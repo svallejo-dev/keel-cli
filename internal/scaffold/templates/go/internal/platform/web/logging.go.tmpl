@@ -1,0 +1,21 @@
+package web
+
+import (
+	"context"
+	"log/slog"
+)
+
+type loggerKey struct{}
+
+// WithLogger stores log in ctx for LoggerFrom.
+func WithLogger(ctx context.Context, log *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey{}, log)
+}
+
+// LoggerFrom returns the request logger (carrying request_id) or slog.Default().
+func LoggerFrom(ctx context.Context) *slog.Logger {
+	if log, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok {
+		return log
+	}
+	return slog.Default()
+}

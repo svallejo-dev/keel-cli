@@ -1,0 +1,238 @@
+# {{.Name}}
+
+Servicio REST en Go generado con `keel new go`. Estructura orientada a
+**Package Oriented Design** (estilo Ardan Labs), con [Gin](https://github.com/gin-gonic/gin)
+como framework HTTP, logging estructurado (`log/slog`), configuración en capas y
+**graceful shutdown**.
+
+## Estructura (Package Oriented Design)
+
+```
+{{.Name}}/
+  cmd/
+    {{.Name}}/
+      main.go            # entrypoint: config, logger, servidor, graceful shutdown
+  internal/
+    config/              # settings en capas (defaults <- entorno); un solo Config inmutable
+    handlers/            # composition root de la API: monta middleware + rutas e inyecta deps
+    health/              # liveness (/ping) y readiness (/health con checkers de dependencias)
+    platform/            # paquetes fundacionales, agnósticos al dominio
+      web/               #   middleware (request-id, access log, recovery), logger por request, helpers
+{{- if ne .ConfigStore "none"}}
+      configstore/       #   carga de valores desde Vault{{if eq .ConfigStore "aws"}} / AWS Secrets Manager{{end}} al arrancar
+{{- end}}
+  configs/
+    config.yaml          # mapea keys de config -> variables de entorno (${VAR:-default})
+  Dockerfile             # build multi-stage -> imagen distroless nonroot
+  Makefile               # run / build / test / tidy / fmt / vet / docker
+  .golangci.yml
+  .env.example
+```
+
+Principios aplicados:
+
+- **`cmd/`** contiene binarios; cada subcarpeta es un programa.
+- **`internal/`** son paquetes propios del proyecto, no importables desde fuera.
+- **`internal/platform/`** son paquetes fundacionales (web plumbing) sin lógica de negocio.
+- Cada paquete **provee** algo con un nombre claro (nada de `utils`/`common`).
+- **`domain` sin I/O de arranque**: los componentes reciben sus dependencias ya
+  construidas por constructor; ningún paquete de negocio lee el entorno directamente.
+- **Archivos con intención**: la lógica de negocio va en `internal/<contexto>/`,
+  con un archivo y un tipo por caso de uso (`login.go` → `Login.Execute`). Nada de
+  `service.go`, `usecase.go` ni tipos `Service` que agrupen varias operaciones.
+- **Comentarios mínimos**: el código se explica con nombres; un comentario solo
+  aporta un *por qué* que el código no puede decir.
+
+## Requisitos
+
+- Go {{.GoVersion}}+.
+- (Opcional) Docker, para construir la imagen.
+
+## Arranque rápido
+
+```bash
+go mod tidy          # resuelve dependencias (Gin) y genera go.sum
+make run             # o: go run ./cmd/{{.Name}}
+```
+
+Por defecto escucha en `0.0.0.0:8080`.
+
+## Endpoints
+
+| Método | Ruta          | Propósito                                             |
+|--------|---------------|-------------------------------------------------------|
+| GET    | `/ping`       | Liveness: el proceso está arriba (no toca dependencias) |
+| GET    | `/health`     | Readiness: chequea las dependencias registradas (503 si falla) |
+| GET    | `/api/v1/`    | Ruta de ejemplo — reemplázala por tu dominio          |
+
+```bash
+curl localhost:8080/ping
+# {"build":"develop","status":"ok","uptime":"1.2s"}
+
+curl localhost:8080/health
+# {"dependencies":{},"status":"ready"}
+```
+
+## Configuración
+
+Flujo: **entorno → `configs/config.yaml` → struct tipado**. El código Go **no
+conoce los nombres de las variables de entorno**; el mapeo vive en el YAML, donde
+puedes renombrar keys o reagrupar secciones sin tocar código:
+
+```yaml
+web:
+  host: {{printf "${%s_HOST:-0.0.0.0}" .EnvPrefix}}
+  port: {{printf "${%s_PORT:-8080}" .EnvPrefix}}
+```
+
+Formas de referencia:
+
+| Forma | Significado |
+|---|---|
+| `${VAR}` | opcional — vacío si no está definida |
+| `${VAR:-default}` | usa el default si no está definida (**el entorno siempre gana**) |
+| `${VAR:?}` | **obligatoria** — el arranque falla con un error claro |
+| `${VAR:?pista}` | obligatoria, con una pista en el mensaje |
+
+- `config.Load(config.Path())` lee el archivo (ruta configurable con
+  `{{.EnvPrefix}}_CONFIG`), expande las referencias y las deserializa a un `Config`
+  tipado — **una sola vez, al arranque**.
+- Ese `Config` inmutable se **inyecta por constructor**; no hay singleton global
+  ni lectura de `os.Getenv` dispersa (según el patrón de inyección de conexiones).
+- **Fail-fast**: las variables `:?` que falten se reportan **todas juntas** al
+  arrancar, en vez de fallar más tarde en la primera conexión.
+- **Regla de secretos**: en el YAML solo van *referencias* `${VAR}`, nunca valores
+  reales. El secreto llega por el entorno, no se versiona.
+
+### Local vs. ambientes desplegados
+
+El mismo binario corre en todos lados. Lo único que cambia es **quién llena las
+variables**:
+
+| Capa | Ejemplo | ¿Cambia por ambiente? |
+|---|---|---|
+| Código (struct) | `cfg.DynamoDB.Table` | **nunca** |
+| Clave del contrato | `dynamodb.table` | **nunca** |
+| Nombre de la variable | `${ADMIN_EVENTS_TABLE}` | *puede* (el YAML lo absorbe) |
+| Valor | `admin-events-prod` | **siempre** |
+
+- **Local** → los valores los emite `keel inject <instancia> --out .env`.
+- **QA / producción** → los inyecta la plataforma (K8s secrets/configmaps, ECS task
+  definition, Terraform outputs, Secrets Manager). `.env` y `keel.yaml` no se usan allí.
+
+Como todo es **con forma de AWS**, la única diferencia real es el endpoint:
+
+```bash
+# Local: apunta a floci (emulador) con credenciales dummy
+AWS_ENDPOINT_URL=http://127.0.0.1:4566
+
+# AWS real: NO definas AWS_ENDPOINT_URL (el SDK va al endpoint público)
+# y usa IAM role (IRSA / instance profile) en vez de claves
+```
+
+**Nombra las claves por dominio** (`dynamodb.table`), no por el recurso
+(`admin_events_table`): así el código no se entera de cómo se llame la tabla en
+cada ambiente.
+
+Si en algún ambiente **no controlas los nombres** de las variables (p. ej. tu
+Terraform ya emite `EVENTS_TABLE_NAME`), crea un mapeo por ambiente y selecciónalo
+—sin tocar código ni claves:
+
+```bash
+{{.EnvPrefix}}_CONFIG=configs/config.prod.yaml
+```
+
+Empieza con **un solo** `config.yaml` para todos los ambientes; pásate a un mapeo
+por ambiente solo cuando la realidad te obligue (dos archivos pueden desincronizarse).
+
+Mantén `.env.example` actualizado: es tu **checklist anti-drift** entre lo que el
+contrato pide y lo que cada ambiente inyecta.
+{{- if ne .ConfigStore "none"}}
+
+### Config store (Vault{{if eq .ConfigStore "aws"}} / AWS Secrets Manager{{end}})
+
+Los valores que necesitan los casos de uso (flags, límites, URLs de terceros…)
+viven en un **config store**, no en el `.env`. Al arrancar,
+`internal/platform/configstore` los lee según `CONFIG_STORE` y `config.Load` los
+usa para resolver las `${VAR}` del contrato:
+
+```
+entorno (K8s, .env)  >  config store  >  ${VAR:-default}
+```
+
+El entorno siempre gana: lo que inyecte Kubernetes sobreescribe al store. Si
+`CONFIG_STORE` no está definido, el servicio funciona solo con variables de entorno.
+
+| Backend | Variables de arranque |
+|---|---|
+| `vault` | `VAULT_ADDR`, `VAULT_TOKEN`, `CONFIG_VAULT_MOUNT` (default `secret`), `CONFIG_VAULT_PATH` |
+{{- if eq .ConfigStore "aws"}}
+| `aws-secretsmanager` | `CONFIG_SECRET_ID` (secreto JSON `{"CLAVE":"valor"}`) + variables `AWS_*` del SDK |
+{{- end}}
+
+En local, `keel` lo deja listo: declara el store en `keel.yaml` y ejecuta `keel sync`.
+
+```yaml
+# keel.yaml
+instances:
+  - {name: {{.Name}}-vault, kind: vault}
+config:
+  store: {{.Name}}-vault
+  seed: config.dev.env      # valores de desarrollo (se siembran si faltan)
+```
+
+```bash
+keel sync                                 # crea Vault, siembra y escribe .env con CONFIG_STORE…
+keel config set MAX_RETRIES=5             # cambia un valor; reinicia el servicio para tomarlo
+keel config list
+```
+{{- end}}
+
+## Añadir una dependencia (p. ej. Postgres o S3)
+
+1. **`configs/config.yaml`**: añade una sección mapeando a las variables que emite
+   `keel inject` (ej. `dsn_write: ${ORDERS_DB_DSN_WRITE}`).
+2. **`internal/config`**: añade el campo tipado correspondiente al struct.
+3. **`internal/platform/<engine>`**: constructor del cliente que abre y valida
+   (ping); implementa ahí un `health.Checker` (`Name()` + `Check(ctx)`).
+4. **`cmd/{{.Name}}/main.go`**: constrúyelo una vez, decide fatal-vs-degradado, e
+   inyéctalo. Pásalo también a `health.New(build, checker...)` para que `/health`
+   reporte 503 si esa dependencia cae.
+
+## Logging y trazabilidad (`request_id`)
+
+Cada request recibe un `request_id` (generado una vez, o tomado del header
+`X-Request-ID` entrante) y se devuelve en la respuesta. El middleware `RequestID`
+guarda en el `context.Context` un **logger por request con el id ya incrustado**,
+así que **cualquier log en cualquier capa lo incluye automáticamente** — sin pasar
+el id a mano y sin generar ids nuevos:
+
+```go
+func (r *PaymentRepo) Save(ctx context.Context, p Payment) error {
+    web.LoggerFrom(ctx).Info("guardando pago", "amount", p.Amount)
+    // → {"level":"INFO","msg":"guardando pago","request_id":"a1b2…","amount":100}
+}
+```
+
+Regla: propaga siempre el `context.Context` del request hacia abajo y loguea con
+`web.LoggerFrom(ctx)`. El access-log y el recovery ya usan ese mismo logger.
+
+## Graceful shutdown
+
+`main` escucha `SIGINT`/`SIGTERM` vía `signal.NotifyContext` y llama a
+`http.Server.Shutdown` con un timeout (`{{.EnvPrefix}}_SHUTDOWN_TIMEOUT`, 20s por
+defecto), dando margen a las peticiones en vuelo antes de cerrar.
+{{if .AITools}}
+## Configuración de IA
+
+El repo incluye espacios de configuración para herramientas de IA. La guía común y
+tool-agnóstica vive en [AGENTS.md](AGENTS.md) (una sola fuente de verdad); cada
+herramienta apunta ahí. Herramientas incluidas: **{{range $i, $t := .AITools}}{{if $i}}, {{end}}{{$t}}{{end}}**.
+
+- **claude** → `CLAUDE.md`, `.claude/agents/`, `.claude/skills/`, `.claude/settings.json`, `.mcp.json`.
+- **copilot** → `.github/copilot-instructions.md`, `.github/prompts/`, `.vscode/mcp.json`.
+- **cursor** → `.cursor/rules/`, `.cursor/mcp.json`.
+
+Añade tus agents/skills/prompts en esas carpetas y registra servidores MCP en el
+archivo correspondiente. Actualiza las convenciones en `AGENTS.md`, no en cada copia.
+{{end}}

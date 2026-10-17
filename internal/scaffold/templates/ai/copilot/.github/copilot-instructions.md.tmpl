@@ -1,0 +1,22 @@
+# Copilot instructions — {{.Name}}
+
+Instrucciones de repo para GitHub Copilot. La guía completa (proyecto, comandos,
+convenciones) vive en [AGENTS.md](../AGENTS.md); esto la resume.
+
+- Servicio REST en Go con **Package Oriented Design**: `cmd/` binarios, `internal/`
+  paquetes de app, `internal/platform/` fundacionales.
+- **Config**: `entorno → configs/config.yaml → struct tipado`, inyectada por
+  constructor. No hard-codees nombres de variables ni leas `os.Getenv` fuera de
+  `internal/config`.
+- **Sin estado global** para conexiones; se construyen en `main` y se inyectan.
+- **Logs** con `web.LoggerFrom(ctx)` para arrastrar el `request_id`.
+- **Un archivo y un tipo por caso de uso**, nombrados por su intención
+  (`login.go` → `Login.Execute`). Prohibidos `service.go`, `usecase.go`,
+  `helpers.go`, `utils.go` y tipos cajón `Service`/`UseCase`.
+- **Comentarios mínimos**: doc de una línea en exportados; nada que narre el código.
+- Antes de proponer cambios grandes: `make test` y `golangci-lint run`.
+
+## Espacios relacionados
+
+- `.github/prompts/` — prompt files reutilizables (`*.prompt.md`).
+- `.vscode/mcp.json` — servidores MCP para Copilot en VS Code.

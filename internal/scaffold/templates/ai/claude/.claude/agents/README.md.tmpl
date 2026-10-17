@@ -1,0 +1,17 @@
+# Agents (Claude Code)
+
+Coloca aquí los **subagentes** del proyecto: un archivo `.md` por agente, con
+frontmatter YAML y el system prompt en el cuerpo.
+
+```markdown
+---
+name: go-reviewer
+description: Revisa cambios de Go buscando bugs y desviaciones de las convenciones del repo.
+tools: Read, Grep, Glob
+---
+
+Eres un revisor senior de Go. Aplica las convenciones de AGENTS.md…
+```
+
+Se invocan con la herramienta Agent o por su nombre. Mantenlos enfocados en una
+sola responsabilidad.

@@ -1,0 +1,24 @@
+# CLAUDE.md
+
+Instrucciones para Claude Code en este repositorio.
+
+👉 La guía completa (proyecto, comandos, convenciones) vive en
+[AGENTS.md](AGENTS.md). Léela primero; lo de abajo es específico de Claude Code.
+
+## Espacios de configuración
+
+- `.claude/agents/` — subagentes (un `.md` por agente, con frontmatter).
+- `.claude/skills/` — skills (`<nombre>/SKILL.md`).
+- `.claude/settings.json` — permisos, hooks y ajustes del proyecto.
+- `.mcp.json` — servidores MCP del repo.
+
+## Notas
+
+- Antes de un cambio no trivial, corre `make test` y `golangci-lint run`.
+- Sigue Package Oriented Design y la inyección por constructor descritas en AGENTS.md.
+- Un archivo y un tipo por caso de uso, nombrados por su intención; sin `service.go`
+  ni `usecase.go`. Comentarios mínimos (ver AGENTS.md).
+{{- if .Skills}}
+- Las skills `ddd-go-idiomatic`, `go-design-rules`, `senior-go-idiomatic` y `review-pr`
+  de `.claude/skills/` aplican y revisan estas reglas.
+{{- end}}

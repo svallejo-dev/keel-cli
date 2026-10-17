@@ -1,0 +1,13 @@
+package web
+
+import "github.com/gin-gonic/gin"
+
+// JSON writes v with the given status code.
+func JSON(c *gin.Context, status int, v any) {
+	c.JSON(status, v)
+}
+
+// Error writes {"error": msg}.
+func Error(c *gin.Context, status int, msg string) {
+	c.AbortWithStatusJSON(status, gin.H{"error": msg})
+}

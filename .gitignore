@@ -1,0 +1,28 @@
+# Binaries
+/bin/
+/dist/
+/keel
+/keel.exe
+*.exe
+*.test
+
+# Local state / emitted config
+/.keel/
+*.env
+!.env.example
+!*.example.env
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Editor / OS
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# Client documents: kept locally, never published
+/docs/Assessment-*.docx
+/docs/assessment-*.html

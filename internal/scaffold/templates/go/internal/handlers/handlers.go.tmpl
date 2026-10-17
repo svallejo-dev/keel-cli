@@ -1,0 +1,39 @@
+// Package handlers is the composition root: it mounts middleware and routes.
+package handlers
+
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	"{{.Module}}/internal/health"
+	"{{.Module}}/internal/platform/web"
+)
+
+// Config carries the dependencies injected into the routes.
+type Config struct {
+	Log   *slog.Logger
+	Build string
+}
+
+// API returns the router with every middleware and route mounted.
+func API(cfg Config) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+
+	r := gin.New()
+	// RequestID goes first: Logger and Recovery read the logger it stores.
+	r.Use(web.RequestID(cfg.Log), web.Logger(), web.Recovery())
+
+	hh := health.New(cfg.Build)
+	r.GET("/ping", hh.Liveness)
+	r.GET("/health", hh.Readiness)
+
+	v1 := r.Group("/api/v1")
+	v1.GET("/", func(c *gin.Context) {
+		web.LoggerFrom(c.Request.Context()).Info("handling example request")
+		web.JSON(c, http.StatusOK, gin.H{"service": "{{.Name}}", "message": "it works"})
+	})
+
+	return r
+}

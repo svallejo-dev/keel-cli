@@ -1,0 +1,111 @@
+# Taskfile — friendly top-level entrypoint for the local IaaS platform.
+# Install go-task: https://taskfile.dev  ·  then run `task` to list commands.
+version: "3"
+
+vars:
+  BIN: '{{if eq OS "windows"}}./bin/keel.exe{{else}}./bin/keel{{end}}'
+  COMPOSE: docker compose -f docker/floci-compose.yml
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the keel binary into ./bin
+    cmds:
+      - go build -o {{.BIN}} ./cmd/keel
+
+  install:
+    desc: Install keel into GOBIN
+    cmds:
+      - go install ./cmd/keel
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test ./...
+
+  check:
+    desc: Format, vet and test
+    cmds:
+      - go fmt ./...
+      - go vet ./...
+      - go test ./...
+
+  # --- floci (AWS emulator) lifecycle ---
+  net:
+    desc: Ensure the shared docker network exists
+    cmds:
+      - docker network inspect keel-net >/dev/null 2>&1 || docker network create keel-net
+    silent: true
+
+  floci-up:
+    desc: Start the floci AWS emulator
+    deps: [net]
+    cmds:
+      - "{{.COMPOSE}} up -d"
+
+  floci-down:
+    desc: Stop the floci AWS emulator
+    cmds:
+      - "{{.COMPOSE}} down"
+
+  floci-logs:
+    desc: Tail floci logs
+    cmds:
+      - "{{.COMPOSE}} logs -f"
+
+  # --- platform shortcuts (delegate to the CLI) ---
+  doctor:
+    desc: Diagnose the environment (Docker, floci, engine)
+    deps: [build]
+    cmds:
+      - "{{.BIN}} doctor"
+
+  catalog:
+    desc: Show the blueprint catalog
+    deps: [build]
+    cmds:
+      - "{{.BIN}} catalog"
+
+  list:
+    desc: List all instances
+    deps: [build]
+    cmds:
+      - "{{.BIN}} list"
+
+  health:
+    desc: Health-check every component
+    deps: [build]
+    cmds:
+      - "{{.BIN}} health"
+
+  up:
+    desc: Start every instance
+    deps: [build]
+    cmds:
+      - "{{.BIN}} up --all"
+
+  down:
+    desc: Stop every instance
+    deps: [build]
+    cmds:
+      - "{{.BIN}} down --all"
+
+  tui:
+    desc: Open the interactive dashboard
+    deps: [build]
+    cmds:
+      - "{{.BIN}} tui"
+
+  demo:
+    desc: Provision an example stack (mock engine, no Docker needed)
+    deps: [build]
+    env:
+      KEEL_ENGINE: mock
+    cmds:
+      - "{{.BIN}} apply stacks/example-relational-cache-bus.yaml"
+      - "{{.BIN}} list"

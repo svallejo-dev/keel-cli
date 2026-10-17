@@ -1,0 +1,29 @@
+BINARY := {{.Name}}
+BUILD  := $(shell git rev-parse --short HEAD 2>/dev/null || echo develop)
+LDFLAGS := -s -w -X main.build=$(BUILD)
+
+.PHONY: run build test tidy fmt vet docker clean
+
+run:
+	go run ./cmd/$(BINARY)
+
+build:
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/$(BINARY)
+
+test:
+	go test ./...
+
+tidy:
+	go mod tidy
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+docker:
+	docker build --build-arg BUILD=$(BUILD) -t $(BINARY):$(BUILD) .
+
+clean:
+	rm -rf bin

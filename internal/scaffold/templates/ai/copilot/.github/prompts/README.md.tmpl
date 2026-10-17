@@ -1,0 +1,16 @@
+# Prompts (GitHub Copilot)
+
+Coloca aquí **prompt files** reutilizables: un archivo `*.prompt.md` por tarea.
+Se ejecutan desde Copilot Chat con `/nombre`.
+
+```markdown
+---
+mode: agent
+description: Añade un endpoint REST siguiendo las convenciones del repo.
+---
+
+Crea un endpoint en internal/handlers para ${input:recurso}. Respeta la
+inyección por constructor y añade su readiness Checker si toca una dependencia.
+```
+
+Consulta AGENTS.md para las convenciones que deben respetar.

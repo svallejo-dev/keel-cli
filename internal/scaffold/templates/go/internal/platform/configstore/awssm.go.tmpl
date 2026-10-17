@@ -1,0 +1,39 @@
+package configstore
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+)
+
+// The SDK default chain picks up AWS_ENDPOINT_URL locally and the real endpoint in AWS.
+func loadAWSSecrets(ctx context.Context) (Values, error) {
+	id, err := required("CONFIG_SECRET_ID")
+	if err != nil {
+		return nil, err
+	}
+	awsCfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := secretsmanager.NewFromConfig(awsCfg).GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(id),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(aws.ToString(out.SecretString)), &raw); err != nil {
+		return nil, fmt.Errorf("secret %s is not a JSON object: %w", id, err)
+	}
+	v := make(Values, len(raw))
+	for k, val := range raw {
+		v[k] = stringify(val)
+	}
+	return v, nil
+}

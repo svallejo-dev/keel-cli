@@ -1,0 +1,32 @@
+# Example stack manifest (microservice-agnostic).
+#
+# A generic "relational + cache + event bus + secrets" topology — the shape most
+# services in the assessments needed. Apply it with:
+#   keel apply stacks/example-relational-cache-bus.yaml
+#
+# Each entry is an isolated instance; give three services their own Postgres by
+# listing three postgres entries with different names.
+version: 1
+name: example-relational-cache-bus
+
+instances:
+  - name: orders-db
+    kind: postgres
+    params:
+      dbname: entdb_orders
+
+  - name: billing-db
+    kind: postgres
+    params:
+      dbname: entdb_billing
+
+  - name: session-cache
+    kind: redis
+
+  - name: event-bus
+    kind: kafka
+    params:
+      partitions: "6"
+
+  - name: gateway-creds
+    kind: secrets

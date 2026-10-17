@@ -1,0 +1,80 @@
+// Package web is domain-agnostic HTTP plumbing: request id, logging, recovery, responses.
+package web
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+// HeaderRequestID carries the correlation id in requests and responses.
+const HeaderRequestID = "X-Request-ID"
+
+const ctxRequestID = "request_id"
+
+// RequestID reuses an inbound X-Request-ID or generates one, echoes it and
+// stores a logger carrying it in the request context.
+func RequestID(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := c.GetHeader(HeaderRequestID)
+		if id == "" {
+			id = newID()
+		}
+		c.Header(HeaderRequestID, id)
+		c.Set(ctxRequestID, id)
+
+		ctx := WithLogger(c.Request.Context(), log.With("request_id", id))
+		c.Request = c.Request.WithContext(ctx)
+
+		c.Next()
+	}
+}
+
+// RequestIDValue returns the current request id, or "".
+func RequestIDValue(c *gin.Context) string {
+	if v, ok := c.Get(ctxRequestID); ok {
+		if id, ok := v.(string); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+// Logger emits one access log line per request.
+func Logger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+
+		LoggerFrom(c.Request.Context()).LogAttrs(c.Request.Context(), slog.LevelInfo, "request",
+			slog.String("method", c.Request.Method),
+			slog.String("path", c.Request.URL.Path),
+			slog.Int("status", c.Writer.Status()),
+			slog.Duration("took", time.Since(start)),
+			slog.String("ip", c.ClientIP()),
+		)
+	}
+}
+
+// Recovery turns a panic into a logged 500.
+func Recovery() gin.HandlerFunc {
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, err any) {
+		LoggerFrom(c.Request.Context()).Error("panic recovered",
+			"error", err,
+			"path", c.Request.URL.Path,
+		)
+		Error(c, http.StatusInternalServerError, "internal server error")
+	})
+}
+
+func newID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "unknown"
+	}
+	return hex.EncodeToString(b[:])
+}

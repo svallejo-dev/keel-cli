@@ -1,0 +1,68 @@
+# AGENTS.md
+
+Guía para agentes de IA que trabajan en este repositorio (Claude Code, GitHub
+Copilot, Cursor, etc.). Es **tool-agnóstica**: cada herramienta apunta aquí para
+no duplicar reglas. Si actualizas una convención, hazlo en este archivo.
+
+## Proyecto
+
+`{{.Name}}` — servicio REST en Go, estructurado con **Package Oriented Design**.
+
+## Comandos
+
+- Build:  `make build`
+- Run:    `make run`  (o `go run ./cmd/{{.Name}}`)
+- Test:   `make test`
+- Lint:   `golangci-lint run`
+
+## Convenciones (respétalas)
+
+- **Package Oriented Design**: `cmd/` binarios · `internal/` paquetes de app ·
+  `internal/platform/` fundacionales (agnósticos al dominio). Nada de `utils`/`common`.
+- **Config**: `entorno → configs/config.yaml → struct tipado`. El código no
+  hard-codea nombres de variables; el mapeo vive en el YAML. Se carga una vez y se
+  **inyecta por constructor**.
+- **Sin estado global**: no service locators ni singletons para conexiones; los
+  clientes se construyen en `main` y se inyectan.
+- **Logging**: usa `web.LoggerFrom(ctx)` para que cada log arrastre el `request_id`.
+- **Errores**: envuélvelos con contexto (`fmt.Errorf("...: %w", err)`).
+
+## Casos de uso y nombres de archivo
+
+Lógica de negocio en un paquete por bounded context (`internal/<contexto>/`). El
+nombre de cada archivo dice su intención:
+
+- **Un archivo por caso de uso**, nombrado por lo que hace: `register_user.go`,
+  `login.go`, `search_users.go`. Nunca dos casos de uso en un archivo (`Login` y
+  `Signup` van en `login.go` y `signup.go`).
+- **Un tipo por caso de uso** con el nombre de la acción: `RegisterUser`,
+  `NewRegisterUser(deps...)` y un solo método `Execute(ctx, RegisterUserInput)
+  (RegisterUserOutput, error)`. Input/Output y la interfaz estrecha que consume
+  viven en el mismo archivo.
+- Conceptos de dominio por nombre: `user.go`, `email.go`, `errors.go`.
+- Transporte: un archivo por endpoint (`<contexto>http/register_user.go`) más
+  `routes.go`.
+- **Prohibidos** dentro de un contexto: `service.go`, `usecase.go`, `usecases.go`,
+  `manager.go`, `helpers.go`, `utils.go`, `common.go`, `handler.go` con varios
+  endpoints, y tipos cajón `Service`, `UseCase` o `Manager`.
+
+## Comentarios
+
+- Package doc de una línea; exportados con doc comment de una línea solo si dice
+  algo que el nombre no dice.
+- Sin comentarios que narran el código, repiten el nombre o separan secciones.
+  Un comentario inline solo explica un *por qué* no obvio.
+- Si un bloque necesita un párrafo para entenderse, renombra o extrae una función.
+
+## Qué NO hacer
+
+- No leer `os.Getenv` fuera de `internal/config`.
+- No introducir dependencias pesadas sin justificación.
+- No crear `service.go`/`usecase.go` ni agrupar varios casos de uso en un archivo o tipo.
+- No romper la separación de capas (el negocio no conoce SDKs de infraestructura
+  directamente; recibe clientes ya construidos).
+
+## Estructura de configuración de IA
+
+Este repo incluye carpetas de configuración de IA (agents, skills, MCP). Son
+específicas por herramienta pero todas se rigen por este AGENTS.md.

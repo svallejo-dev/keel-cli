@@ -1,0 +1,83 @@
+package configstore
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// A single GET does not justify depending on the Vault SDK.
+func loadVault(ctx context.Context) (Values, error) {
+	addr, err := required("VAULT_ADDR")
+	if err != nil {
+		return nil, err
+	}
+	token, err := required("VAULT_TOKEN")
+	if err != nil {
+		return nil, err
+	}
+	path, err := required("CONFIG_VAULT_PATH")
+	if err != nil {
+		return nil, err
+	}
+	mount := os.Getenv("CONFIG_VAULT_MOUNT")
+	if mount == "" {
+		mount = "secret"
+	}
+
+	url := fmt.Sprintf("%s/v1/%s/data/%s", strings.TrimRight(addr, "/"), strings.Trim(mount, "/"), strings.Trim(path, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Vault-Token", token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		// Nothing stored yet: boot on defaults.
+		return Values{}, nil
+	default:
+		return nil, fmt.Errorf("GET %s/%s: HTTP %d", mount, path, resp.StatusCode)
+	}
+
+	var body struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode %s/%s: %w", mount, path, err)
+	}
+	out := make(Values, len(body.Data.Data))
+	for k, v := range body.Data.Data {
+		out[k] = stringify(v)
+	}
+	return out, nil
+}
+
+func stringify(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case nil:
+		return ""
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprint(t)
+		}
+		return string(b)
+	}
+}

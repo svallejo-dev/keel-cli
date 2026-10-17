@@ -1,0 +1,30 @@
+# Contrato de configuración, igual en todos los ambientes: solo referencias, nunca valores.
+# ${VAR} opcional · ${VAR:-default} con default · ${VAR:?pista} obligatoria (falla al arrancar).
+{{- if ne .ConfigStore "none"}}
+# Precedencia: entorno > config store > default.
+{{- end}}
+web:
+  host: {{printf "${%s_HOST:-0.0.0.0}" .EnvPrefix}}
+  port: {{printf "${%s_PORT:-8080}" .EnvPrefix}}
+  read_timeout: {{printf "${%s_READ_TIMEOUT:-5s}" .EnvPrefix}}
+  write_timeout: {{printf "${%s_WRITE_TIMEOUT:-10s}" .EnvPrefix}}
+  idle_timeout: {{printf "${%s_IDLE_TIMEOUT:-120s}" .EnvPrefix}}
+  shutdown_timeout: {{printf "${%s_SHUTDOWN_TIMEOUT:-20s}" .EnvPrefix}}
+
+{{if ne .ConfigStore "none" -}}
+# Valores de los casos de uso: viven en el config store (`keel config set CLAVE=valor`).
+# app:
+#   max_retries: ${MAX_RETRIES:-3}
+#   new_checkout: ${FEATURE_NEW_CHECKOUT:-false}
+
+{{end -}}
+# Dependencias: local las emite `keel inject`; en QA/prod, la plataforma con los mismos nombres.
+# dynamodb:
+#   table: ${ADMIN_EVENTS_TABLE:?sin tabla no hay persistencia}
+# s3:
+#   bucket: ${ADMIN_ASSETS_BUCKET:?}
+#   endpoint: ${AWS_ENDPOINT_URL}          # vacía en AWS real
+#   region: ${AWS_REGION:-us-east-1}
+# postgres:
+#   dsn_write: ${ORDERS_DB_DSN_WRITE:?}
+#   dsn_read:  ${ORDERS_DB_DSN_READ:?}

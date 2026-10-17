@@ -1,0 +1,25 @@
+# Skills (Claude Code)
+
+Este proyecto viene con **skills de Go pre-cargadas** por `keel new go`
+(idiomas Go, diseño, DDD y flujo de git). Cada skill es una carpeta con su
+`SKILL.md` (frontmatter + instrucciones) y se activa por su `description`.
+
+Para añadir las tuyas, usa el mismo formato:
+
+```
+.claude/skills/
+  release-notes/
+    SKILL.md
+```
+
+```markdown
+---
+name: release-notes
+description: Genera notas de versión a partir de los commits desde el último tag.
+---
+
+Pasos para generar las notas…
+```
+
+Las skills incluidas se pueden ajustar al crear el proyecto con `--skills`
+(`all` · `none` · lista). Consulta AGENTS.md para las convenciones del repo.

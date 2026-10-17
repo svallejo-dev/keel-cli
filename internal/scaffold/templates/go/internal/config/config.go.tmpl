@@ -1,0 +1,156 @@
+// Package config loads configs/config.yaml, expanding ${VAR} references
+{{- if ne .ConfigStore "none"}}
+// against the environment first and the config store second.
+{{- else}}
+// against the environment.
+{{- end}}
+package config
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// EnvConfigPath is the environment variable that overrides the config location.
+const EnvConfigPath = "{{.EnvPrefix}}_CONFIG"
+
+// DefaultPath is the config file location relative to the working directory.
+const DefaultPath = "configs/config.yaml"
+
+// Config is loaded once at startup and injected by constructor.
+type Config struct {
+	Web Web `yaml:"web"`
+}
+
+// Web holds the HTTP server settings.
+type Web struct {
+	Host            string   `yaml:"host"`
+	Port            int      `yaml:"port"`
+	ReadTimeout     Duration `yaml:"read_timeout"`
+	WriteTimeout    Duration `yaml:"write_timeout"`
+	IdleTimeout     Duration `yaml:"idle_timeout"`
+	ShutdownTimeout Duration `yaml:"shutdown_timeout"`
+}
+
+// Addr returns the host:port the server binds to.
+func (w Web) Addr() string { return fmt.Sprintf("%s:%d", w.Host, w.Port) }
+
+// Path returns the config file to load: the EnvConfigPath override or DefaultPath.
+func Path() string {
+	if p := os.Getenv(EnvConfigPath); p != "" {
+		return p
+	}
+	return DefaultPath
+}
+
+// Load expands ${VAR}, ${VAR:-default} and ${VAR:?hint} references and reports
+// every missing required value in a single error.
+{{- if ne .ConfigStore "none"}} A nil store means env only.{{- end}}
+{{- if ne .ConfigStore "none"}}
+func Load(path string, store map[string]string) (Config, error) {
+	lookup := func(name string) string {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+		return store[name]
+	}
+{{- else}}
+func Load(path string) (Config, error) {
+	lookup := os.Getenv
+{{- end}}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	// Expanding parsed scalars, not raw text, keeps ${VAR} inside YAML comments inert.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+
+	var missing []string
+	expandNode(&doc, lookup, &missing)
+	if len(missing) > 0 {
+		return Config{}, fmt.Errorf(
+{{- if ne .ConfigStore "none"}}
+			"incomplete configuration (%s): these required values are unset (environment or config store):\n  - %s",
+{{- else}}
+			"incomplete configuration (%s): these required environment variables are unset:\n  - %s",
+{{- end}}
+			path, strings.Join(missing, "\n  - "))
+	}
+
+	// Round-trip so expanded scalars get their types re-inferred ("8080" -> int).
+	expanded, err := yaml.Marshal(&doc)
+	if err != nil {
+		return Config{}, fmt.Errorf("render config %s: %w", path, err)
+	}
+
+	var c Config
+	if err := yaml.Unmarshal(expanded, &c); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	return c, nil
+}
+
+func expandNode(n *yaml.Node, lookup func(string) string, missing *[]string) {
+	if n.Kind == yaml.ScalarNode {
+		if !strings.Contains(n.Value, "$") {
+			return
+		}
+		n.Value = os.Expand(n.Value, func(ref string) string {
+			v, err := resolveRef(ref, lookup)
+			if err != nil {
+				*missing = append(*missing, err.Error())
+				return ""
+			}
+			return v
+		})
+		n.Tag, n.Style = "", 0
+		return
+	}
+	for _, child := range n.Content {
+		expandNode(child, lookup, missing)
+	}
+}
+
+func resolveRef(ref string, lookup func(string) string) (string, error) {
+	// ":-" goes first so a default value may itself contain "?".
+	if name, fallback, ok := strings.Cut(ref, ":-"); ok {
+		if v := lookup(name); v != "" {
+			return v, nil
+		}
+		return fallback, nil
+	}
+	if name, hint, ok := strings.Cut(ref, ":?"); ok {
+		if v := lookup(name); v != "" {
+			return v, nil
+		}
+		if hint != "" {
+			return "", fmt.Errorf("%s — %s", name, hint)
+		}
+		return "", fmt.Errorf("%s", name)
+	}
+	return lookup(ref), nil
+}
+
+// Duration is a time.Duration that unmarshals from a YAML string like "5s".
+type Duration time.Duration
+
+// UnmarshalYAML parses a Go duration string such as "5s".
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	parsed, err := time.ParseDuration(node.Value)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", node.Value, err)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// Std returns the underlying time.Duration.
+func (d Duration) Std() time.Duration { return time.Duration(d) }

@@ -1,0 +1,102 @@
+// Command {{.Name}} runs the HTTP service until SIGINT/SIGTERM.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+{{- if ne .ConfigStore "none"}}
+	"time"
+{{- end}}
+
+	"{{.Module}}/internal/config"
+	"{{.Module}}/internal/handlers"
+{{- if ne .ConfigStore "none"}}
+	"{{.Module}}/internal/platform/configstore"
+{{- end}}
+)
+
+// build is stamped at link time with -ldflags "-X main.build=<sha>".
+var build = "develop"
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(log)
+
+	if err := run(log); err != nil {
+		log.Error("service stopped with error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger) error {
+{{- if ne .ConfigStore "none"}}
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 15*time.Second)
+	backend, stored, err := configstore.Load(loadCtx)
+	cancelLoad()
+	if err != nil {
+		return err
+	}
+	if backend != "" {
+		log.Info("config store loaded", "backend", backend, "keys", stored.Keys())
+	}
+
+	cfg, err := config.Load(config.Path(), stored)
+	if err != nil {
+		return err
+	}
+{{- else}}
+	cfg, err := config.Load(config.Path())
+	if err != nil {
+		return err
+	}
+{{- end}}
+	log.Info("starting", "service", "{{.Name}}", "build", build, "addr", cfg.Web.Addr())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{
+		Addr: cfg.Web.Addr(),
+		Handler: handlers.API(handlers.Config{
+			Log:   log,
+			Build: build,
+		}),
+		ReadTimeout:  cfg.Web.ReadTimeout.Std(),
+		WriteTimeout: cfg.Web.WriteTimeout.Std(),
+		IdleTimeout:  cfg.Web.IdleTimeout.Std(),
+		ErrorLog:     slog.NewLogLogger(log.Handler(), slog.LevelError),
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		log.Info("listening", "addr", srv.Addr)
+		serverErrors <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("server error: %w", err)
+		}
+		return nil
+
+	case <-ctx.Done():
+		log.Info("shutdown started", "reason", ctx.Err())
+		defer log.Info("shutdown complete")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Web.ShutdownTimeout.Std())
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			return fmt.Errorf("graceful shutdown failed: %w", err)
+		}
+		return nil
+	}
+}

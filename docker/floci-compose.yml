@@ -1,0 +1,52 @@
+# floci — local AWS emulator that backs keel's AWS-API services
+# (S3, SNS, SQS, Secrets Manager). Data engines (postgres/redis/kafka) run as their
+# own containers managed by keel's docker provider, so they are NOT here.
+#
+# Start with:  task floci-up   (or: docker compose -f docker/floci-compose.yml up -d)
+#
+# NOTE: floci is a young project (see README "Risks"). Verify the image tag and the
+# FLOCI_* env var names against https://floci.io docs during the M0 spike; adjust
+# below if they differ.
+name: keel
+
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: floci
+    restart: unless-stopped
+    ports:
+      - "4566:4566" # unified AWS API endpoint (AWS_ENDPOINT_URL)
+      # floci proxies backing engines on its own address at allocated ports.
+      # Publish those ranges so HOST processes reach them at localhost:<port>;
+      # containers on keel-net use floci:<port>.
+      #   RDS      → 7001, 7002, …
+      #   ElastiCache (redis) → 6379, 6380, …
+      - "7000-7060:7000-7060"
+      - "6379-6400:6379-6400"
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      # No FLOCI_SERVICES limit on purpose: keel provisions s3/sns/sqs/secretsmanager/kms
+      # AND rds/elasticache/kafka/dynamodb through floci, so every service stays enabled.
+      # (Limiting this list previously would have broken DynamoDB and the data engines.)
+      DEBUG: "0"
+    volumes:
+      # floci spins real backing containers for some services → needs the socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - floci-data:/var/lib/floci
+    networks:
+      - keel-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_floci/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+networks:
+  # keel's docker provider creates this network on first `create`; mark it
+  # external so compose attaches to it instead of trying to own it.
+  keel-net:
+    external: true
+    name: keel-net
+
+volumes:
+  floci-data:

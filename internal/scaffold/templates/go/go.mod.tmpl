@@ -1,0 +1,13 @@
+module {{.Module}}
+
+go {{.GoVersion}}
+
+require (
+{{- if eq .ConfigStore "aws"}}
+	github.com/aws/aws-sdk-go-v2 {{.AWSSDKVersion}}
+	github.com/aws/aws-sdk-go-v2/config {{.AWSSDKConfigVersion}}
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager {{.AWSSDKSecretsMgrVersion}}
+{{- end}}
+	github.com/gin-gonic/gin {{.GinVersion}}
+	gopkg.in/yaml.v3 v3.0.1
+)

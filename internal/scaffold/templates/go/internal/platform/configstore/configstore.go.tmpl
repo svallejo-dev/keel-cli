@@ -1,0 +1,65 @@
+// Package configstore loads use-case settings from Vault{{if eq .ConfigStore "aws"}} or AWS Secrets Manager{{end}},
+// selected by CONFIG_STORE; when unset the service runs on env vars alone.
+package configstore
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+)
+
+// Backend identifiers accepted in CONFIG_STORE.
+const (
+{{- if eq .ConfigStore "aws"}}
+	BackendVault      = "vault"
+	BackendAWSSecrets = "aws-secretsmanager"
+{{- else}}
+	BackendVault = "vault"
+{{- end}}
+)
+
+// Values are the KEY/value pairs read from the store.
+type Values map[string]string
+
+// Keys returns the sorted keys; log these, never the values.
+func (v Values) Keys() []string {
+	ks := make([]string, 0, len(v))
+	for k := range v {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// Load returns ("", nil, nil) when CONFIG_STORE is unset.
+func Load(ctx context.Context) (string, Values, error) {
+	backend := os.Getenv("CONFIG_STORE")
+	var (
+		v   Values
+		err error
+	)
+	switch backend {
+	case "":
+		return "", nil, nil
+	case BackendVault:
+		v, err = loadVault(ctx)
+{{- if eq .ConfigStore "aws"}}
+	case BackendAWSSecrets:
+		v, err = loadAWSSecrets(ctx)
+{{- end}}
+	default:
+		return "", nil, fmt.Errorf("CONFIG_STORE=%q is not supported", backend)
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("config store %s: %w", backend, err)
+	}
+	return backend, v, nil
+}
+
+func required(name string) (string, error) {
+	if v := os.Getenv(name); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("%s is not set", name)
+}
