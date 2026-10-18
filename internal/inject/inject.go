@@ -35,6 +35,8 @@ const (
 	FormatEnv    Format = "env"    // export KEY=VALUE
 	FormatJSON   Format = "json"   // {"KEY":"VALUE"}
 	FormatYAML   Format = "yaml"   // KEY: VALUE
+	// FormatPowerShell emits $env:KEY = 'VALUE', for `keel inject ... | iex` on Windows.
+	FormatPowerShell Format = "powershell"
 )
 
 // KV is one ordered environment variable.
@@ -203,6 +205,13 @@ func (b *Bundle) Render(format Format) (string, error) {
 		return b.renderLines("")
 	case FormatEnv:
 		return b.renderLines("export ")
+	case FormatPowerShell:
+		var sb strings.Builder
+		for _, kv := range b.Vars {
+			// Single quotes disable $ expansion; a literal ' is escaped by doubling it.
+			fmt.Fprintf(&sb, "$env:%s = '%s'\n", kv.Key, strings.ReplaceAll(kv.Value, "'", "''"))
+		}
+		return sb.String(), nil
 	case FormatJSON:
 		m := make(map[string]string, len(b.Vars))
 		for _, kv := range b.Vars {

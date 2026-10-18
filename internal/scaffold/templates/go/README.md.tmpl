@@ -55,7 +55,8 @@ go mod tidy          # resuelve dependencias (Gin) y genera go.sum
 make run             # o: go run ./cmd/{{.Name}}
 ```
 
-Por defecto escucha en `0.0.0.0:8080`.
+Por defecto escucha en `0.0.0.0:8080`. En Windows sin `make`, usa los comandos `go`
+directamente (`go run`, `go test ./...`) o instálalo con `winget install ezwinports.make`.
 
 ## Endpoints
 

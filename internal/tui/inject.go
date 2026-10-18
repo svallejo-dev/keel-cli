@@ -25,7 +25,7 @@ type injectScreen struct {
 func newInject(inst *domain.Instance) *injectScreen {
 	return &injectScreen{
 		inst:    inst,
-		formats: []inject.Format{inject.FormatDotenv, inject.FormatEnv, inject.FormatJSON, inject.FormatYAML},
+		formats: []inject.Format{inject.FormatDotenv, inject.FormatEnv, inject.FormatJSON, inject.FormatYAML, inject.FormatPowerShell},
 		mode:    inject.ModeHost,
 	}
 }

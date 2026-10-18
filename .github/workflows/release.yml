@@ -25,8 +25,8 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          # Without the tap token the release still ships; only the brew cask is skipped.
-          args: release --clean ${{ secrets.TAP_GITHUB_TOKEN == '' && '--skip=homebrew' || '' }}
+          # Without the tap token the release still ships; only the brew cask and scoop manifest are skipped.
+          args: release --clean ${{ secrets.TAP_GITHUB_TOKEN == '' && '--skip=homebrew,scoop' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

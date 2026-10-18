@@ -79,7 +79,7 @@ func (m *Manifest) ConfigPath() string {
 // fall back to Defaults (see InjectOrDefault).
 type Inject struct {
 	Out    string `yaml:"out"`    // output file (default ".env")
-	Format string `yaml:"format"` // dotenv|env|json|yaml (default "dotenv")
+	Format string `yaml:"format"` // dotenv|env|json|yaml|powershell (default "dotenv")
 	Mode   string `yaml:"mode"`   // host|docker (default "host")
 }
 

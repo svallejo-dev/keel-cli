@@ -133,3 +133,15 @@ func TestDotenvQuotesMultiline(t *testing.T) {
 		t.Errorf("multi-line value rendered as %q", out)
 	}
 }
+
+func TestRenderPowerShellQuotesLiterally(t *testing.T) {
+	b := &Bundle{Vars: []KV{{"DB_PASSWORD", "p$w'd"}, {"DB_HOST", "localhost"}}}
+	out, err := b.Render(FormatPowerShell)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	want := "$env:DB_PASSWORD = 'p$w''d'\n$env:DB_HOST = 'localhost'\n"
+	if out != want {
+		t.Fatalf("got %q, want %q", out, want)
+	}
+}

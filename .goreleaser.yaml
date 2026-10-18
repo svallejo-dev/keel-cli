@@ -43,6 +43,15 @@ homebrew_casks:
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/keel"]
           end
 
+scoops:
+  - name: keel
+    homepage: https://github.com/svallejo-dev/keel-cli
+    description: Local cloud-shaped infrastructure as a service (CLI + TUI)
+    repository:
+      owner: svallejo-dev
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+
 release:
   footer: |
     ## Instalación
@@ -51,4 +60,12 @@ release:
     curl -fsSL https://raw.githubusercontent.com/svallejo-dev/keel-cli/{{ .Tag }}/install.sh | KEEL_VERSION={{ .Tag }} sh
     # o
     brew install svallejo-dev/tap/keel
+    ```
+
+    Windows (PowerShell):
+
+    ```powershell
+    $env:KEEL_VERSION = '{{ .Tag }}'; irm https://raw.githubusercontent.com/svallejo-dev/keel-cli/{{ .Tag }}/install.ps1 | iex
+    # o
+    scoop bucket add keel https://github.com/svallejo-dev/scoop-bucket; scoop install keel
     ```

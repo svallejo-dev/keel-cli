@@ -46,7 +46,7 @@ guiado). Paridad garantizada: ambos usan la misma capa interna.
 - **Ciclo de vida**: `up` / `down` / `restart` (una o todas) y `destroy [--purge]`.
 - **Editar** params/notas (`update [--restart]`).
 - **Observar**: `list`, `describe` (detalle completo), `health`, `doctor`, `logs`.
-- **Conectar**: `connect` e `inject` (env/dotenv/json/yaml · host/docker) para cablear cualquier repo.
+- **Conectar**: `connect` e `inject` (env/dotenv/json/yaml/powershell · host/docker) para cablear cualquier repo.
 - **Auditar**: `audit`.
 
 **Operaciones por componente**
@@ -111,12 +111,29 @@ brew install svallejo-dev/tap/keel
 go install github.com/svallejo-dev/keel-cli/cmd/keel@latest
 ```
 
-En Windows, descarga el `.zip` desde [Releases](https://github.com/svallejo-dev/keel-cli/releases).
-Para actualizar, repite el comando de instalación (o `brew upgrade keel`).
+En Windows (PowerShell 5.1 o 7, sin permisos de administrador):
+
+```powershell
+# descarga, verifica el SHA-256, instala en %LOCALAPPDATA%\Programs\keel y lo añade a tu Path
+irm https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.ps1 | iex
+
+# una versión concreta
+$env:KEEL_VERSION = 'v0.1.0'; irm https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.ps1 | iex
+
+# Scoop
+scoop bucket add keel https://github.com/svallejo-dev/scoop-bucket
+scoop install keel
+```
+
+Para actualizar, repite el comando de instalación (o `brew upgrade keel` / `scoop update keel`).
 
 > **macOS:** los binarios no están notarizados por Apple. `curl`, `brew` y `go install`
 > no los marcan en cuarentena, así que corren sin avisos. Si descargas el archivo con el
 > navegador, desbloquéalo una vez: `xattr -d com.apple.quarantine ./keel`.
+>
+> **Windows:** necesitas Docker Desktop con backend WSL2 para el motor real. Usa Windows
+> Terminal o PowerShell 7 para que el TUI se vea bien; `cmd.exe` funciona, pero con
+> colores limitados.
 
 ## Inicio rápido
 
@@ -541,6 +558,8 @@ operaciones sobre instancias reales.
   `GOOGLE_CLOUD_PROJECT` para los SDKs de Google; `VAULT_ADDR`/`VAULT_TOKEN` para Vault.
 - **`--mode host`** (localhost:puertoMapeado) vs **`--mode docker`** (hostname de red)
   para consumidores en el host vs en contenedores.
+- **Formatos**: `dotenv`, `env` (`export …`, para bash/zsh: `eval "$(keel inject --all --format env)"`),
+  `json`, `yaml` y `powershell` (`$env:… = '…'`, para Windows: `keel inject --all --format powershell | iex`).
 
 ## Configuración
 
@@ -579,7 +598,9 @@ task demo       # provisiona el stack de ejemplo en modo mock
 
 Un tag `v*` dispara `.github/workflows/release.yml`: corre los tests y GoReleaser
 compila los binarios, publica el release con `checksums.txt` y actualiza el cask de
-`svallejo-dev/homebrew-tap` (si el secreto `TAP_GITHUB_TOKEN` existe).
+`svallejo-dev/homebrew-tap` y el manifest de `svallejo-dev/scoop-bucket` (si el secreto
+`TAP_GITHUB_TOKEN` existe). Cada push a `main` corre `.github/workflows/ci.yml`: tests en
+Linux, macOS y Windows, y `install.ps1` probado en PowerShell 7 y 5.1.
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0

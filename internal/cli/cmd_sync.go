@@ -187,7 +187,7 @@ Examples:
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "", "manifest path (default: ./keel.yaml)")
 	cmd.Flags().StringVar(&mode, "mode", "", "override address mode: host|docker")
-	cmd.Flags().StringVar(&format, "format", "", "override output format: dotenv|env|json|yaml")
+	cmd.Flags().StringVar(&format, "format", "", "override output format: dotenv|env|json|yaml|powershell")
 	cmd.Flags().StringVarP(&out, "out", "o", "", "override output file")
 	cmd.Flags().BoolVar(&resolve, "resolve", false, "write the config store's values into the connection file (overrides config.resolve)")
 	return cmd

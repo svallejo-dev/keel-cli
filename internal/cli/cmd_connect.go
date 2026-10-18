@@ -56,13 +56,15 @@ func newInjectCmd() *cobra.Command {
 consuming application injects at bootstrap — the platform's implementation of
 CONNECTION_INJECTION_PATTERN.md.
 
-Formats: dotenv (KEY=VALUE), env (export KEY=VALUE), json, yaml.
+Formats: dotenv (KEY=VALUE), env (export KEY=VALUE), json, yaml,
+         powershell ($env:KEY = 'VALUE').
 Modes:   host (localhost:mappedPort) for host apps, docker (network hostname) for
          containerized apps.
 
 Examples:
   keel inject orders-db session-cache --format dotenv --out .env
-  keel inject --all --format yaml --mode docker --out infra.yaml`,
+  keel inject --all --format yaml --mode docker --out infra.yaml
+  keel inject --all --format powershell | iex   # Windows PowerShell`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mgr, err := buildManager()
 			if err != nil {
@@ -103,7 +105,7 @@ Examples:
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&format, "format", string(inject.FormatDotenv), "output format: dotenv|env|json|yaml")
+	cmd.Flags().StringVar(&format, "format", string(inject.FormatDotenv), "output format: dotenv|env|json|yaml|powershell")
 	cmd.Flags().StringVar(&mode, "mode", string(inject.ModeHost), "address mode: host|docker")
 	cmd.Flags().StringVarP(&out, "out", "o", "", "output file (default: stdout)")
 	cmd.Flags().BoolVar(&all, "all", false, "inject every instance")
