@@ -1,0 +1,54 @@
+version: 2
+project_name: keel
+
+builds:
+  - main: ./cmd/keel
+    binary: keel
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: -s -w -X github.com/svallejo-dev/keel-cli/internal/cli.Version={{.Version}}
+
+archives:
+  # Version-less names keep releases/latest/download/<asset> stable for install.sh.
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+homebrew_casks:
+  - name: keel
+    homepage: https://github.com/svallejo-dev/keel-cli
+    description: Local cloud-shaped infrastructure as a service (CLI + TUI)
+    repository:
+      owner: svallejo-dev
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    hooks:
+      post:
+        # The binary is not notarized; brew quarantines casks, so lift it.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/keel"]
+          end
+
+release:
+  footer: |
+    ## Instalación
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/svallejo-dev/keel-cli/{{ .Tag }}/install.sh | KEEL_VERSION={{ .Tag }} sh
+    # o
+    brew install svallejo-dev/tap/keel
+    ```

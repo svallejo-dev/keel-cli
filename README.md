@@ -84,20 +84,43 @@ cambios. La interfaz `Provider` permite cambiar cualquier blueprint entre driver
 
 ## Requisitos previos
 
-- **Go 1.26+** (para compilar).
 - **Docker Desktop** — requerido para el motor real. Sin él, keel corre
   automáticamente en modo **mock** (las instancias son simuladas) para que la
   CLI/TUI sigan siendo totalmente usables. Verifícalo cuando quieras con
   `keel doctor`.
-- Opcional: [go-task](https://taskfile.dev) para los atajos `task`.
+- Solo para compilar desde el código: **Go 1.26+** y, opcional,
+  [go-task](https://taskfile.dev) para los atajos `task`.
+
+## Instalación
+
+No necesitas Go ni clonar el repo: cada release publica binarios para macOS, Linux y
+Windows (amd64/arm64).
+
+```bash
+# macOS / Linux: descarga el binario, verifica su SHA-256 y lo deja en ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.sh | sh
+
+# una versión concreta, o en otra carpeta
+curl -fsSL https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.sh | KEEL_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.sh | sudo env KEEL_BIN_DIR=/usr/local/bin sh
+
+# Homebrew
+brew install svallejo-dev/tap/keel
+
+# con Go
+go install github.com/svallejo-dev/keel-cli/cmd/keel@latest
+```
+
+En Windows, descarga el `.zip` desde [Releases](https://github.com/svallejo-dev/keel-cli/releases).
+Para actualizar, repite el comando de instalación (o `brew upgrade keel`).
+
+> **macOS:** los binarios no están notarizados por Apple. `curl`, `brew` y `go install`
+> no los marcan en cuarentena, así que corren sin avisos. Si descargas el archivo con el
+> navegador, desbloquéalo una vez: `xattr -d com.apple.quarantine ./keel`.
 
 ## Inicio rápido
 
 ```bash
-# instalar (queda en tu PATH vía $GOBIN / $GOPATH/bin)
-go install github.com/svallejo-dev/keel-cli/cmd/keel@latest
-# o desde un clon: go install ./cmd/keel   ·   go build -o bin/keel ./cmd/keel
-
 # abrir el panel interactivo (launcher): crear infra, nuevo proyecto, doctor…
 keel
 
@@ -550,4 +573,15 @@ Los ajustes de la plataforma vienen de variables de entorno (ver
 ```bash
 task check      # go fmt + vet + test
 task demo       # provisiona el stack de ejemplo en modo mock
+```
+
+### Publicar una versión
+
+Un tag `v*` dispara `.github/workflows/release.yml`: corre los tests y GoReleaser
+compila los binarios, publica el release con `checksums.txt` y actualiza el cask de
+`svallejo-dev/homebrew-tap` (si el secreto `TAP_GITHUB_TOKEN` existe).
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+goreleaser release --snapshot --clean   # ensayo local en ./dist, sin publicar nada
 ```
