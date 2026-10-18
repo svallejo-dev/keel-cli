@@ -1,4 +1,5 @@
-# Installs keel from GitHub Releases on Windows. Env: KEEL_VERSION (default latest), KEEL_INSTALL_DIR.
+# Installs keel from GitHub Releases on Windows. Keep this file ASCII: PowerShell 5.1 does not assume UTF-8.
+# Env: KEEL_VERSION (default latest), KEEL_INSTALL_DIR.
 # Usage: irm https://raw.githubusercontent.com/svallejo-dev/keel-cli/main/install.ps1 | iex
 
 # The scriptblock keeps variables out of the caller's session, and throw (not exit) avoids closing it under iex.
@@ -40,7 +41,7 @@
         $expected = if ($line) { ($line -split '\s+')[0].ToLower() } else { '' }
         $actual = (Get-FileHash (Join-Path $tmp $asset) -Algorithm SHA256).Hash.ToLower()
         if (-not $expected -or $expected -ne $actual) {
-            throw "keel: checksum inválido para $asset, no se instaló nada"
+            throw "keel: el checksum de $asset no coincide, no se ha instalado nada"
         }
 
         Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath (Join-Path $tmp 'x') -Force
@@ -60,7 +61,7 @@
         # Setting any user variable broadcasts WM_SETTINGCHANGE so new terminals pick up the Path.
         [Environment]::SetEnvironmentVariable('KEEL_INSTALLER', '1', 'User')
         [Environment]::SetEnvironmentVariable('KEEL_INSTALLER', $null, 'User')
-        Write-Host "keel: $binDir añadido a tu Path de usuario (abre una terminal nueva)"
+        Write-Host "keel: $binDir agregado al Path de tu usuario (abre una terminal nueva)"
     }
     $envKey.Close()
     if (($env:Path -split ';') -notcontains $binDir) { $env:Path = "$env:Path;$binDir" }
