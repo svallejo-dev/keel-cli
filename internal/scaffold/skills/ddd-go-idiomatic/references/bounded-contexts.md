@@ -1,186 +1,161 @@
-# Bounded Contexts en Go
+# Bounded Contexts in Go
 
-## Regla #0 — Ante conflicto, gana go-idiomatic
+DDD is a set of **heuristics about where behaviour lives**, not a folder structure or a
+framework. When a tactical DDD rule clashes with idiomatic Go, Go wins: no top-level
+`domain/application/infrastructure` layers, no `AbstractRepositoryFactory`, no central
+`interfaces` package. A bounded context in Go is, almost always, **one package inside
+`internal/`**.
 
-DDD es un conjunto de **heurísticas sobre dónde vive el comportamiento**, no una estructura de
-carpetas ni un framework. Cuando una regla táctica de DDD choca con el estilo idiomático de Go, gana
-Go: nada de capas `domain/application/infrastructure` de nivel superior, nada de
-`AbstractRepositoryFactory`, nada de getters/setters ceremoniales, nada de un paquete `interfaces`
-central. Un bounded context en Go es, casi siempre, **un paquete dentro de `internal/`**.
+Tactical details live in [value-objects.md](value-objects.md), [entities.md](entities.md),
+[aggregates.md](aggregates.md), [application-layer.md](application-layer.md) and
+[antipatterns.md](antipatterns.md). Examples use the module `example.com/shop`.
 
-Esta referencia es autocontenida. `senior-go-idiomatic` es una skill compañera opcional, no un
-requisito. Los detalles tácticos viven en `references/value-objects.md`, `references/entities.md`,
-`references/aggregates.md`, `references/application-layer.md` y `references/antipatterns.md`.
+## 1. What a bounded context is and how it maps to Go
 
----
+A bounded context is a boundary inside which a model and its language are coherent and
+unambiguous. In Go that boundary is **a package** (or a small cluster of packages) under
+`internal/`.
 
-## 1. Qué es un bounded context y cómo mapea a Go
+- `internal/` is a **privacy boundary the compiler enforces**: only the tree rooted at its parent can import it.
+- The **context is the package** (`internal/identity`, `internal/billing`), named after the context.
 
-Un bounded context es un límite dentro del cual un modelo y su lenguaje son coherentes y sin
-ambigüedad. En Go ese límite es **un paquete** (o un clúster pequeño de paquetes) bajo `internal/`.
+The root type, its value objects, invariants and persistence port live together: they are
+one concept, not three technical packages. The `identity` package of the
+[worked example](worked-example.md) is the reference: `User` with unexported fields, built
+only through `NewUser(id, email, name, now) (*User, error)`.
 
-- `internal/` es la **frontera de privacidad** que impone el compilador: solo lo importa el árbol enraizado en el padre de ese `internal/`.
-- El **contexto es el paquete** (`internal/identity`, `internal/billing`): el paquete se llama como el contexto.
+## 2. Ubiquitous language = the package's exported vocabulary
 
-El tipo raíz, sus value objects, invariantes e interfaz de persistencia viven juntos: son el mismo
-concepto, no tres paquetes técnicos.
+A context's ubiquitous language **is its exported API**; the package name is part of it
+(`identity.NewUser`, `identity.Email`, `identity.RegisterUser`). The domain reads in the
+exported identifiers, not in external documentation.
 
-```go
-// internal/identity/user.go
-package identity
-
-// User es la entidad raíz del bounded context identity.
-type User struct {
-	id    string
-	email Email
-}
-
-func Register(id string, email Email) *User {
-	return &User{id: id, email: email}
-}
-
-func (u *User) ID() string   { return u.id }
-func (u *User) Email() Email { return u.email }
-```
-
-Los campos son no-exportados: el invariante (un `User` siempre tiene un `Email` válido) solo se
-puede construir vía `Register`. Ver `references/entities.md` para identidad y ciclo de vida.
-
----
-
-## 2. Ubiquitous language = el vocabulario exportado del paquete
-
-El ubiquitous language de un contexto **es su API exportada**; el nombre del paquete es el lenguaje
-(`identity.Register`, `identity.Email`, `identity.User`). El dominio se lee en los identificadores
-exportados, no en documentación externa.
+**internal/identity/email.go**
 
 ```go
-// internal/identity/email.go
 package identity
 
 import (
 	"fmt"
+	"net/mail"
 	"strings"
 )
 
-// Email es un value object: se valida al construir y es inmutable.
-type Email string
+// Email is a lower-cased address that is valid by construction.
+type Email struct{ v string }
 
-func ParseEmail(raw string) (Email, error) {
-	raw = strings.TrimSpace(raw)
-	if !strings.Contains(raw, "@") {
-		return "", fmt.Errorf("identity: email inválido %q", raw)
+// NewEmail trims and lower-cases raw and fails with ErrInvalidEmail if it is not an address.
+func NewEmail(raw string) (Email, error) {
+	addr := strings.ToLower(strings.TrimSpace(raw))
+	if _, err := mail.ParseAddress(addr); err != nil {
+		return Email{}, fmt.Errorf("%w: %q", ErrInvalidEmail, raw)
 	}
-	return Email(raw), nil
+	return Email{v: addr}, nil
 }
+
+// String returns the normalized address.
+func (e Email) String() string { return e.v }
 ```
 
-**Nada de paquetes-cajón.** `util`, `common`, `models`, `types`, `helpers` no tienen ubiquitous
-language: no representan ningún concepto del dominio, solo agrupan cosas. Si no puedes nombrar el
-paquete con un sustantivo específico del negocio, todavía no has encontrado el contexto.
+**No grab-bag packages.** `util`, `common`, `models`, `types`, `helpers` have no ubiquitous
+language: they represent no domain concept, they only group things. If you cannot name the
+package with a business-specific noun, you have not found the context yet.
 
-| Paquete | Por qué falla |
+| Package | Why it fails |
 |---|---|
-| `models` | ORM thinking; el tipo queda separado de su comportamiento |
-| `util` / `common` | Cajón sin frontera; acopla contextos que no deberían tocarse |
-| `types` | Capa anémica de datos; nadie es dueño del invariante |
-| `service` | "Servicio" no es un concepto; suele ser un God object |
+| `models` | ORM thinking; the type is separated from its behaviour |
+| `util` / `common` | A drawer without a boundary; couples contexts that should not touch |
+| `types` | Anemic data layer; nobody owns the invariant |
+| `service` | "Service" is not a concept; it usually becomes a god object |
 
-La misma regla baja un nivel, a los **archivos** del contexto: `service.go`, `usecase.go`,
-`manager.go` o `helpers.go` no dicen qué hacen. Dentro de un contexto, cada archivo nombra un
-concepto (`user.go`, `email.go`) o un caso de uso (`register_user.go`, `login.go`).
+The same rule applies one level down, to **files**: inside a context each file names a
+concept (`user.go`, `email.go`) or a use case (`register_user.go`, `log_in.go`). The file
+rules are in [application-layer.md](application-layer.md) §2.
 
-Por qué un value object como `Email` evita la primitive obsession: ver `references/value-objects.md`.
+## 3. Folder per CONTEXT, not per layer
 
----
-
-## 3. Carpeta por CONTEXTO, no por capa
-
-Este es el error central que trasplantan quienes vienen de Java/C#: organizar el árbol por capa
-técnica. En Go se organiza por **concepto**.
+The central mistake transplanted from Java/C# is organizing the tree by technical layer. Go
+organizes by **concept**.
 
 ```
-# BAD — capas técnicas de nivel superior (Java-ism)
+# BAD: top-level technical layers
 internal/
-├── domain/          ← ¿de qué dominio?
-├── application/     ← capa, no concepto
-└── infrastructure/  ← el modelo de User vive lejos de su lógica
+├── domain/          ← which domain?
+├── application/     ← a layer, not a concept
+└── infrastructure/  ← the User model lives far from its logic
 ```
 
 ```
-# GOOD — un paquete por contexto; dentro, un ARCHIVO por concepto o caso de uso
+# GOOD: one package per context; inside, one FILE per concept or use case
 internal/
 ├── identity/
-│   ├── user.go              ← entidad raíz + constructores
+│   ├── user.go              ← entity + package doc
 │   ├── email.go             ← value object
-│   ├── user_store.go        ← puerto de persistencia compartido (consumer-defined)
-│   ├── register_user.go     ← caso de uso RegisterUser
-│   ├── login.go             ← caso de uso Login
-│   └── change_email.go      ← caso de uso ChangeEmail
+│   ├── user_repository.go   ← shared persistence port (consumer-defined)
+│   ├── register_user.go     ← use case RegisterUser
+│   ├── log_in.go            ← use case LogIn
+│   ├── change_email.go      ← use case ChangeEmail
+│   └── pgstore/             ← infrastructure subpackage
 └── billing/
     ├── customer.go
-    ├── accounts.go          ← puerto hacia identity (consumer-defined)
-    └── charge_customer.go   ← caso de uso ChargeCustomer
+    ├── accounts.go          ← port towards identity (consumer-defined)
+    └── charge_customer.go   ← use case ChargeCustomer
 ```
 
 ```
-# BAD — archivos-cajón dentro del contexto
+# BAD: grab-bag files inside the context
 internal/identity/
-├── models.go        ← ¿qué modelos?
-├── service.go       ← Login(), Signup(), ChangeEmail()… todo junto
-└── handler.go       ← todos los endpoints
+├── models.go        ← which models?
+├── service.go       ← LogIn(), SignUp(), ChangeEmail()... all together
+└── handler.go       ← every endpoint
 ```
 
-Un archivo = una intención. Abrir el árbol de `identity` debe bastar para saber qué sabe hacer el
-contexto: registrar, iniciar sesión, cambiar el email. Si dos casos de uso comparten archivo
-(`Login()` y `Signup()` en `service.go`), sepáralos aunque sean cortos.
+Inside the context, split **by file**, not by subpackage: the package is the unit of design
+and files only organize reading. Nesting subpackages does **not** create hierarchy or grant
+access to the "parent's" unexported identifiers; visibility in Go is per package, never per
+folder.
 
-Dentro del contexto se separa **por archivo**, no por sub-paquete: el paquete es la unidad de
-diseño y los archivos solo organizan la lectura. Anidar sub-paquetes **no** crea jerarquía ni da
-acceso a los no-exportados del "padre" — la visibilidad en Go es por paquete, nunca por carpeta.
+Extract a subpackage only for a detail with its own name: infrastructure
+(`internal/identity/pgstore/`) and transport (`internal/identity/identityhttp/`). The
+interface lives in the consumer (`identity`) and the implementation in the subpackage: the
+context does **not** import `pgstore`; it is the other way round.
 
-Extrae un sub-paquete **solo cuando el contexto crece** y aparece un detalle de infra con nombre
-propio — típicamente la impl de la persistencia en `internal/identity/pgstore/`. La interfaz vive en
-el consumidor (`identity`), la implementación en el sub-paquete: el contexto **no** importa `pgstore`,
-es al revés.
+**internal/identity/user_repository.go**
 
 ```go
-// internal/identity/user_store.go
 package identity
 
 import "context"
 
-// UserStore es la persistencia de User que comparten los casos de uso del contexto.
-type UserStore interface {
-	ByID(ctx context.Context, id string) (*User, error)
+// UserRepository is the persistence port shared by the context's use cases.
+type UserRepository interface {
+	FindByID(ctx context.Context, id UserID) (*User, error)
+	ExistsByEmail(ctx context.Context, email Email) (bool, error)
 	Save(ctx context.Context, u *User) error
 }
 ```
 
-Cada caso de uso (`register_user.go`, `change_email.go`) es un tipo propio que coordina agregados y
-transacciones: ver `references/application-layer.md`. Layout completo y anti-patrones: `references/antipatterns.md`.
+## 4. Integration between contexts
 
----
+**Never import another context's internals.** Two packages compiling together does not mean
+they should be coupled. Contexts talk through three channels:
 
-## 4. Integración entre contextos
-
-**Nunca importes los internals de otro contexto.** Que dos paquetes compilen juntos no significa que
-deban acoplarse. Los contextos se comunican por exactamente tres vías:
-
-1. **Interfaz publicada consumer-defined** — el consumidor declara qué necesita; se satisface al cablear.
-2. **Eventos** — el productor publica un domain event; los consumidores se suscriben sin importarlo.
-3. **Anti-Corruption Layer (ACL)** — una función/paquete pequeño de traducción en la frontera.
+1. **Consumer-defined published interface**: the consumer declares what it needs; wiring satisfies it.
+2. **Events**: the producer publishes a domain event; consumers subscribe without importing it.
+3. **Anti-Corruption Layer (ACL)**: a small translation package at the border.
 
 ### Consumer-defined interface
 
-`billing` declara lo que necesita del exterior. **No importa `identity`**; declara el contrato con su
-propio vocabulario:
+`billing` declares what it needs from outside, in its own vocabulary, **without importing
+`identity`**:
+
+**internal/billing/customer.go**
 
 ```go
-// internal/billing/customer.go
+// Package billing charges customers; it never imports identity.
 package billing
 
-// Customer es el modelo de billing de la persona que paga; no es identity.User.
+// Customer is billing's read-only snapshot of a paying person, not identity.User.
 type Customer struct {
 	AccountID string
 	Email     string
@@ -188,66 +163,72 @@ type Customer struct {
 }
 ```
 
+**internal/billing/accounts.go**
+
 ```go
-// internal/billing/accounts.go
 package billing
 
 import "context"
 
-// Accounts resuelve clientes fuera de billing; se satisface al cablear.
+// Accounts resolves customers that live outside billing; wiring provides the implementation.
 type Accounts interface {
 	Lookup(ctx context.Context, accountID string) (Customer, error)
 }
 ```
 
-Un mismo humano es `User` en `identity` y `Customer` en `billing`: cada contexto modela lo que
-necesita, y `billing` declara el contrato sin importar `identity`.
+The same human is a `User` in `identity` and a `Customer` in `billing`: each context models
+what it needs. `Customer` is a plain snapshot returned by a port, not a billing entity, so
+exported fields are fine here.
 
-### Eventos
+### Events
 
-Un domain event cruza la frontera con **tipos primitivos/serializables**, nunca con value objects
-internos (`identity.Email` no debe filtrarse a otro contexto ni a un bus):
+A domain event crosses the border with **primitive, serializable types**, never internal
+value objects (`identity.Email` must not leak to another context or onto a bus):
+
+**internal/identity/user_registered.go**
 
 ```go
-// internal/identity/user_registered.go
 package identity
 
-// UserRegistered se publica al dar de alta un usuario.
+// UserRegistered is published after RegisterUser saves a new user.
 type UserRegistered struct {
 	UserID string
 	Email  string
 }
 ```
 
-### Anti-Corruption Layer mínima
+### Minimal Anti-Corruption Layer
 
-El ACL es el **único** lugar que conoce ambos contextos: traduce el modelo de `identity` al de
-`billing`, satisface la interfaz consumer-defined y aísla a `billing` de cambios en `identity`.
+The ACL is the **only** place that knows both contexts: it translates `identity`'s model
+into `billing`'s, satisfies the consumer-defined interface and shields `billing` from changes
+in `identity`.
+
+**internal/acl/identityacl/accounts.go**
 
 ```go
-// internal/acl/identityacl/accounts.go
-
-// Package identityacl traduce identity al modelo de billing.
+// Package identityacl translates identity users into billing customers.
 package identityacl
 
 import (
 	"context"
 
-	"shop/internal/billing"
-	"shop/internal/identity"
+	"example.com/shop/internal/billing"
+	"example.com/shop/internal/identity"
 )
 
-// Adapter satisface billing.Accounts leyendo de identity.UserStore.
-type Adapter struct {
-	users identity.UserStore
+// Accounts satisfies billing.Accounts by reading identity users.
+type Accounts struct {
+	users identity.UserRepository
 }
 
-func New(users identity.UserStore) *Adapter { return &Adapter{users: users} }
+// New adapts an identity repository for billing.
+func New(users identity.UserRepository) *Accounts { return &Accounts{users: users} }
 
-var _ billing.Accounts = (*Adapter)(nil)
+var _ billing.Accounts = (*Accounts)(nil)
 
-func (a *Adapter) Lookup(ctx context.Context, accountID string) (billing.Customer, error) {
-	u, err := a.users.ByID(ctx, accountID)
+// Lookup treats the billing account ID as an identity user ID.
+func (a *Accounts) Lookup(ctx context.Context, accountID string) (billing.Customer, error) {
+	u, err := a.users.FindByID(ctx, identity.UserID(accountID))
 	if err != nil {
 		return billing.Customer{}, err
 	}
@@ -256,65 +237,53 @@ func (a *Adapter) Lookup(ctx context.Context, accountID string) (billing.Custome
 
 func translate(u *identity.User) billing.Customer {
 	return billing.Customer{
-		AccountID: u.ID(),
-		Email:     string(u.Email()),
-		Plan:      "free", // identity no sabe de planes; el default lo pone billing
+		AccountID: string(u.ID()),
+		Email:     u.Email().String(),
+		Plan:      "free", // identity knows nothing about plans; billing's default applies
 	}
 }
 ```
 
-El wiring (`cmd/`) es el único punto que importa ambos contextos e inyecta el ACL:
-`identityacl.New(users)` satisface `billing.Accounts`, que recibe el caso de uso que lo necesita
-(`billing.NewChargeCustomer(accounts, ...)`). Ni `identity`
-ni `billing` se importan entre sí; solo el wiring y el ACL conocen a los dos.
+The wiring (`cmd/`) is the only other place that imports both contexts: it builds
+`identityacl.New(users)` and passes it to the billing use case that needs it
+(`billing.NewChargeCustomer(accounts, ...)`). Neither `identity` nor `billing` imports the
+other.
 
----
+## 5. Each context has its own model
 
-## 5. Cada contexto tiene su propio modelo
+`identity.User` **is not** `billing.Customer`. A shared "global" type reintroduces `models`
+and couples independent contexts.
 
-`identity.User` **no es** `billing.Customer`: el mismo humano es `User` con `Email` aquí y `Customer`
-con `Plan` allá. Un tipo "global" compartido reintroduce `models` y acopla contextos independientes.
+- No type crosses the border as-is: it is **translated** (the ACL's `translate`).
+- A change in `identity.User` breaks **only** the ACL, not all of `billing`. That is the point.
+- IDs cross as strings or UUIDs, not as entities: store `AccountID`, not `*identity.User`.
 
-- Ningún tipo cruza la frontera tal cual: se **traduce** (ver el `translate` del ACL).
-- Un cambio en `identity.User` rompe **solo** el ACL, no todo `billing`. Ese es el propósito.
-- Los IDs cruzan como `string`/`uuid`, no como entidad: guarda `AccountID`, no `*identity.User`.
+## 6. Context = package, not automatically a service
 
-Cuándo un `string` desnudo merece ser un value object propio: ver `references/value-objects.md`.
-Cuándo un cúmulo de tipos forma un agregado con raíz única: ver `references/aggregates.md`.
+A bounded context is a **logical** boundary, not a deployment one. Do not turn it into a
+microservice by default: a package is free to move and checked by the compiler; the network
+costs latency, versioning and observability.
 
----
-
-## 6. Contexto = paquete, no automáticamente servicio
-
-Un bounded context es un **límite lógico**, no de despliegue. No lo vuelvas microservicio por defecto:
-un paquete es gratis de mover y lo verifica el compilador; la red cuesta latencia, versionado y observabilidad.
-
-- **Paquete primero.** `internal/identity` e `internal/billing` en el mismo binario.
-- **Separa a servicio solo cuando el límite ya está probado**: interfaz consumer-defined y ACL
-  estables, más una razón operativa real (escalado, aislamiento de fallos, equipos distintos).
-- Con el ACL bien hecho, promover a servicio es reimplementar el `Adapter` sobre HTTP/gRPC **sin
-  tocar** `billing`: `Accounts` no cambia, solo su implementación.
+- **Package first**: `internal/identity` and `internal/billing` in the same binary.
+- **Split into a service only once the boundary is proven**: a stable consumer-defined
+  interface and ACL, plus a real operational reason (scaling, fault isolation, separate teams).
+- With a good ACL, promoting to a service means reimplementing `identityacl.Accounts` over
+  HTTP/gRPC **without touching** `billing`: `Accounts` stays, only its implementation changes.
 
 ```
-Monolito:   billing ──(Accounts)──▶ identityacl.Adapter ──▶ identity.UserStore (in-proc)
-Servicio:   billing ──(Accounts)──▶ identityacl.Adapter ──▶ HTTP client ──▶ identity-svc
+Monolith:  billing ──(Accounts)──▶ identityacl.Accounts ──▶ identity.UserRepository (in-process)
+Service:   billing ──(Accounts)──▶ identityacl.Accounts ──▶ HTTP client ──▶ identity service
 ```
-
-Empezar por servicios ata el diseño a una decisión de infraestructura antes de saber si el límite es
-el correcto. Paga ese coste una vez, tarde, y solo tras hacer bien los paquetes.
-
----
 
 ## Checklist
 
-- [ ] Cada bounded context es **un paquete** bajo `internal/` (`internal/identity`, `internal/billing`)
-- [ ] El árbol se organiza por **contexto**, no por capa (`domain/application/infrastructure`)
-- [ ] Dentro del contexto se separa por **archivo**; sub-paquete solo para infra (`pgstore`) y transporte
-- [ ] Cada archivo nombra un concepto (`user.go`) o un caso de uso (`register_user.go`); cero `service.go`, `usecase.go`, `manager.go`, `helpers.go`
-- [ ] La API exportada es el **ubiquitous language**; cero paquetes-cajón (`util`, `models`, `types`)
-- [ ] Ningún contexto importa los internals de otro; se hablan por interfaz consumer-defined, evento o ACL
-- [ ] Las interfaces se definen en el **consumidor**; las implementa un sub-paquete de infra
-- [ ] Cada contexto tiene su **propio modelo**; los tipos se **traducen** en la frontera (ACL), no se comparten
-- [ ] Los eventos y los IDs cruzan como **primitivos**, nunca como value objects o punteros a entidades
-- [ ] Contexto = paquete por defecto; **separar a servicio solo cuando el límite ya está probado**
-- [ ] Ante conflicto DDD vs go-idiomatic, **gana go-idiomatic** (Regla #0)
+- [ ] Each bounded context is **one package** under `internal/` (`internal/identity`, `internal/billing`).
+- [ ] The tree is organized by **context**, not by layer (`domain/application/infrastructure`).
+- [ ] Inside a context, split by **file**; subpackages only for infrastructure (`pgstore`) and transport (`identityhttp`).
+- [ ] Each file names a concept (`user.go`) or a use case (`register_user.go`); no `service.go`, `usecase.go`, `manager.go`, `helpers.go`.
+- [ ] The exported API is the **ubiquitous language**; no grab-bag packages (`util`, `models`, `types`).
+- [ ] No context imports another's internals; they talk through consumer-defined interfaces, events or an ACL.
+- [ ] Interfaces are defined by the **consumer**; an infrastructure subpackage implements them.
+- [ ] Each context has its **own model**; types are **translated** at the border, not shared.
+- [ ] Events and IDs cross as **primitives**, never as value objects or entity pointers.
+- [ ] Context = package by default; **split into a service only when the boundary is proven**.

@@ -1,240 +1,274 @@
-# Error Handling Avanzado — Go Idiomatic Reference
+# Advanced Error Handling — Go Idiomatic Reference
 
-El modelo base vive en `SKILL.md`, sección **Error Handling (M6)**: wrapping con `%w`, inspección con `errors.Is` / `errors.As`, sentinel errors, y propagación con `errgroup`. Eso ya está — no se repite aquí. Este archivo cubre lo avanzado: sentinel vs typed vs opaque, interfaces de comportamiento, agregación con `errors.Join`, y el uso correcto de `panic` / `recover` (incluyendo fronteras de goroutine).
+The base rules live in the error-handling section of `SKILL.md`: wrap with `%w` when it
+adds context, inspect with `errors.Is` / `errors.As`, sentinel errors, and `errgroup` for
+goroutines. They are not repeated here. This file covers the decisions on top of them:
+opaque vs sentinel vs typed errors, behavior interfaces, aggregation with `errors.Join`,
+and `panic` / `recover` (including goroutine boundaries).
 
 ---
 
-## Sentinel vs Typed vs Opaque
+## Opaque vs Sentinel vs Typed
 
-Tres formas de exponer un error, en orden creciente de acoplamiento con el llamador. La decisión no es de estilo: define cuánto puede el llamador depender de tu implementación interna.
+Three ways to expose an error, in increasing order of coupling with the caller. This is an
+API decision, not a style one: it fixes how much the caller may depend on your internals.
 
-| Forma | Qué expone | El llamador… | Úsalo cuando |
+| Form | Exposes | The caller can… | Use it when |
 |---|---|---|---|
-| **Opaque** (default) | Nada — solo el mensaje | Solo puede loguear o propagar | El llamador no necesita distinguir este error de otro |
-| **Sentinel** | La identidad (`var ErrX`) | Compara con `errors.Is` | Existe una condición discreta que el llamador ramifica (`ErrNotFound`) |
-| **Typed** | Un tipo con datos | Extrae campos con `errors.As` | El llamador necesita **datos** del error (campo inválido, código, retry-after) |
+| **Opaque** (default) | Only the message | Log it or propagate it | The caller has no reason to tell this error apart |
+| **Sentinel** | An identity (`var ErrX`) | Compare with `errors.Is` | There is a discrete condition the caller branches on (`ErrNotFound`) |
+| **Typed** | A type with data | Extract fields with `errors.As` | The caller needs **data** from the error (invalid field, code, retry-after) |
 
-**Regla:** empieza opaco. Promueve a sentinel o typed solo cuando un llamador real necesita ramificar sobre el error. Cada identidad y cada campo que expones se vuelve parte de tu API pública y ata a tus consumidores a tu implementación.
+Start opaque. Promote to sentinel or typed only when a real caller needs to branch on the
+error: every identity and every field you expose becomes public API and ties your
+consumers to your implementation.
 
-### Opaque — el default
+### Opaque — the default
 
 ```go
-// El llamador no puede inspeccionar la causa; solo propagarla con más contexto.
-// Cambiar la implementación interna nunca rompe a nadie.
-func loadConfig(id int64) error {
-    if id == 0 {
-        return fmt.Errorf("load config id=%d: %w", id, ErrNotFound)
-    }
-    return nil
+// Callers can log or propagate this, not inspect it, so the internals can change freely.
+func loadConfig(path string) (*Config, error) {
+	if _, err := os.ReadFile(path); err != nil {
+		return nil, fmt.Errorf("load config %s: %v", path, err)
+	}
+	return &Config{}, nil
 }
 ```
 
-### Sentinel — condición que el llamador compara
+The verb is the decision: `%w` makes the wrapped error part of your contract (callers can
+`errors.Is` it), `%v` keeps only its text. Wrap with `%w` when you are willing to support
+the cause as API — for example a sentinel of your own package — and use `%v` for
+implementation details you may swap later.
+
+### Sentinel — a condition the caller compares
 
 ```go
-// Definido a nivel de paquete, exportado. El llamador hace errors.Is(err, ErrNotFound).
+// ErrNotFound is returned when no user matches; compare with errors.Is.
 var ErrNotFound = errors.New("user: not found")
 ```
 
-Ver `SKILL.md` M6 para la mecánica de `errors.Is` sobre cadenas envueltas.
-
-### Typed — cuando el llamador necesita datos
+### Typed — when the caller needs data
 
 ```go
 type ValidationError struct {
-    Field string
-    Msg   string
+	Field string
+	Msg   string
 }
 
 func (e *ValidationError) Error() string {
-    return fmt.Sprintf("validation: field %q: %s", e.Field, e.Msg)
+	return fmt.Sprintf("validation: field %q: %s", e.Field, e.Msg)
 }
 
-// El llamador extrae el dato, no solo la identidad:
+// The caller extracts data, not just identity.
 var vErr *ValidationError
 if errors.As(err, &vErr) {
-    respondBadRequest(w, vErr.Field) // necesita el campo concreto
+	respondBadRequest(w, vErr.Field)
 }
 ```
 
 ---
 
-## Interfaces de Comportamiento (behavior, no type)
+## Behavior Interfaces (Behavior, Not Type)
 
-Exponer un tipo concreto (`errors.As` a `*MyError`) ata al llamador a tu struct. Exponer **comportamiento** no: el llamador hace `errors.As` a una **interfaz** que él mismo define, y tú implementas ese método sin exportar el tipo. Es el patrón de `net.Error` (`Timeout() bool`, `Temporary() bool`).
+Exposing a concrete type (`errors.As` into `*MyError`) ties the caller to your struct.
+Exposing **behavior** does not: the caller runs `errors.As` against a small interface it
+defines itself, and you implement that method on an unexported type. For cross-cutting
+conditions — retryable, timeout — expose a method, not a type; any error from any package
+that implements the method then classifies.
 
-**Regla:** para condiciones transversales (es temporal, es un timeout, se puede reintentar), expón un método, no un tipo. Desacopla al productor del consumidor: cualquier error de cualquier paquete que implemente el método clasifica.
+Do not model new code on `net.Error`'s `Temporary()`: it has been deprecated since Go 1.18
+because "temporary" was never well defined. `Timeout() bool` is still fine; for retry
+decisions, define the behavior you actually mean.
 
 ```go
-// El paquete que INSPECCIONA define la interfaz mínima que le importa.
-type temporary interface {
-    Temporary() bool
+// The package that INSPECTS declares the minimal interface it cares about.
+type retryable interface {
+	Retryable() bool
 }
 
-func IsTemporary(err error) bool {
-    var t temporary
-    return errors.As(err, &t) && t.Temporary()
+func IsRetryable(err error) bool {
+	var r retryable
+	return errors.As(err, &r) && r.Retryable()
 }
 ```
 
 ```go
-// El paquete que PRODUCE implementa el comportamiento sin exportar el tipo.
-// Unwrap mantiene la cadena viva para errors.Is / errors.As.
+// The package that PRODUCES implements the behavior without exporting the type.
+// Unwrap keeps the chain intact for errors.Is / errors.As.
 type transientError struct {
-    err error
+	err error
 }
 
 func (e *transientError) Error() string   { return e.err.Error() }
 func (e *transientError) Unwrap() error   { return e.err }
-func (e *transientError) Temporary() bool { return true }
+func (e *transientError) Retryable() bool { return true }
 ```
 
-`errors.As(err, &t)` con `t` de tipo interfaz recorre la cadena y hace match con el primer error que satisface el método. Ni el productor ni el consumidor conocen el tipo concreto del otro.
+`errors.As(err, &r)` with an interface-typed target walks the chain and matches the first
+error that has the method. Neither side knows the other's concrete type.
 
 ---
 
-## `errors.Join` — Agregar Múltiples Errores  `// Go 1.20+`
+## errors.Join — Aggregating Several Errors
 
-`errors.Join` combina N errores en uno solo. Devuelve `nil` si todos los argumentos son `nil`, así que es seguro pasarle un slice que puede estar vacío. El error resultante implementa `Unwrap() []error`, de modo que `errors.Is` / `errors.As` inspeccionan **todos** los errores unidos, no solo el primero.
+`errors.Join` (Go 1.20) combines errors into one. It returns `nil` when every argument is
+`nil`, so passing a possibly empty slice is safe. The result implements
+`Unwrap() []error`, so `errors.Is` / `errors.As` inspect **every** joined error, not only
+the first.
 
-### Validar N campos — acumular en vez de fallar al primero
+### Validating N fields — collect instead of failing on the first
 
 ```go
 func validateUser(u User) error {
-    var errs []error
-    if u.Name == "" {
-        errs = append(errs, errors.New("name is required"))
-    }
-    if u.Age < 0 {
-        errs = append(errs, errors.New("age must be non-negative"))
-    }
-    return errors.Join(errs...) // nil si errs está vacío
+	var errs []error
+	if u.Name == "" {
+		errs = append(errs, errors.New("name is required"))
+	}
+	if u.Age < 0 {
+		errs = append(errs, errors.New("age must be non-negative"))
+	}
+	return errors.Join(errs...) // nil when errs is empty
 }
 ```
 
-### Cerrar N recursos — acumular errores de cleanup
+### Closing N resources — keep every cleanup error
 
 ```go
-// No cortocircuites al primer Close que falle: intenta cerrarlos todos.
+// Do not stop at the first failing Close: try them all.
 func closeAll(closers []io.Closer) error {
-    var err error
-    for _, c := range closers {
-        err = errors.Join(err, c.Close()) // Join ignora los nil
-    }
-    return err
+	var err error
+	for _, c := range closers {
+		err = errors.Join(err, c.Close()) // nil arguments are dropped
+	}
+	return err
 }
 ```
 
-### Recorrerlo — `errors.Is` inspecciona todos los unidos
+### Inspecting — errors.Is sees all of them
 
 ```go
 err := errors.Join(ErrNotFound, io.EOF)
 errors.Is(err, ErrNotFound) // true
-errors.Is(err, io.EOF)      // true — ambos, no solo el primero
+errors.Is(err, io.EOF)      // true — both, not only the first
 ```
 
-`errors.Join` no reemplaza a `%w`: usa `%w` para envolver **una** causa, y `Join` para agregar **varios** errores hermanos.
+`errors.Join` does not replace `%w`: wrap **one** cause with `%w`; join **sibling** errors.
 
 ---
 
-## panic / recover — El Uso Correcto
+## panic / recover — Correct Use
 
-**Regla:** en una API de librería, `panic` **nunca** es para errores esperados. Un error esperado (input inválido, recurso ausente, red caída) se retorna como `error`. `panic` se reserva para:
+In library code, `panic` is not for expected failures. Invalid input, a missing resource
+or a network failure is returned as an `error`, because the caller is the one who knows
+how to react. `panic` is for:
 
-1. **Bugs de programación** — un invariante roto que indica que el código está mal (índice fuera de rango lógico, estado imposible, un `default:` en un switch exhaustivo).
-2. **Config imposible en el arranque** — el proceso no puede funcionar y debe morir de inmediato (`regexp.MustCompile`, `template.Must`).
+1. **Programming bugs** — a broken invariant that means the code itself is wrong (an
+   impossible state, the `default:` of a switch that should be exhaustive).
+2. **Impossible configuration at startup** — the process cannot work and should stop
+   immediately (`regexp.MustCompile`, `template.Must` on a literal).
 
 ```go
-// panic aceptable: patrón inválido = bug del programador, detectado al iniciar el proceso.
+// Acceptable: an invalid literal pattern is a programmer bug, caught at process start.
 var reEmail = regexp.MustCompile(`^\S+@\S+$`)
 ```
 
-### BAD — panic como control de flujo
+### BAD — panic as control flow
 
 ```go
-// BAD: input inválido es una condición esperada, no un bug. Esto tumba al llamador.
+// Invalid input is an expected condition, not a bug; this takes the caller down.
 func parsePort(s string) int {
-    n, err := strconv.Atoi(s)
-    if err != nil {
-        panic("invalid port")
-    }
-    return n
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		panic("invalid port")
+	}
+	return n
 }
 ```
 
-### GOOD — error retornado
+### GOOD — return the error
 
 ```go
-// GOOD: el llamador decide qué hacer con el error.
 func parsePort(s string) (int, error) {
-    n, err := strconv.Atoi(s)
-    if err != nil {
-        return 0, fmt.Errorf("parse port %q: %w", s, err)
-    }
-    return n, nil
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("parse port %q: %w", s, err)
+	}
+	return n, nil
 }
 ```
 
-### `recover` solo en fronteras
+### recover only at boundaries
 
-`recover` va **únicamente** en un boundary donde un panic no debe tumbar el proceso: un handler HTTP, un supervisor de goroutine, la raíz de un worker. Nunca lo uses para "manejar" errores esperados en medio de la lógica de negocio.
+Put `recover` at a boundary where one panic must not take down the process: an HTTP
+handler, a goroutine supervisor, the root of a worker. Using it in the middle of business
+logic to "handle" expected errors hides bugs.
 
 ```go
-// Middleware que convierte un panic en un 500 + log, sin tumbar el servidor.
+// Turns a panic into a 500 plus a log line instead of crashing the server.
 func Recoverer(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        defer func() {
-            if v := recover(); v != nil {
-                log.Printf("panic recovered: %v\n%s", v, debug.Stack())
-                http.Error(w, "internal server error", http.StatusInternalServerError)
-            }
-        }()
-        next.ServeHTTP(w, r)
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("panic recovered: %v\n%s", v, debug.Stack())
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 ```
+
+`net/http` already recovers panics in handlers and logs them, but it drops the
+connection without a response; a middleware like this one returns a proper 500.
 
 ---
 
-## Errores Cruzando Goroutines
+## Errors Crossing Goroutines
 
-Un `recover` solo atrapa panics de **su propia** goroutine. Un panic que escapa de una goroutine sin `recover` tumba **todo el proceso** — el `recover` del middleware o del llamador no lo alcanza, porque está en otra pila.
+`recover` only catches panics from **its own** goroutine. A panic that escapes a goroutine
+without a `recover` crashes the whole process — the middleware's or the caller's `recover`
+cannot reach it, because it runs on a different stack.
 
-**Regla:** toda goroutine que ejecuta trabajo arbitrario necesita, o bien su propio `recover` en la frontera, o bien un mecanismo que convierta panic en error antes de cruzar el boundary.
+So every goroutine that runs arbitrary work needs its own `recover` at its boundary, or a
+wrapper that turns a panic into an error before it crosses.
 
 ```go
-// BAD: si process() hace panic, adiós proceso. Ningún recover externo lo captura.
+// BAD: if process panics, the process dies; no outer recover can catch it.
 go func() {
-    process(job)
+	process(job)
 }()
 
-// GOOD: recover dentro de la goroutine; el panic se convierte en error y se propaga
-// por un canal con buffer 1 (nunca bloquea al emisor, no hay leak).
+// GOOD: recover inside the goroutine; the panic becomes an error sent on a channel with
+// buffer 1, so the send never blocks and the goroutine cannot leak.
 func safeGo(fn func() error) <-chan error {
-    errc := make(chan error, 1)
-    go func() {
-        defer func() {
-            if v := recover(); v != nil {
-                errc <- fmt.Errorf("panic in goroutine: %v", v)
-            }
-        }()
-        errc <- fn()
-    }()
-    return errc
+	errc := make(chan error, 1)
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				errc <- fmt.Errorf("panic in goroutine: %v", v)
+			}
+		}()
+		errc <- fn()
+	}()
+	return errc
 }
 ```
 
-Para propagar **errores** (no panics) desde múltiples goroutines con cancelación automática al primer fallo, usa `errgroup` — ver `references/concurrency-patterns.md`, sección Errgroup. `errgroup` no recupera panics: si tu `g.Go(...)` puede entrar en pánico, envuélvelo con un `recover` como el de arriba.
+To propagate **errors** (not panics) from several goroutines with cancellation on the
+first failure, use `errgroup` — see the Errgroup section of
+`references/concurrency-patterns.md`. `errgroup` does not recover panics: if a function
+passed to `g.Go` can panic, wrap it with a `recover` like the one above.
 
 ---
 
 ## Checklist
 
-- [ ] Errores opacos por default; sentinel o typed solo cuando un llamador real ramifica
-- [ ] Sentinel (`var ErrX`) para condiciones comparadas con `errors.Is`; typed (`errors.As`) solo cuando el llamador necesita **datos**
-- [ ] Condiciones transversales (temporal, timeout, retryable) expuestas como comportamiento, no como tipo concreto
-- [ ] Tipos de error con causa envuelta implementan `Unwrap()` para preservar la cadena
-- [ ] `errors.Join` para validación multi-campo y cleanup de N recursos; nunca reemplaza a `%w`
-- [ ] `panic` solo para bugs de programación o config imposible en el arranque — jamás como control de flujo
-- [ ] `recover` únicamente en fronteras (handler HTTP, supervisor de goroutine)
-- [ ] Toda goroutine con trabajo arbitrario tiene `recover` propio o convierte panic en error; errores entre goroutines se propagan con `errgroup` (ver `concurrency-patterns.md`)
+- [ ] Errors are opaque by default; sentinel or typed only when a real caller branches on them
+- [ ] `%w` only for causes you are willing to support as API; `%v` for implementation details
+- [ ] Sentinels (`var ErrX`) for conditions compared with `errors.Is`; typed errors (`errors.As`) only when the caller needs data
+- [ ] Cross-cutting conditions (retryable, timeout) exposed as behavior, not as a concrete type; no new `Temporary()`
+- [ ] Error types that wrap a cause implement `Unwrap()` to keep the chain
+- [ ] `errors.Join` for multi-field validation and multi-resource cleanup; it does not replace `%w`
+- [ ] `panic` only for programming bugs or impossible startup configuration, never as control flow
+- [ ] `recover` only at boundaries (HTTP handler, goroutine supervisor)
+- [ ] Every goroutine running arbitrary work has its own `recover` or converts panics into errors; errors across goroutines go through `errgroup`

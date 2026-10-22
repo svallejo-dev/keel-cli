@@ -1,38 +1,37 @@
-# Entities — DDD Táctico al Estilo Idiomático de Go
+# Entities
 
-> **Regla #0 — go-idiomatic gana.** Ante cualquier conflicto entre un patrón de DDD y el Go idiomático, gana el Go idiomático. Una entity en Go **no** es un JavaBean: sin getters `Get*`, sin setters, sin modelo anémico. Modelamos identidad y estado mutable con las herramientas del lenguaje (structs, pointer receivers, tipos dedicados), no con ceremonia importada de otra plataforma.
+An entity in Go is not a JavaBean: no `Get*` getters, no setters, no anemic model. Identity
+and mutable state are modeled with the language's own tools (structs, pointer receivers,
+dedicated ID types). When a DDD habit and a Go idiom disagree, the Go idiom wins.
 
-Verificado con toolchain 1.24.7; API estándar de Go 1.26. Los VOs (`Email`, `Name`) que se componen aquí son stubs mínimos; su mecánica interna vive en `references/value-objects.md`.
+This file covers only the entity. Neighbouring topics live elsewhere:
 
-Este documento cubre **solo** la entity. Las fronteras adyacentes son deliberadas:
+- Building, normalizing and comparing a VO → [value-objects.md](value-objects.md) (here VOs are only composed).
+- The root that groups entities under a transactional boundary → [aggregates.md](aggregates.md).
+- Orchestration, transactions and persistence → [application-layer.md](application-layer.md).
+- The anemic model and its refactor → [antipatterns.md](antipatterns.md).
 
-- La construcción, normalización e igualdad por valor de un VO → `references/value-objects.md` (aquí solo se **componen**).
-- La raíz que agrupa entities y VOs bajo un límite transaccional → `references/aggregates.md`.
-- La orquestación de casos de uso, transacciones y persistencia → `references/application-layer.md`.
-- El modelo anémico y su refactor → `references/antipatterns.md`.
+## 1. What an entity is
 
----
+An **entity** is defined by its **identity**, not its attributes:
 
-## 1. Qué ES una Entity
+- It has a stable **ID** that identifies it uniquely and persistently.
+- It is **mutable over time**: attributes change, identity does not.
+- It is **composed of value objects**: every attribute with its own rules is a VO, not a bare primitive.
 
-Una **entity** es un objeto del dominio definido por su **identidad**, no por sus atributos:
+A `User` is still the same `User` after changing email, name and everything else, because
+its `id` did not change.
 
-- Tiene un **ID** estable que la identifica de forma única y persistente.
-- Es **mutable a lo largo del tiempo**: sus atributos cambian, su identidad no.
-- Está **compuesta por value objects** — cada atributo con reglas propias es un VO, no un tipo primitivo desnudo.
+## 2. Shape in Go
 
-El contraste con el value object es total: un VO se define por su valor y es inmutable; una entity se define por su ID y evoluciona. Un `User` sigue siendo el mismo `User` aunque cambie de email, de nombre y de todo lo demás — porque su `id` no cambió.
-
----
-
-## 2. Realización en Go
-
-Una entity es un `struct` con **campos no-exportados** (encapsulación real: nadie fuera del paquete construye un estado inválido) y **métodos con pointer receiver** (mutan el estado y transmiten identidad).
+A struct with **unexported fields** (no other package can build an invalid state) and
+**pointer-receiver methods** (they mutate state and carry identity).
 
 ```go
-type UserID int64
+// UserID identifies a User; the empty string means "not assigned".
+type UserID string
 
-// User es una persona registrada; su identidad es id.
+// User is a registered person; its identity is id.
 type User struct {
 	id        UserID
 	email     Email
@@ -41,129 +40,128 @@ type User struct {
 }
 ```
 
-El ID es un **tipo propio** (`type UserID int64`), no un `int64` suelto ni un `string`. También puede ser un VO de UUID. La ganancia es del type system: pasar un `OrderID` donde se espera un `UserID` no compila.
+The ID is a **dedicated type** (`type UserID string`, or a UUID value object), not a loose
+`string` or `int64`: passing an `OrderID` where a `UserID` is expected does not compile.
 
 ### Pointer receiver (entity) vs value receiver (VO)
 
-El tipo de receiver no es una preferencia estética: codifica la semántica del dominio.
+The receiver kind encodes domain semantics, not taste.
 
-| Aspecto | Entity | Value object |
+| Aspect | Entity | Value object |
 |---|---|---|
-| Receiver | `func (u *User)` — pointer | `func (e Email)` — value |
-| Muta estado | Sí (`u.email = ...`) | Nunca; devuelve un nuevo valor |
-| Identidad | Sí, por ID | No; es puro valor |
-| Igualdad | Por ID (`SameAs`) | Por valor (`==`) |
-| Copiar | Se comparte por puntero | Se copia libremente |
+| Receiver | `func (u *User)`, pointer | `func (e Email)`, value |
+| Mutates state | Yes (`u.email = ...`) | Never; returns a new value |
+| Identity | Yes, by ID | No; pure value |
+| Equality | By ID (`SameAs`) | By value (`==`) |
+| Copying | Shared by pointer | Copied freely |
+
+If a type has identity or any method mutates it, **all** its methods use pointer receivers;
+mixing value and pointer receivers on one type makes its method set inconsistent.
+
+### Zero value and why the constructor is mandatory
+
+The zero value of an entity is **invalid**: no ID, empty VOs, no `createdAt`. Unexported
+fields are what stop other packages from building that state; the only door is `NewUser`.
+Exporting the fields opens the door and the entity protects nothing.
 
 ```go
-// VO: value receiver, no muta, igualdad por valor.
-func (e Email) String() string { return e.addr }
-
-// Entity: pointer receiver, muta, identidad por ID.
-func (u *User) ChangeEmail(newEmail Email) error { /* ... */ }
-```
-
-Regla práctica: si un método necesita cambiar el estado del receiver, o si el tipo tiene identidad, **todos** sus métodos usan pointer receiver (consistencia de method set). No mezcles value y pointer receivers en el mismo tipo.
-
-### Zero value y por qué el constructor es obligatorio
-
-El zero value de una entity es **inválido**: `id` en cero, VOs vacíos, sin `createdAt`. Los campos no-exportados son precisamente lo que impide construir ese estado inválido desde otro paquete: la única puerta de entrada es `NewUser`, que garantiza el invariante. Exportar los campos abre esa puerta y la entity deja de proteger nada.
-
-```go
-// BAD — campos exportados: cualquiera fabrica un User inválido sin pasar por NewUser.
+// BAD: exported fields; anyone builds an invalid User without NewUser.
 type User struct {
 	ID    UserID
 	Email Email
 }
-u := User{} // id 0, email vacío: un estado que el dominio nunca debería ver
 
-// GOOD — campos no-exportados + constructor.
-u, err := NewUser(id, email, name)
+u := User{} // no ID, empty email: a state the domain should never see
+
+// GOOD: unexported fields + constructor.
+u, err := NewUser(id, email, name, now)
 ```
 
----
+## 3. Equality by identity, not by value
 
-## 3. Igualdad por IDENTIDAD, no por Valor
+Two entities are the **same** when they share an ID, even if every attribute differs, and
+**different** when IDs differ, even if everything else matches. That is the opposite of a VO.
 
-Dos entities son la **misma** si comparten ID, aunque cada atributo difiera. Y son **distintas** si tienen IDs distintos, aunque todos los demás atributos coincidan. Esto es lo opuesto a un VO.
-
-Por eso **nunca** uses `==` sobre entities. `==` compara valor campo a campo: dos `User` con el mismo ID pero distinto `createdAt` saldrían "distintos", y peor aún, incluir un campo no-comparable (un slice, un map) haría que `==` ni siquiera compile. La identidad se compara explícitamente:
+So never use `==` on entities. On values it compares field by field (same ID, different
+`createdAt` → "different"); on pointers it compares addresses, so two loads of the same row
+are "different". Compare identity explicitly:
 
 ```go
-// SameAs compara identidad, no valor: misma entity si comparten ID.
-func (u *User) SameAs(other *User) bool { return u.id == other.id }
+// SameAs compares identity, never field values.
+func (u *User) SameAs(other *User) bool {
+	return u != nil && other != nil && u.id == other.id
+}
 ```
 
-```go
-// BAD — compara valor; frágil y semánticamente incorrecto para una entity.
-if a == b { /* ... */ }
+`==` on the **ID** (`u.id == other.id`) is right: the ID is a value and value equality is
+exactly what identity means.
 
-// GOOD — compara identidad, que es lo único estable de una entity.
-if a.SameAs(b) { /* ... */ }
-```
-
-El `==` sobre el **ID** (`u.id == other.id`) sí es correcto: el `UserID` es un value object numérico y su igualdad por valor es exactamente lo que queremos.
-
-### Identidad en colecciones
-
-La misma regla gobierna cómo se indexan o deduplican entities: la clave es siempre el **ID**, nunca el valor entero del struct. Un `map[UserID]*User` colapsa duplicados por identidad de forma natural.
+The same rule governs indexing and deduplication: the key is always the ID.
 
 ```go
-// Indexar/deduplicar por identidad: la clave es el ID.
 byID := make(map[UserID]*User, len(users))
 for _, u := range users {
-	byID[u.ID()] = u // dos cargas de la misma entity colapsan en una
+	byID[u.ID()] = u // two loads of the same entity collapse into one
 }
 ```
 
-Usar la entity misma como clave de un map (`map[User]...`) es un error de diseño: obliga a que todos sus campos sean comparables y ata la clave al valor mutable, no a la identidad.
+Using the entity itself as a key (`map[User]...`) ties the key to mutable values instead of
+identity.
 
----
+## 4. The constructor validates how the VOs fit together
 
-## 4. El Constructor Valida la INTEGRACIÓN de los VOs
-
-Un constructor de entity **no re-valida los VOs**: cuando `Email` y `Name` llegan al constructor, ya son válidos por construcción (sus propios constructores fallaron si no lo eran; ver `references/value-objects.md`). La entity valida las reglas que **cruzan** varios VOs — invariantes que ningún VO puede conocer por sí solo.
+An entity constructor **does not re-validate VOs**: an `Email` or a `Name` that reaches it is
+already valid by construction. The entity checks rules that **span** several VOs, which no
+single VO can know.
 
 ```go
-// NewUser exige nombre y apellido cuando el email es corporativo.
-func NewUser(id UserID, email Email, name Name) (*User, error) {
-	if email.IsCorporate() && len(strings.Fields(name.String())) < 2 {
-		return nil, fmt.Errorf("user: email corporativo requiere nombre y apellido")
+// ErrIncompleteName means a corporate email needs a first and last name.
+var ErrIncompleteName = errors.New("identity: corporate email requires first and last name")
+
+// NewUser requires first and last name when the email is corporate.
+func NewUser(id UserID, email Email, name Name, now time.Time) (*User, error) {
+	if id == "" {
+		return nil, errors.New("identity: user requires an id")
 	}
-	return &User{
-		id:        id,
-		email:     email,
-		name:      name,
-		createdAt: time.Now(),
-	}, nil
+	if email.IsCorporate() && len(strings.Fields(name.String())) < 2 {
+		return nil, ErrIncompleteName
+	}
+	return &User{id: id, email: email, name: name, createdAt: now}, nil
 }
 ```
 
-La firma recibe **VOs, no strings**: `NewUser(id UserID, email Email, name Name)`, jamás `NewUser(id int64, email, name string)`. Empujar la validación de cada campo a su VO deja al constructor un único trabajo claro: verificar la combinación. Si una entity crece con demasiadas invariantes cruzadas o coordina varios sub-objetos con reglas propias, probablemente es un **aggregate root** (ver `references/aggregates.md`).
+(`Email.IsCorporate` is a VO method that checks the domain part.)
 
-El reparto de responsabilidades es nítido y no se solapa:
+The signature takes **VOs, not strings**, and the current time **as a parameter**: the
+domain never calls `time.Now()`. The use case owns the clock (`now func() time.Time`,
+injected), which keeps `NewUser` deterministic and testable. Stores call the same
+constructor with the stored `createdAt` when they rebuild a `User`.
 
-| Regla | Dónde vive | Ejemplo |
+Responsibilities do not overlap:
+
+| Rule | Where it lives | Example |
 |---|---|---|
-| Formato/rango de un solo campo | Constructor del VO | `NewEmail` exige un `@` |
-| Normalización de un solo campo | Constructor del VO | `NewEmail` baja a minúsculas |
-| Combinación entre varios VOs | Constructor de la entity | email corporativo ⇒ nombre y apellido |
-| Transición de estado válida | Método de la entity | `ChangeEmail` re-verifica el cruce |
-| Coordinación entre entities/aggregates | Capa de aplicación | ver `references/application-layer.md` |
+| Format/range of one field | VO constructor | `NewEmail` requires an address |
+| Normalization of one field | VO constructor | `NewEmail` lower-cases |
+| Combination of several VOs | Entity constructor | corporate email ⇒ first and last name |
+| Valid state transition | Entity method | `ChangeEmail` re-checks the combination |
+| Coordination across entities/aggregates | Use case | see [application-layer.md](application-layer.md) |
 
-Devolver `(*User, error)` (puntero + error), no `(User, error)`: la entity tiene identidad y se comparte por referencia; el error obliga a quien construye a manejar el caso inválido antes de tener un `User`.
+Return `(*User, error)`: the entity is shared by reference, and the error forces the caller
+to handle the invalid case before holding a `User`. If an entity grows many cross-cutting
+invariants or coordinates sub-objects, it is probably an aggregate root
+([aggregates.md](aggregates.md)).
 
----
+## 5. Behaviour with intent, not setters
 
-## 5. Comportamiento con INTENCIÓN, no Setters
-
-El estado mutable de una entity se cambia mediante métodos que **expresan la intención del dominio** y **re-verifican las invariantes**, no mediante setters mecánicos que dejan pasar cualquier valor.
+State changes through methods that **name the domain operation** and **re-check
+invariants**, not through mechanical setters.
 
 ```go
-// ChangeEmail re-verifica la regla de email corporativo antes de cambiarlo.
+// ChangeEmail re-applies the corporate-email rule before switching.
 func (u *User) ChangeEmail(newEmail Email) error {
 	if newEmail.IsCorporate() && len(strings.Fields(u.name.String())) < 2 {
-		return fmt.Errorf("user: email corporativo requiere nombre y apellido")
+		return ErrIncompleteName
 	}
 	u.email = newEmail
 	return nil
@@ -171,92 +169,85 @@ func (u *User) ChangeEmail(newEmail Email) error {
 ```
 
 ```go
-// BAD — setter anémico: no expresa intención y puede romper la invariante.
+// BAD: anemic setter; no intent, and it can break the invariant.
 func (u *User) SetEmail(e Email) { u.email = e }
-
-// GOOD — método con nombre de dominio que protege el invariante.
-func (u *User) ChangeEmail(newEmail Email) error { /* ... */ }
 ```
 
-Sobre los accessors: en Go **no** existe el prefijo `Get`. `GetEmail()` es un Java-ismo; se escribe `Email()`. Y ni siquiera se expone por reflejo: un accessor se agrega **solo cuando de verdad hace falta** que otro paquete lea ese atributo. Muchas entities exponen comportamiento y casi ningún campo.
+(In the worked example there is no cross-VO rule, so its `ChangeEmail` cannot fail and
+returns nothing.)
+
+Accessors: Go has no `Get` prefix (`Email()`, not `GetEmail()`), and an accessor exists only
+when another package really needs to read the attribute. It returns the **VO**, not its
+internal representation, so the guarantees travel with it.
 
 ```go
+// Email is the current normalized address.
 func (u *User) Email() Email { return u.email }
-func (u *User) ID() UserID   { return u.id }
 ```
 
-Nótese que el accessor devuelve el **VO** (`Email`), no su representación interna (`string`). Devolver el VO preserva las garantías; devolver el string las tira.
+Method names are ubiquitous language: `Deactivate`, `Promote`, `Rename`, `ChangeEmail`. A
+generic `Update(fields map[string]any)` erases intent and reopens invalid states.
 
-El nombre del método **es** ubiquitous language: `Deactivate`, `Promote`, `Rename`, `ChangeEmail` describen operaciones que el negocio reconoce. Un `Update(fields map[string]any)` genérico borra esa intención y reabre la puerta a estados inválidos; cada transición merece su método con nombre propio y su verificación de invariantes.
+## 6. Rich vs anemic
 
----
+Logic lives **with** the data, in the same package as the type. A rich entity's methods are
+the domain behaviour: `u.ChangeEmail(...)`, `u.Deactivate()`.
 
-## 6. Rich vs Anémico
-
-La lógica vive **con** los datos, en el mismo paquete que el tipo. Una entity rica es un tipo cuyos métodos son el comportamiento del dominio: `u.ChangeEmail(...)`, `u.Deactivate()`, `u.Promote(...)`.
-
-El **modelo anémico** es el anti-patrón inverso: la entity queda reducida a un saco de campos públicos (un DTO) y toda la lógica se exilia a un `UserService` gordo que la manipula desde fuera. Nadie es dueño de las invariantes; tres paquetes deben coordinarse para hacer cualquier cosa con un usuario.
+The **anemic model** is the reverse: the entity is a bag of exported fields and the logic
+lives in a fat `UserService` that edits it from outside. Nobody owns the invariants.
 
 ```go
-// BAD — anémico: datos sin comportamiento + lógica en un "service" externo.
-package models
-type User struct { // campos públicos, sin invariantes
-	ID    int64
+// BAD: data without behaviour, in one package...
+type User struct {
+	ID    string
 	Email string
-	Name  string
 }
 
-package services
-type UserService struct{}
-func (UserService) ChangeEmail(u *models.User, e string) { u.Email = e } // sin protección
+// ...and a service in another that edits it with no protection.
+func (UserService) ChangeEmail(u *models.User, e string) { u.Email = e }
 ```
 
-```go
-// GOOD — rico: el tipo y su comportamiento en el mismo paquete de dominio.
-package user
-func (u *User) ChangeEmail(newEmail Email) error { /* protege invariantes */ }
-```
+The fix is §5: the method on `User`, in the context package. Legitimate orchestration
+(transactions, coordinating aggregates) does live outside the entity, but as one use case
+per file (`change_email.go` → `ChangeEmail`, which loads the `User`, calls
+`u.ChangeEmail(...)` and saves it), never a `UserService`. See
+[application-layer.md](application-layer.md) and [antipatterns.md](antipatterns.md) §4.
 
-Esta separación `models/` + `services/` es capa técnica disfrazada de arquitectura, no diseño de dominio. El desarrollo completo del anti-patrón y su refactor están en `references/antipatterns.md`. La orquestación legítima (transacciones, coordinación entre agregados) sí vive fuera de la entity, pero no en un `UserService`: cada caso de uso es su propio tipo en su propio archivo (`change_email.go` → `ChangeEmail`, que carga el `User`, llama a `u.ChangeEmail(...)` y lo guarda). Ver `references/application-layer.md`.
+## 7. The entity does not touch infrastructure
 
----
-
-## 7. La Entity NO Toca Infraestructura
-
-Una entity opera **solo** sobre VOs y tipos de dominio. Su lista de imports es el diagnóstico más rápido de si el diseño está sano — el **test de pureza del import**:
+An entity works only with VOs and domain types. Its import list is the fastest diagnosis
+of a healthy design, the **import purity test**:
 
 ```go
-// GOOD — imports de una entity sana: stdlib de dominio puro.
+// GOOD: a healthy entity imports pure stdlib.
 import (
-	"fmt"
+	"errors"
 	"strings"
 	"time"
 )
-```
 
-```go
-// BAD — infraestructura filtrada dentro de la entity.
+// BAD: infrastructure leaked into the domain.
 import (
-	"database/sql" // persistencia
-	"net/http"     // transporte
-	"github.com/some/orm"
+	"database/sql"
+	"net/http"
 )
 ```
 
-Si el paquete de una entity importa `database/sql`, `net/http`, un driver, un cliente HTTP o cualquier lib externa de infraestructura, el dominio se contaminó. La persistencia se expresa con una **interfaz `Store` definida en el punto de uso** que la infraestructura implementa por fuera; el transporte (handlers HTTP, serialización) vive en su propia capa. La entity nunca sabe cómo se guarda ni cómo viaja: solo conoce sus reglas.
-
-El `time` es el caso límite honesto: es stdlib y es tipo de dominio (`createdAt`), así que pasa el test. Si la entity necesitara "la hora actual" de forma testeable, se inyecta un `clock` como dependencia — no se acopla a un reloj de infraestructura.
-
----
+If the entity's package imports `database/sql`, `net/http`, a driver or an HTTP client, the
+domain is contaminated. Persistence is a port (`UserRepository`) declared by the consuming
+use cases and implemented in an infrastructure subpackage; transport lives in its own
+subpackage. `time` passes the test because `time.Time` is a domain value; reading the clock
+does not, which is why `now` is a parameter.
 
 ## Checklist
 
-- [ ] La entity es un `struct` con campos **no-exportados** y un **ID de tipo dedicado** (`type UserID int64` o VO de UUID).
-- [ ] Todos los métodos usan **pointer receiver**; el value receiver queda para los VOs.
-- [ ] La igualdad se compara con `SameAs` (por ID), **nunca** con `==` sobre la entity.
-- [ ] El constructor recibe **VOs, no primitivos**, y valida solo reglas **cross-VO**, no cada VO por separado.
-- [ ] El estado cambia por **métodos con nombre de dominio** que re-verifican invariantes; cero setters, cero prefijo `Get`.
-- [ ] Los accessors existen **solo si hacen falta** y devuelven el **VO**, no su representación interna.
-- [ ] La lógica vive **con** los datos (entity rica); nada de `models/` + `services/` anémico.
-- [ ] La orquestación que sí sale de la entity es un caso de uso con nombre propio (`change_email.go`), nunca un `UserService`.
-- [ ] Los imports pasan el **test de pureza**: sin `database/sql`, `net/http` ni libs externas — solo VOs y tipos de dominio.
+- [ ] The entity is a struct with **unexported** fields and a **dedicated ID type** (`type UserID string` or a UUID VO).
+- [ ] All methods use **pointer receivers**; value receivers are for VOs.
+- [ ] Equality uses `SameAs` (by ID), never `==` on the entity.
+- [ ] The constructor takes **VOs and `now time.Time`**, returns `(*User, error)` and checks only cross-VO rules.
+- [ ] The domain never calls `time.Now()`; the use case injects the clock.
+- [ ] State changes through **domain-named methods** that re-check invariants; no setters, no `Get` prefix.
+- [ ] Accessors exist only when needed and return the **VO**, not its raw representation.
+- [ ] Logic lives with the data; no `models/` + `services/` split.
+- [ ] Orchestration that leaves the entity is a named use case (`change_email.go`), never a `UserService`.
+- [ ] Imports pass the purity test: no `database/sql`, `net/http` or infrastructure libraries.

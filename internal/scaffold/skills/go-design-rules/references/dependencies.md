@@ -1,243 +1,261 @@
-# Dependencias — Go Design Rules
+# Dependencies: Explicit, Injected, Wired in `main`
 
-Las dependencias de un componente deben ser **visibles en su firma** y **sustituibles
-desde fuera**. En Go esto no exige un framework de dependency injection ni un contenedor:
-basta pasar valores por parámetro o constructor y declarar interfaces pequeñas en el
-consumidor. El grafo queda explícito, testeable y sin nada oculto en el arranque.
+A component's dependencies should be **visible in its signature** and **replaceable from
+outside**. In Go that needs no DI framework or container: pass values through parameters or
+constructors and declare small interfaces at the consumer. The graph stays explicit, testable
+and free of hidden startup magic. No rule here justifies unnatural Go (a reflective DI
+container "because the principle says so"); when they clash, the Go idiom wins.
 
-**Regla #0 (principio rector):** ante conflicto entre un principio de diseño y un idiom
-de Go, gana el idiom de Go. Ninguna regla de aquí justifica escribir Go antinatural
-(p. ej. un contenedor DI reflectivo "porque el principio lo pide").
+## 1. Explicit dependencies
 
-Esta referencia es autocontenida. Las skills `senior-go-idiomatic` (idioms de lenguaje) y
-`ddd-go-idiomatic` (modelado táctico) son compañeras opcionales, no un prerequisito.
-Snippets verificados con la toolchain 1.24.7 (estándar actual: Go 1.26). Ver también
-`references/coupling-behavior.md`, `references/domain-naming.md`,
-`references/illegal-states.md` y `references/dry-solid-go.md`.
+**Rule:** pass every dependency through a parameter or the constructor. Never reach it
+through a global, a singleton or a service locator.
 
----
+**Why:** the signature becomes the honest documentation of what the component needs.
+`NewGreetUser(users, clock)` declares its whole graph; a `NewGreetUser()` that reads
+`db.Global` and calls `time.Now()` inside lies about its requirements and cannot be swapped.
 
-## 1. Dependencias Explícitas
-
-**Regla:** pasa cada dependencia por parámetro o constructor. Nunca la alcances a través
-de un global, un singleton o un service locator.
-
-**Por qué:** la firma se vuelve la documentación honesta de lo que el componente necesita.
-`NewGreetUser(repo, clock)` declara su grafo completo; un `NewGreetUser()` que dentro lee
-`db.Global` y llama `time.Now()` miente sobre sus requisitos y no es sustituible.
+**greet_user.go**
 
 ```go
-// greet_user.go
+package user
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Clock is the only source of "now" for code that must be testable.
+type Clock interface {
+	Now() time.Time
+}
+
+// userFinder is the one method GreetUser needs from storage.
+type userFinder interface {
+	FindByID(ctx context.Context, id UserID) (*User, error)
+}
+
+// GreetUserInput identifies who to greet.
+type GreetUserInput struct {
+	UserID UserID
+}
+
+// GreetUserOutput is the rendered greeting.
+type GreetUserOutput struct {
+	Message string
+}
+
+// GreetUser builds a timestamped greeting for an existing user.
 type GreetUser struct {
-	repo  Repo
+	users userFinder
 	clock Clock
 }
 
-func NewGreetUser(repo Repo, clock Clock) *GreetUser {
-	return &GreetUser{repo: repo, clock: clock}
+// NewGreetUser receives storage and time explicitly; nothing is read from globals.
+func NewGreetUser(users userFinder, clock Clock) *GreetUser {
+	return &GreetUser{users: users, clock: clock}
 }
 
-func (uc *GreetUser) Execute(ctx context.Context, id int64) (string, error) {
-	u, err := uc.repo.UserByID(ctx, id)
+// Execute wraps storage errors with the use case name.
+func (uc *GreetUser) Execute(ctx context.Context, in GreetUserInput) (GreetUserOutput, error) {
+	u, err := uc.users.FindByID(ctx, in.UserID)
 	if err != nil {
-		return "", fmt.Errorf("greet user: %w", err)
+		return GreetUserOutput{}, fmt.Errorf("greet user: %w", err)
 	}
-	return fmt.Sprintf("hi %s at %s", u.Name, uc.clock.Now().Format(time.RFC3339)), nil
+	return GreetUserOutput{Message: fmt.Sprintf("hi %s at %s", u.Name(), uc.clock.Now().Format(time.RFC3339))}, nil
 }
 ```
 
-Cada colaborador se reemplaza por un doble en tests sin tocar `GreetUser`. El struct
-nombra **un** caso de uso y vive en su archivo (`greet_user.go`); un `Service` con varios
-métodos sería un tipo cajón (ver `references/domain-naming.md` §7).
+Each collaborator is replaced by a test double without touching `GreetUser`. The narrow
+`userFinder` interface is declared by its consumer, which is §4 in action. (The use-case shape
+itself, one type per file with `Execute(ctx, XInput) (XOutput, error)`, is defined by the
+`ddd-go-idiomatic` skill.)
 
----
+## 2. No mutable globals, singletons or service locators
 
-## 2. Cero Globals Mutables, Singletons o Service Locator
+**Rule:** no mutable package-level `var` used as a dependency. No singletons, no service
+locator (a global `Get[T]()` that resolves collaborators).
 
-**Regla:** ningún `var` mutable a nivel de paquete usado como dependencia. Ni singletons,
-ni service locator (una función global `Get[T]()` que resuelve colaboradores).
-
-**Por qué (concreto de Go):** un `var` global mutable compartido entre goroutines es un
-**data race real** — falla `go test -race` y el detector aborta el proceso. Además rompe
-el aislamiento de tests: el estado sobrevive entre casos, así que el resultado depende del
-**orden de ejecución** y los tests no se pueden paralelizar.
+**Why, concretely in Go:** a mutable global shared between goroutines is a **real data
+race**: `go test -race` reports it and fails the run. It also breaks test isolation: state
+survives between cases, so results depend on **execution order** and tests cannot run in
+parallel.
 
 ```go
-// BAD — global mutable + funciones que lo usan a escondidas.
-var DB *sql.DB // cualquier goroutine lo lee y escribe
+// BAD: a mutable global + functions that use it behind your back.
+var DB *sql.DB // any goroutine reads and writes it
 
 func GetUser(id int64) (User, error) {
 	var u User
 	err := DB.QueryRow("SELECT id, name FROM users WHERE id = $1", id).
-		Scan(&u.ID, &u.Name) // depende de que alguien haya inicializado DB antes
+		Scan(&u.ID, &u.Name) // depends on someone having initialized DB first
 	return u, err
 }
 ```
 
 ```go
-// GOOD — inyecta *sql.DB (o una interfaz) por constructor. Cero estado global.
+// Store reads users from PostgreSQL; its methods use s.db, never a global.
 type Store struct {
 	db *sql.DB
 }
 
+// NewStore takes the pool from main, which owns its lifecycle.
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db} // sus métodos (UserByID, ...) usan s.db, nunca un global
+	return &Store{db: db}
 }
 ```
 
-### Por qué el global rompe el test
+### Why the global breaks tests
 
-Los tests que preparan escenario mutando el global quedan acoplados entre sí:
+Tests that set up their scenario by mutating the global become coupled to each other:
 
 ```go
-var reqCount int // estado global que los tests deben tocar
+var reqCount int // global state the tests must touch
 
-// BAD: dos tests mutan el mismo global → el resultado depende del ORDEN.
+// BAD: two tests mutate the same global, so the result depends on ORDER.
 func TestFirst(t *testing.T) {
 	reqCount++
 	if reqCount != 1 {
-		t.Fatalf("got %d, want 1", reqCount) // falla si TestSecond corrió antes
+		t.Fatalf("got %d, want 1", reqCount) // fails if TestSecond ran first
 	}
 }
 
 func TestSecond(t *testing.T) {
 	reqCount++
-	if reqCount != 2 { // acoplado a que TestFirst haya corrido justo antes
+	if reqCount != 2 { // coupled to TestFirst running just before
 		t.Fatalf("got %d, want 2", reqCount)
 	}
 }
 ```
 
-Y si dos goroutines tocan `reqCount` sin sincronizar es un data race que `go test -race`
-reporta y aborta. Con la dependencia inyectada, cada test construye su propio `Store`:
-estado fresco por caso, aislable y paralelizable.
+With the dependency injected, each test builds its own `Store`: fresh state per case,
+isolated and parallelizable.
 
----
+## 3. Package-level state that IS acceptable
 
-## 3. Package-Level State que SÍ es Aceptable
+Not every package-level value is an anti-pattern. The line is sharp: **immutable or
+init-only, never shared mutable business state**.
 
-No todo estado a nivel de paquete es un antipatrón. La línea es nítida: **inmutable o de
-solo-init, nunca estado mutable compartido de negocio**.
-
-| Aceptable | Por qué es seguro |
+| Acceptable | Why it is safe |
 |---|---|
-| `const` | Inmutable por definición; no hay race posible. |
-| Tabla `var x = [...]{...}` no mutada tras la carga | De solo lectura; se comparte entre goroutines sin sincronizar. |
-| `sync.Once` para init idempotente | Un solo escritor, una sola vez, con barrera de memoria. |
+| `const` | Immutable by definition; no race possible |
+| A `var` table never mutated after init | Read-only; shared between goroutines without locks |
+| `sync.OnceValue` / `sync.Once` for idempotent init | One writer, once, with a memory barrier |
 
 ```go
-// OK: constante — inmutable.
+// MaxRetries is fixed at compile time.
 const MaxRetries = 3
 
-// OK: tabla inmutable de solo lectura. `[...]` fija el tamaño en compilación.
-var httpVerbs = [...]string{"GET", "POST", "PUT", "DELETE"}
+var httpVerbs = [...]string{"GET", "POST", "PUT", "DELETE"} // read-only table
 
-// OK: sync.Once para init controlado (no estado mutable de negocio).
-var (
-	slugOnce sync.Once
-	slugRxp  *regexp.Regexp
+// slugRegexp compiles once, on first use, safely from any goroutine.
+var slugRegexp = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`[a-z0-9-]+`)
+})
+```
+
+The honest caveat: a configuration `var` that "is only written once at startup" is a trap;
+nothing in the type guarantees it, and the next commit will mutate it at runtime. If it must
+change at runtime, it is an injectable dependency, not a global.
+
+## 4. Idiomatic dependency injection without a framework
+
+**Rule:** in Go, "injecting" is just passing **small interfaces defined by the consumer**.
+No DI container, no annotation tags; implicit interface satisfaction connects everything.
+
+**Why:** the minimal interface belongs to the side that **depends** on the abstraction. The
+consumer declares the one or two methods it uses; the implementer exports a concrete type
+that satisfies it without importing the consumer. `GreetUser`'s `userFinder` (§1) is
+satisfied by a `*postgres.Store` that has never heard of it, and in tests by a three-line
+stub with the same method.
+
+## 5. Clock and randomness as dependencies
+
+**Rule:** inject a `Clock` (or a `func() time.Time`) and a random source. Do not call
+`time.Now()` or the global `math/rand/v2` functions inside logic.
+
+**Why:** `time.Now()` and global randomness are non-deterministic inputs baked into the code.
+A test that checks "expires in 1h" cannot pin the result if the logic reads the system clock.
+Injected, the test freezes them.
+
+**token_issuer.go**
+
+```go
+package token
+
+import (
+	"math/rand/v2"
+	"time"
 )
 
-func slugRegexp() *regexp.Regexp {
-	slugOnce.Do(func() {
-		slugRxp = regexp.MustCompile(`[a-z0-9-]+`)
-	})
-	return slugRxp
-}
-```
-
-El matiz honesto: un `var` de configuración "solo se escribe una vez al arrancar" es una
-trampa — nada en el tipo lo garantiza y el siguiente commit lo mutará en caliente. Si debe
-cambiar en runtime, es una dependencia inyectable, no un global.
-
----
-
-## 4. Dependency Injection Idiomática sin Framework
-
-**Regla:** en Go, "inyectar" es solo pasar interfaces **pequeñas definidas en el
-consumidor**. No necesitas un contenedor DI ni tags de anotación; el compilador conecta
-todo por implicit satisfaction.
-
-**Por qué:** la interfaz mínima pertenece al lado que **depende** de la abstracción. El
-consumidor declara los uno o dos métodos que usa; el implementador exporta un tipo
-concreto y lo satisface sin importar al consumidor.
-
-```go
-type Repo interface {
-	UserByID(ctx context.Context, id int64) (*User, error)
-}
-```
-
-`GreetUser` (sección 1) recibe este `Repo`. `*postgres.Store` (sección 2) lo
-satisface sin declararlo. En el test, un `stubRepo` con la misma firma sustituye a
-Postgres sin base de datos. Eso es toda la "inyección" que Go requiere.
-
----
-
-## 5. Reloj y Aleatoriedad como Dependencias
-
-**Regla:** inyecta un `Clock` (o un `func() time.Time`) y una fuente de `rand`. No llames
-`time.Now()` ni al `rand` global directamente dentro de la lógica.
-
-**Por qué:** `time.Now()` y el rand global son entradas no deterministas incrustadas. Un
-test que verifica "expira en 1h" no puede fijar el resultado si la lógica lee el reloj del
-sistema. Inyectadas, el test las congela.
-
-```go
+// Clock is the only source of "now" for code that must be testable.
 type Clock interface {
 	Now() time.Time
 }
 
-// fixedClock congela el tiempo en tests; en producción se pasa un reloj real.
-type fixedClock struct{ t time.Time }
-
-func (c fixedClock) Now() time.Time { return c.t }
-
-// TokenIssuer recibe tiempo y aleatoriedad; no los toma del entorno global.
-type TokenIssuer struct {
+// Issuer receives time and randomness instead of taking them from globals.
+type Issuer struct {
 	clock Clock
 	rng   *rand.Rand
 }
 
-func NewTokenIssuer(clock Clock, rng *rand.Rand) *TokenIssuer {
-	return &TokenIssuer{clock: clock, rng: rng}
+// NewIssuer is deterministic when given a fixed clock and a seeded *rand.Rand.
+func NewIssuer(clock Clock, rng *rand.Rand) *Issuer {
+	return &Issuer{clock: clock, rng: rng}
 }
 
-func (ti *TokenIssuer) Issue(ttl time.Duration) (id int64, expires time.Time) {
-	return ti.rng.Int63(), ti.clock.Now().Add(ttl)
+// Issue returns a random token ID and its expiry, ttl from now.
+func (i *Issuer) Issue(ttl time.Duration) (id uint64, expires time.Time) {
+	return i.rng.Uint64(), i.clock.Now().Add(ttl)
 }
 ```
 
-El test se vuelve determinista con un reloj fijo y una semilla fija:
+**token_issuer_test.go**
 
 ```go
-func TestIssueDeterministic(t *testing.T) {
-	clock := fixedClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
-	rng := rand.New(rand.NewSource(1)) // semilla fija → secuencia reproducible
+package token
 
-	ti := NewTokenIssuer(clock, rng)
-	_, exp := ti.Issue(1 * time.Hour)
+import (
+	"math/rand/v2"
+	"testing"
+	"time"
+)
 
-	if want := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC); !exp.Equal(want) {
-		t.Fatalf("exp = %v, want %v", exp, want)
+type fixedClock struct{ t time.Time }
+
+func (c fixedClock) Now() time.Time { return c.t }
+
+func TestIssueIsDeterministic(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	issue := func() (uint64, time.Time) {
+		return NewIssuer(fixedClock{start}, rand.New(rand.NewPCG(1, 2))).Issue(time.Hour)
+	}
+
+	id1, exp := issue()
+	id2, _ := issue()
+	if id1 != id2 {
+		t.Errorf("same seed gave different ids: %d, %d", id1, id2)
+	}
+	if want := start.Add(time.Hour); !exp.Equal(want) {
+		t.Errorf("expires = %v, want %v", exp, want)
 	}
 }
 ```
 
-Para casos triviales, un `func() time.Time` como campo es más ligero que una interfaz
-(`s.now()` en vez de `s.clock.Now()`). Cualquiera de los dos evita el acoplamiento al
-reloj del sistema.
+`math/rand/v2` (Go 1.22+) replaces `rand.NewSource`/`Int63` with explicit generators such as
+`rand.NewPCG(seed1, seed2)`; a seeded `*rand.Rand` gives a reproducible sequence. For
+security-sensitive tokens use `crypto/rand` instead, injected behind the same kind of seam.
+For trivial cases a `now func() time.Time` field is lighter than a `Clock` interface.
 
----
+## 6. Wiring in one place
 
-## 6. Wiring en un Solo Lugar
+**Rule:** the graph is assembled at the entry point (`main` / `cmd/<app>`). The rest of the
+code does not know `main` or how anything is built; it receives its collaborators ready.
 
-**Regla:** el ensamblado del grafo vive en la entrada (`main` / `cmd`). El resto del código
-no conoce a `main` ni sabe cómo se construye nada; recibe sus colaboradores ya resueltos.
-
-**Por qué:** concentrar el `new` de todo en un punto hace el grafo auditable de un vistazo
-y evita que la lógica de negocio dependa del arranque. La dirección de imports es
-`main → paquetes`, nunca al revés.
+**Why:** concentrating construction in one point makes the graph auditable at a glance and
+keeps business logic independent of startup. Imports flow `main → packages`, never the
+reverse.
 
 ```go
 type systemClock struct{}
@@ -245,36 +263,32 @@ type systemClock struct{}
 func (systemClock) Now() time.Time { return time.Now() }
 
 func main() {
-	db, err := sql.Open("pgx", dsn)
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
-	store := postgres.NewStore(db)
-	greetUser := user.NewGreetUser(store, systemClock{})
-
-	msg, err := greetUser.Execute(context.Background(), 1)
+	greet := user.NewGreetUser(postgres.NewStore(db), systemClock{})
+	out, err := greet.Execute(context.Background(), user.GreetUserInput{UserID: 1})
 	if err != nil {
-		log.Fatalf("greeting: %v", err)
+		log.Fatalf("greet: %v", err)
 	}
-	log.Println(msg)
+	log.Println(out.Message)
 }
 ```
 
-Cuando el grafo crece sigue siendo composición manual en `main` (o `cmd/app`). Si se
-vuelve inmanejable, `google/wire` genera ese mismo código en compilación, sin reflection
-ni contenedor en runtime. La regla no cambia: el wiring vive en la entrada.
-
----
+As the graph grows it stays manual composition in `main`. If it becomes unmanageable,
+`google/wire` generates that same code at compile time, with no reflection or runtime
+container. The rule does not change: wiring lives at the entry point.
 
 ## Checklist
 
-- [ ] Cada dependencia se pasa por parámetro o constructor; la firma no esconde requisitos
-- [ ] Cero `var` mutables a nivel de paquete como dependencia; sin singletons ni service locator
-- [ ] Ningún global compartido entre goroutines (pasa `go test -race` y no rompe el aislamiento de tests)
-- [ ] El package-level state que existe es `const`, tabla inmutable o `sync.Once`, nunca estado mutable de negocio
-- [ ] Las interfaces de dependencia son mínimas y se definen en el **consumidor**, no en el implementador
-- [ ] `Clock`/`func() time.Time` y la fuente de `rand` están inyectados; la lógica no llama `time.Now()` ni al rand global
-- [ ] Todo el wiring del grafo vive en `main`/`cmd`; ningún paquete de dominio importa la entrada
-- [ ] La inyección es Go plano (pasar interfaces), sin contenedor DI reflectivo (Regla #0: gana el idiom de Go)
+- [ ] Every dependency arrives through a parameter or constructor; the signature hides no requirement.
+- [ ] No mutable package-level `var` as a dependency; no singletons or service locators.
+- [ ] No global shared between goroutines (passes `go test -race`, keeps tests isolated).
+- [ ] Package-level state is `const`, an immutable table or `sync.OnceValue`/`sync.Once`, never mutable business state.
+- [ ] Dependency interfaces are minimal and defined by the **consumer**.
+- [ ] `Clock`/`func() time.Time` and a `*rand.Rand` (`math/rand/v2`) are injected; logic never calls `time.Now()` or global rand.
+- [ ] All wiring lives in `main`/`cmd`; no domain package imports the entry point.
+- [ ] Injection is plain Go (passing interfaces), not a reflective container.

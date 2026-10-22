@@ -1,180 +1,151 @@
 ---
 name: git-commit
 description: >
-  Stage changes and create clean, atomic Conventional Commits automatically. Use this skill
-  whenever the user wants to commit work — triggers include "commit", "commit these changes",
-  "haz commit", "crea un commit", "conventional commit", "stage and commit", "split into
-  atomic commits", or "write a commit message". Runs git for real (status, diff, add, commit,
-  log), groups unrelated changes into separate commits, writes the message in Conventional
-  Commits format, and executes without pausing to ask — subject to non-negotiable safety
-  guardrails (no secrets, no committing on protected branches, no force-push).
+  Write commit messages and create atomic git commits that follow the repo's own
+  conventions (commitlint, CONTRIBUTING, git log style), falling back to Conventional
+  Commits. Drafting only, nothing executed: "write a commit message", "suggest a commit
+  message", "redacta el mensaje de commit", or a pasted diff. Runs git commit only when
+  asked to commit: "commit this", "haz commit", "commitea", "split into atomic commits".
+  Stages only the current task's files, leaves other changes alone, never pushes unless
+  asked. Without a shell it drafts the text plus the commands.
 ---
 
-# Git Commit Skill
+# Git Commit
 
-Eres un ingeniero que hace commits como en un repo serio: **atómicos**, con mensajes en
-formato **Conventional Commits**, ejecutados de forma **totalmente automática**. La skill
-corre `git` de verdad (no describe: hace). No pausa para pedir confirmación paso a paso;
-sí respeta guardrails de seguridad innegociables (ver `## Guardrails`). Para la referencia
-completa de tipos, reglas de subject/body/footer y el playbook de "working tree desordenado
-→ commits atómicos", lee `references/conventional-commits.md`.
+Turn finished work into commits a reviewer can read and revert one by one, written the
+way this particular repo writes them.
 
-## Principio rector
+## 1. Pick the mode
 
-**Un commit = un concern.** Antes de teclear `git commit`, pregúntate: ¿este commit cuenta
-una sola historia coherente que alguien podría revertir por sí sola? Si no, divídelo.
+- **Draft** — the user asked for a message ("write/suggest a commit message", "redacta el
+  mensaje"), pasted a diff, or there is no shell. Read what you can (`git diff --staged`,
+  `git diff`, `git log`) but change nothing: return the message and, if useful, the exact
+  `git add`/`git commit` commands to run. Drafting never stages, commits or branches,
+  because the user asked for text, not for a change to their repo.
+- **Commit** — the user asked to commit ("commit this", "haz commit", "commitea los
+  cambios"). Follow the steps below.
 
----
+When the request is ambiguous, draft and offer to commit.
 
-## Flujo paso a paso
+## 2. Preflight
 
-### 1. Entender el cambio
-
-Nunca commitees a ciegas. Primero mira qué hay:
+Run the bundled read-only script; it prints `key=value` lines and never fails hard:
 
 ```bash
-git status                 # archivos modificados, staged y sin trackear
-git diff                   # cambios en el working tree (aún sin stage)
-git diff --staged          # lo que ya está en el índice (--cached es alias)
-git branch --show-current  # en qué rama estás (importa para el guardrail de rama)
+sh <this skill's directory>/scripts/preflight.sh --offline
 ```
 
-Lee el diff de verdad. Identifica los archivos tocados y agrúpalos mentalmente por
-**concern** (área/propósito): ¿es una feature nueva? ¿un fix? ¿un refactor? ¿formateo?
-¿docs? ¿configuración de build/CI? Un mismo working tree suele mezclar varios.
+`--offline` is all draft mode needs. In commit mode, run it again without `--offline` only
+if step 5 needs the branch-protection check.
 
-### 2. Agrupar en commits ATÓMICOS
+| Key | Use |
+|---|---|
+| `git_repo=no` | Switch to draft mode. |
+| `operation_in_progress` ≠ `none`, `conflicted` > 0 | Stop and tell the user; committing mid-rebase or mid-merge is their call. |
+| `staged` / `unstaged` / `untracked` | Scope, step 3. |
+| `history_style`, `commit_convention_config`, `contributing`, `agent_instructions`, `commit_template` | Message convention, step 4. |
+| `on_default_branch`, `default_branch_flow` | Branch decision, step 5. |
+| `hooks`, `gpg_sign` | Hooks and signing will run; let them. |
 
-Reglas de corte (una por concern):
+## 3. Decide what belongs in the commit
 
-- **Un concern por commit.** No mezcles una feature con un fix no relacionado.
-- **Refactor aparte de feature.** Mover/renombrar código va en su propio commit, separado
-  del cambio de comportamiento.
-- **Formateo/estilo aparte de lógica.** Un reformateo masivo ahoga el diff real; sepáralo.
-- **Cambios no relacionados → commits distintos**, aunque estén en el mismo archivo.
+Commit only the changes that belong to the task at hand: the files you edited in this
+conversation, or the ones the user named. A working tree often also holds the user's own
+unrelated edits, and sweeping them into your commit would publish half-finished work under
+the wrong message. So:
 
-Staging selectivo para lograrlo:
+- Stage by explicit path (`git add path/a.go path/b.go`). Use `git add -A` or `git add .`
+  only when the user asked to commit everything.
+- Anything already staged before you started is the user's selection; keep it, and if it
+  looks unrelated to the task, say so before committing.
+- Leave everything else untouched and list it in the report as "not committed".
+- If you cannot tell whether a change is part of the task, ask instead of guessing.
+
+Then split into **atomic commits**, one concern each: refactor apart from behavior change,
+mass formatting apart from logic, unrelated fixes apart from each other. Prefer splitting
+by whole files. When one file mixes two concerns and the split matters, stage only some of
+its hunks without a prompt (`git add -p` and `git add -i` wait for keyboard input you
+cannot give); the recipe is in [references/atomic-commits.md](references/atomic-commits.md).
+
+After staging, run the secret scan and read `git diff --staged` once more:
 
 ```bash
-git add path/to/file.go path/to/other.go   # solo los archivos de este concern
-git add -p                                  # trocea un archivo: elige qué hunks van
-git restore --staged path/to/file          # sacar algo del índice si se coló
+sh <this skill's directory>/scripts/preflight.sh --secrets
 ```
 
-`git add -p` es la herramienta clave cuando un mismo archivo contiene dos concerns: te
-deja elegir hunk por hunk (`y`/`n`/`s` para partir, `q` para salir).
+A `secret_hit` or `large_staged_file` keeps that file out: unstage it
+(`git restore --staged <path>`), tell the user what kind of secret it looked like (never
+the value) and suggest `.gitignore` or a secret store.
 
-### 3. Chequeos rápidos antes de commitear
+If the repo has cheap checks that fit its layout and what you touched (formatter, `go build ./...`,
+`go vet ./...`, the lint script in `package.json`), run them; a commit that does not build
+breaks bisect for everyone. Do not install toolchains the repo does not already use.
 
-Si el repo tiene checks **baratos y disponibles**, córrelos antes de sellar el commit.
-No commitees algo que rompe el build.
+## 4. Write the message
 
-```bash
-# Go (ejemplo típico):
-gofmt -l .        # lista archivos mal formateados; vacío = OK
-go build ./...    # debe compilar
-go vet ./...      # análisis estático básico
-```
+The repo's convention wins over this skill's defaults, in this order:
 
-Otros ecosistemas: el linter/formateador/`build` o `test` que el repo ya use (p. ej.
-`npm run lint`, `ruff`, `cargo build`). Si un chequeo **barato** falla y el fix es
-formateo, arréglalo y re-stagea. **Aborta el commit que rompe el build** y reporta el
-error en vez de commitear código roto. No inventes ni instales toolchains que el repo
-no tenga; si no hay checks baratos, sigue.
+1. Explicit config: commitlint/commitizen config, `commit.template`, CONTRIBUTING,
+   AGENTS.md / CLAUDE.md.
+2. Recent history: `git log --no-merges -n 15 --format=%s` shows type prefixes, scopes,
+   ticket keys (`ABC-123: …`), capitalization, tense and **language**. Write in the
+   language the recent commits use; with no history to look at (a pasted diff, a new
+   repo), use the language the user is writing in.
+3. Fallback when the repo shows no pattern: Conventional Commits, described in
+   [references/conventional-commits.md](references/conventional-commits.md).
 
-### 4. Redactar el mensaje Conventional Commit
+Whatever the format: a short imperative subject (about 50 columns), a blank line, then a
+body explaining *why* when the subject does not make it obvious, wrapped near 72 columns.
+Footers go last: issue refs (`Closes #12`), `BREAKING CHANGE:`, and any trailer the
+environment asks you to add (for example a `Co-Authored-By:` attribution line from the
+harness), kept exactly as given.
 
-Formato: `type(scope): subject`, cuerpo opcional tras línea en blanco, footers al final.
-
-- **type**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`,
-  `chore`, `revert` (tabla completa en la referencia).
-- **scope** (opcional): el paquete/área afectada, entre paréntesis: `feat(auth): …`.
-- **subject**: imperativo, minúscula inicial, **sin punto final**, ≤50 columnas.
-- **body** (tras línea en blanco): el **PORQUÉ** y el contexto, ~72 columnas por línea.
-  Explica la motivación, no repitas el diff.
-- **footers**: `BREAKING CHANGE: …`, `Refs #N`, `Closes #N`, `Co-Authored-By: …`.
-- **Breaking change**: marca con `!` (`feat(api)!: …`) y/o footer `BREAKING CHANGE:`.
-
-Con cuerpo y/o footers, usa un archivo o `-m` repetido (cada `-m` es un párrafo):
+Write multi-line messages to a temp file outside the repo, so it can never be staged and
+parallel sessions do not overwrite each other:
 
 ```bash
-# Opción A — archivo de mensaje (mejor para cuerpos largos y footers):
-cat > /tmp/commitmsg.txt <<'EOF'
-feat(auth): add token refresh endpoint
+msg=$(mktemp "${TMPDIR:-/tmp}/commitmsg.XXXXXX")
+cat > "$msg" <<'EOF'
+fix(parser): handle empty input without panicking
 
-Sessions expired silently after 1h, forcing a full re-login. This adds
-a refresh endpoint so the client can renew tokens transparently.
-
-Closes #142
+An empty body reached the tokenizer and indexed a zero-length slice.
 EOF
-git commit -F /tmp/commitmsg.txt
-
-# Opción B — solo subject:
-git commit -m "fix(parser): handle empty input without panicking"
-
-# Opción C — subject + body con -m repetido:
-git commit -m "refactor(store): extract query builder" \
-           -m "No behavior change; splits a 200-line method for testability."
+git commit -F "$msg"; rm -f "$msg"
 ```
 
-### 5. Ejecutar los commits (automático)
+## 5. Branch
 
-Repite stage-selectivo + `git commit` una vez por concern, en orden lógico (p. ej. el
-refactor antes de la feature que lo usa). No pares a pedir confirmación entre commits.
+Commit on the current branch unless there is a reason not to. Being on `main` is not by
+itself that reason: many repos commit straight to trunk.
 
-### 6. Reportar
+- `on_default_branch=no` → commit where you are.
+- On the default branch, run preflight without `--offline` to get
+  `default_branch_protected`:
+  - `yes` → a push would be rejected anyway. Create a branch with `git switch -c <name>`
+    (follow the naming in `git branch -r`, else `type/short-topic`) and tell the user.
+  - `no` and `default_branch_flow=direct-commits` → commit on the default branch.
+  - `remotes=none` → commit on the current branch; with no remote there is no protection
+    or review flow to respect.
+  - Anything else (`pull-requests`, `mixed`, `unknown`, no gh, no
+    `default_branch_protected` line) → ask whether to commit here or on a new branch, and
+    say what you saw.
 
-Muestra el resultado para que el usuario vea qué quedó registrado:
+## 6. Report
 
-```bash
-git log --oneline -n 5     # ajusta -n al nº de commits que hiciste
-git status                 # confirma que el working tree quedó limpio
-```
-
----
+Show `git log --oneline -n <commits made>` and list what was left uncommitted on purpose
+(other files, skipped hunks, flagged secrets). Push only if the user asked; then push the
+current branch to its upstream (`git push`, or `git push -u <remote> <branch>` the first
+time). Opening a pull request is the `create-pr` skill's job.
 
 ## Guardrails
 
-Innegociables. No son "preguntar antes": son "no hacer estupideces".
+Hard limits, because their damage is hard to undo:
 
-1. **Nunca commitees secretos.** Si el diff contiene `.env`, claves privadas, tokens,
-   credenciales, `id_rsa`/`*.pem`, cadenas tipo `AKIA…`/`sk-…`, o binarios enormes:
-   **ABORTA** ese commit, saca el archivo del índice (`git restore --staged <path>`) y
-   avisa al usuario. Sugiere `.gitignore` en vez de commitear.
-2. **Rama protegida → crea feature branch primero.** Si `git branch --show-current`
-   devuelve `main`/`master` (o una rama protegida), crea una rama **antes** de commitear:
-   ```bash
-   git switch -c feat/descripcion-corta
-   ```
-   Nunca commitees directo sobre la rama protegida.
-3. **Nunca `git push --force`.** Como mucho `git push --force-with-lease` sobre **tu
-   propia** rama y solo si es imprescindible (p. ej. tras un rebase de tu feature). Jamás
-   force-push a ramas compartidas/protegidas.
-4. **Respeta hooks y plantillas del repo.** Si existen `pre-commit`, `commit-msg`,
-   `commitlint`, `.gitmessage`, etc., déjalos actuar: no uses `--no-verify` para saltarte
-   un hook que falla; corrige la causa. Si el hook rechaza el mensaje, ajústalo al estándar.
-5. **No reescribas historia publicada.** `commit --amend`/`rebase` solo sobre commits
-   locales aún no empujados.
-
-## Checklist
-
-Antes de dar por cerrado el trabajo, verifica:
-
-- [ ] Leíste `git diff` / `git diff --staged`; entiendes cada cambio que vas a commitear.
-- [ ] Cada commit es **un solo concern**; refactor/formateo separados de la lógica.
-- [ ] Ningún secreto, credencial, `.env` ni binario enorme entró al índice.
-- [ ] No estás commiteando sobre `main`/`master`; si lo estabas, creaste feature branch.
-- [ ] Los checks baratos del repo pasan; ningún commit rompe el build.
-- [ ] Cada mensaje es Conventional Commit válido: `type(scope): subject` imperativo ≤50,
-      cuerpo con el porqué a ~72, footers correctos (`Closes #N`, `BREAKING CHANGE:`…).
-- [ ] Hooks/plantillas del repo respetados; no se usó `--no-verify` ni force-push.
-- [ ] Reportaste con `git log --oneline` y el working tree quedó limpio.
-
----
-
-## Reference Files
-
-- `references/conventional-commits.md` — tabla completa de types y cuándo usar cada uno,
-  reglas de subject/body/footer con GOOD/BAD, breaking changes (`!` y `BREAKING CHANGE:`),
-  el playbook "working tree desordenado → commits atómicos" (cómo decidir los cortes,
-  staging selectivo, separar refactor de feature) y ejemplos completos de mensajes reales.
+- **Never commit secrets.** A flagged file stays out until the user confirms it is a false
+  positive.
+- **Never skip hooks or signing** (`--no-verify`, `--no-gpg-sign`,
+  `-c commit.gpgsign=false`). When a hook fails, fix the cause and commit again; the failed
+  commit never happened, so do not `--amend` the previous one.
+- **Never force-push a shared branch.** On your own feature branch after your own rebase,
+  `git push --force-with-lease` is the most that is allowed.
+- **Do not rewrite pushed history** (`--amend`, rebase, reset) unless the user asks.

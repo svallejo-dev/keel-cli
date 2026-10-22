@@ -1,179 +1,192 @@
 # Channels & Concurrency Fundamentals — Go Idiomatic Reference
 
-## Concurrencia vs Paralelismo
+## Contents
 
-Son ejes distintos. **Concurrencia** es estructura: descomponer un programa en tareas independientes que progresan de forma intercalada. **Paralelismo** es ejecución: correr varias de esas tareas literalmente al mismo tiempo sobre varios cores. Un programa concurrente corre bien en un solo core; el paralelismo solo aparece si hay hardware para ello.
-
-Una goroutine es un hilo ligero gestionado por el runtime, no por el SO — arranca con ~2 KB de stack que crece bajo demanda. El scheduler es **G-P-M**: `G` goroutines se multiplexan sobre `M` threads del SO a través de `P` procesadores lógicos, cada `P` con su run queue local y work-stealing entre ellas.
-
-`GOMAXPROCS` fija cuántos `P` hay activos, es decir el techo de paralelismo real. Por defecto es el número de cores visibles (o el límite de CPU del cgroup en Go 1.25+). Consúltalo sin modificarlo con `runtime.GOMAXPROCS(0)`.
-
-Regla: elige la concurrencia por la estructura del problema (cuántas tareas independientes hay), no por cuántos cores tienes. El scheduler reparte.
+- Concurrency vs parallelism
+- Channel axioms (nil / open / closed) and ownership
+- Unbuffered vs buffered; when a buffer is right
+- select
+- Memory model / happens-before
+- Data races
+- "Share memory by communicating" and its limits
+- Checklist
 
 ---
 
-## Axiomas de Channels
+## Concurrency vs Parallelism
 
-Un channel tiene tres estados — nil, abierto, cerrado — y cada operación se comporta distinto en cada uno. Memorizar esta tabla elimina la mayoría de los deadlocks y panics de concurrencia.
+They are different axes. **Concurrency** is structure: decomposing a program into independent tasks that make progress interleaved. **Parallelism** is execution: running several of those tasks literally at the same time on several cores. A concurrent program runs fine on one core; parallelism only appears if the hardware is there.
 
-| Estado del canal | `send` (`ch <- v`) | `recv` (`<-ch`) | `close(ch)` |
+A goroutine is a lightweight thread managed by the runtime, not the OS; it starts with a small stack (a few KB) that grows on demand. The scheduler is **G-P-M**: `G` goroutines are multiplexed onto `M` OS threads through `P` logical processors, each `P` with its own local run queue and work-stealing between them.
+
+`GOMAXPROCS` sets how many `P`s are active, i.e. the ceiling on real parallelism. It defaults to the number of visible cores (or, since Go 1.25 on Linux, the cgroup CPU limit when that is lower). Read it without changing it with `runtime.GOMAXPROCS(0)`.
+
+Choose concurrency from the structure of the problem (how many independent tasks exist), not from how many cores you have. The scheduler does the distribution.
+
+---
+
+## Channel Axioms
+
+A channel has three states (nil, open, closed), and each operation behaves differently in each. Knowing this table removes most concurrency deadlocks and panics.
+
+| Channel state | send (`ch <- v`) | receive (`<-ch`) | `close(ch)` |
 |---|---|---|---|
-| `nil` | bloquea **para siempre** | bloquea **para siempre** | **panic** |
-| abierto | bloquea si no hay hueco/receptor | bloquea si no hay dato | ok |
-| cerrado | **panic** | zero value + `ok=false` (inmediato) | **panic** (doble close) |
+| `nil` | blocks **forever** | blocks **forever** | **panic** |
+| open | blocks until there is room or a receiver | blocks until there is a value | ok |
+| closed | **panic** | zero value + `ok=false`, immediately | **panic** (double close) |
 
-Dos consecuencias que se explotan a diario:
+Two consequences used daily:
 
-- El bloqueo eterno de un canal `nil` es **útil** dentro de un `select`: asignar `nil` a una variable de canal desactiva ese `case` dinámicamente (ver más abajo).
-- Un canal cerrado se puede leer infinitas veces; primero drena lo que quede en el buffer y luego entrega zero values con `ok=false`. Por eso `range ch` termina limpio al cerrar.
+- Blocking forever on a `nil` channel is **useful** inside a `select`: setting a channel variable to `nil` disables that case dynamically (see below).
+- A closed channel can be received from indefinitely: it first drains whatever is buffered, then yields zero values with `ok=false`. That is why `range ch` ends cleanly on close.
 
 ```go
 ch := make(chan int, 1)
 ch <- 42
 close(ch)
-v, ok := <-ch // v=42, ok=true  — drena el buffer primero
-v, ok = <-ch  // v=0,  ok=false — cerrado y vacío
+v, ok := <-ch // v=42, ok=true  — drains the buffer first
+v, ok = <-ch  // v=0,  ok=false — closed and empty
 ```
 
-### Ownership: quién cierra
+### Ownership: who closes
 
-**Cierra el productor/owner del canal, NUNCA el receptor.** El `close` es una señal de "no habrá más datos", y solo quien produce sabe eso. Cerrar desde el receptor abre la puerta a un `send` sobre canal cerrado (panic) en el productor.
+The producer that owns the channel closes it; the receiver does not. `close` means "no more values", and only the sender knows that. Closing from the receiver side invites a send on a closed channel (panic) in the producer.
 
 ```go
 func producer(n int) <-chan int {
 	out := make(chan int)
 	go func() {
-		defer close(out) // el owner cierra al terminar de producir
-		for i := 0; i < n; i++ {
+		defer close(out) // the owner closes when it is done producing
+		for i := range n {
 			out <- i
 		}
 	}()
-	return out // devuelve <-chan int: el receptor no puede cerrarlo
+	return out // returning <-chan int: the receiver cannot close it
 }
 
 func consume() {
-	for v := range producer(3) { // range termina solo cuando el owner cierra
+	for v := range producer(3) { // range ends only when the owner closes
 		fmt.Println(v)
 	}
 }
 ```
 
-Devolver `<-chan T` (receive-only) hace que el compilador impida que el receptor cierre el canal. Es el modo idiomático de codificar el ownership en la firma.
+Returning `<-chan T` (receive-only) makes the compiler reject a `close` by the receiver. It is the idiomatic way to encode ownership in the signature.
 
 ---
 
 ## Unbuffered vs Buffered
 
-Un canal **unbuffered** (`make(chan T)`, capacidad 0) es un **rendezvous síncrono**: el `send` y el `recv` se encuentran en el mismo instante y hay un handoff garantizado — el emisor no avanza hasta que alguien recibe. Un canal **buffered** (`make(chan T, N)`) es una **cola asíncrona** de capacidad `N`: el `send` solo bloquea si el buffer está lleno; el `recv` solo bloquea si está vacío.
+An **unbuffered** channel (`make(chan T)`, capacity 0) is a **synchronous rendezvous**: send and receive meet at the same instant and the handoff is guaranteed; the sender does not proceed until someone receives. A **buffered** channel (`make(chan T, N)`) is an **asynchronous queue** of capacity `N`: a send blocks only when the buffer is full; a receive blocks only when it is empty.
 
 | | Unbuffered (`cap==0`) | Buffered (`cap==N`) |
 |---|---|---|
-| Semántica | rendezvous síncrono | cola asíncrona FIFO |
-| `send` bloquea | hasta que un `recv` lo tome | solo si el buffer está lleno |
-| `recv` bloquea | hasta que un `send` ocurra | solo si el buffer está vacío |
-| Garantía tras `send` | el receptor **ya** lo tomó | solo encolado, quizá no leído |
-| Uso típico | señalización, handoff, sincronización | desacoplar productor/consumidor |
+| Semantics | synchronous rendezvous | asynchronous FIFO queue |
+| Send blocks | until a receiver takes it | only when the buffer is full |
+| Receive blocks | until a sender sends | only when the buffer is empty |
+| Guarantee after send | the receiver **has** it | only queued, maybe not read yet |
+| Typical use | signaling, handoff, synchronization | decoupling producer and consumer |
 
-`len()` y `cap()` operan sobre channels: `cap(ch)` es el tamaño del buffer (constante); `len(ch)` es cuántos elementos están encolados ahora mismo. Sobre un unbuffered ambos son 0.
+`len()` and `cap()` work on channels: `cap(ch)` is the buffer size (constant); `len(ch)` is how many elements are queued right now. Both are 0 on an unbuffered channel.
 
 ```go
 ch := make(chan int, 2)
 ch <- 1
-ch <- 2                       // no bloquea: hay hueco
+ch <- 2                       // does not block: there is room
 fmt.Println(len(ch), cap(ch)) // 2 2
 <-ch
 fmt.Println(len(ch), cap(ch)) // 1 2
 ```
 
-`len(ch)` es una foto instantánea sin valor para sincronizar — puede cambiar entre que lo lees y actúas. Úsalo para métricas, no para control de flujo.
+`len(ch)` is an instantaneous snapshot that can change between reading it and acting on it. Use it for metrics, not for control flow.
 
 ---
 
-## Cuándo Buffered es Correcto — y el Anti-Patrón
+## When a Buffer Is Right — and the Anti-Pattern
 
-Un buffer se justifica cuando hay una razón concreta:
+A buffer is justified by a concrete reason:
 
-- **`N` conocido de antemano.** Un resultado por worker con `N` fijo: los sends nunca bloquean y el receptor puede recogerlos a su ritmo.
-- **Desacoplar productor de consumidor** cuando su throughput es desigual y ráfagas cortas no deben frenar al productor.
-- **Evitar goroutine leak cuando el receptor puede irse.** Si el receptor abandona (timeout, cancelación) antes de leer, un `send` sobre canal unbuffered bloquea a la goroutine emisora para siempre. Un buffer de tamaño suficiente absorbe el envío y deja que la goroutine termine.
+- **`N` known in advance.** One result per worker with a fixed `N`: sends never block and the receiver collects at its own pace.
+- **Decoupling producer from consumer** when their throughput is uneven and short bursts should not stall the producer.
+- **Avoiding a goroutine leak when the receiver may leave.** If the receiver gives up (timeout, cancellation) before reading, a send on an unbuffered channel blocks the sender forever. A buffer large enough to hold every send lets the goroutine finish.
 
 ```go
 func fanOut(ids []int) <-chan int {
-	results := make(chan int, len(ids)) // N exacto: los sends nunca bloquean
+	results := make(chan int, len(ids)) // exact N: sends never block
 	for _, id := range ids {
-		go func(id int) {
-			results <- id * id // sin leak aunque nadie lea aún
-		}(id)
+		go func() {
+			results <- id * id // no leak even if nobody reads yet
+		}()
 	}
 	return results
 }
 ```
 
-### Anti-patrón: usar un buffer para "arreglar" un bug
+### Anti-pattern: a buffer to "fix" a bug
 
 ```go
-// BAD: aumentar el buffer para que el deadlock/race "desaparezca"
-ch := make(chan int, 1000) // ← número mágico que oculta el problema
+// BAD: grow the buffer until the deadlock or race "goes away"
+ch := make(chan int, 1000) // magic number hiding the problem
 
-// GOOD: diseñar la terminación y la sincronización explícitamente
-ch := make(chan int)       // capacidad = razón concreta, no conveniencia
+// GOOD: design termination and synchronization explicitly
+ch := make(chan int) // capacity comes from a concrete reason, not convenience
 ```
 
-Un buffer **no corrige** un deadlock ni una race — solo cambia el timing lo suficiente para que el síntoma se manifieste menos seguido. Si eliges el tamaño del buffer por prueba y error hasta que "deja de fallar", el bug sigue ahí, latente y dependiente de la carga. La capacidad de un canal debe derivarse de una propiedad del problema (número de workers, tamaño de lote), nunca ajustarse para esconder un fallo de sincronización.
+A buffer does **not** fix a deadlock or a race; it only shifts timing enough for the symptom to show up less often. If you pick the buffer size by trial and error until "it stops failing", the bug is still there, latent and load-dependent. Derive channel capacity from a property of the problem (number of workers, batch size), never tune it to hide a synchronization fault.
 
 ---
 
 ## select
 
-`select` espera sobre varias operaciones de canal a la vez y procede con la primera que esté lista.
+`select` waits on several channel operations at once and proceeds with the first one ready.
 
-- Si **varios** casos están listos, elige uno **al azar** (evita starvation; no asumas orden).
-- Un caso `default` hace el `select` **no bloqueante**: si ningún canal está listo, corre `default` de inmediato.
-- Asignar `nil` a una variable de canal **desactiva** ese caso: como leer/escribir en `nil` bloquea para siempre, ese `case` nunca vuelve a seleccionarse.
+- If **several** cases are ready, it picks one **at random** (avoids starvation; do not assume an order).
+- A `default` case makes the `select` **non-blocking**: if no channel is ready, `default` runs immediately.
+- Setting a channel variable to `nil` **disables** that case: since operations on `nil` block forever, the case is never selected again.
 
 ```go
-// default no bloqueante: intenta enviar sin esperar
+// Non-blocking send: try without waiting.
 func trySend(ch chan int, v int) bool {
 	select {
 	case ch <- v:
 		return true
 	default:
-		return false // canal lleno: no bloquea
+		return false // channel full: do not block
 	}
 }
 ```
 
 ```go
-// Truco del canal nil: desactivar un caso dinámicamente
+// nil-channel trick: disable a case dynamically.
 func drain(in <-chan int, tick <-chan time.Time) {
 	for in != nil || tick != nil {
 		select {
 		case v, ok := <-in:
 			if !ok {
-				in = nil // canal agotado → desactiva este case
+				in = nil // input exhausted → disable this case
 				continue
 			}
 			fmt.Println(v)
 		case <-tick:
-			tick = nil // desactiva el ticker
+			tick = nil // disable the ticker case
 		}
 	}
 }
 ```
 
-El patrón `for`-`select` con `ctx.Done()` es la forma canónica de una goroutine terminable: siempre hay una salida garantizada.
+The `for`-`select` loop with `ctx.Done()` is the canonical shape of a goroutine that can be stopped: there is always a guaranteed way out.
 
 ```go
 func worker(ctx context.Context, in <-chan int, out chan<- int) {
 	for {
 		select {
 		case <-ctx.Done():
-			return // única salida garantizada
+			return
 		case v, ok := <-in:
 			if !ok {
 				return
 			}
-			select { // el send también respeta la cancelación
+			select { // the send honors cancellation too
 			case out <- v * 2:
 			case <-ctx.Done():
 				return
@@ -187,60 +200,58 @@ func worker(ctx context.Context, in <-chan int, out chan<- int) {
 
 ## Memory Model / Happens-Before
 
-Un channel no solo **comunica** valores: **sincroniza** memoria. El Go Memory Model garantiza dos relaciones happens-before clave:
+A channel does not only **communicate** values; it **synchronizes** memory. The Go memory model guarantees two key happens-before relations:
 
-- Un `send` sobre un canal **happens-before** el `recv` correspondiente completa.
-- Un `close` **happens-before** un `recv` que observa el cierre (el que recibe `ok=false`).
+- A send on a channel **happens before** the corresponding receive completes.
+- A `close` **happens before** a receive that observes the close (the one that gets `ok=false`).
 
-Por eso, todo lo que una goroutine escribió **antes** de enviar (o cerrar) es visible en la goroutine que recibe. Sin esta garantía, una escritura en un core podría no ser visible en otro.
+So everything a goroutine wrote **before** sending (or closing) is visible to the goroutine that receives. Without that guarantee, a write on one core might not be visible on another.
 
 ```go
 func happensBefore() {
 	var data int
 	done := make(chan struct{})
 	go func() {
-		data = 42   // (1) escritura
-		close(done) // (2) close happens-before el recv que lo observa
+		data = 42   // (1) write
+		close(done) // (2) close happens before the receive that observes it
 	}()
-	<-done            // (3) observa el close
-	fmt.Println(data) // 42 garantizado: (1) es visible aquí
+	<-done            // (3) observes the close
+	fmt.Println(data) // 42 guaranteed: (1) is visible here
 }
 ```
 
-Para el caso concreto de un **contador**, un channel es demasiado pesado. `sync/atomic` da la misma garantía de visibilidad con read-modify-write atómico y sin bloqueo:
+For a plain **counter**, a channel is too heavy. `sync/atomic` gives the same visibility guarantee with an atomic read-modify-write and no blocking:
 
 ```go
-var n atomic.Int64 // Go 1.19+ tipos atómicos con métodos
-n.Add(1)           // atómico: sin race, sin mutex
+var n atomic.Int64 // typed atomics, Go 1.19+
+n.Add(1)
 n.Load()
 ```
 
-Regla: channels para transferir datos y coordinar; `atomic` para contadores y flags simples; `mutex` para invariantes sobre varias variables.
+Channels to transfer data and coordinate; `atomic` for simple counters and flags; a mutex for invariants spanning several variables.
 
 ---
 
 ## Data Races
 
-Una **data race** ocurre cuando dos goroutines acceden a la misma variable concurrentemente, al menos uno de los accesos es una escritura, y no hay una relación happens-before que los ordene. El resultado es undefined behavior: valores corruptos, no solo "el último gana".
+A **data race** happens when two goroutines access the same variable concurrently, at least one access is a write, and no happens-before relation orders them. The result is undefined behavior: corrupted values, not merely "last write wins".
 
-El race detector es la herramienta definitiva. Instrumenta los accesos a memoria en runtime y reporta la race con ambos stacks:
+The race detector instruments memory accesses at run time and reports each race with both stacks:
 
 ```bash
-go run -race ./...
+go run -race .
 go test -race ./...
 ```
 
 ```go
-// BAD: counter++ es read-modify-write NO atómico → data race
+// BAD: counter++ is a non-atomic read-modify-write → data race
 func racyCounter() int {
 	var counter int
 	var wg sync.WaitGroup
-	for i := 0; i < 1000; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			counter++ // -race lo marca; el resultado es no determinista
-		}()
+	for range 1000 {
+		wg.Go(func() {
+			counter++ // -race flags this; the result is nondeterministic
+		})
 	}
 	wg.Wait()
 	return counter
@@ -248,72 +259,76 @@ func racyCounter() int {
 ```
 
 ```go
-// GOOD (mutex): protege el estado compartido
+// GOOD (mutex): protect the shared state
 func mutexCounter() int {
 	var (
 		mu      sync.Mutex
 		counter int
 		wg      sync.WaitGroup
 	)
-	for i := 0; i < 1000; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 1000 {
+		wg.Go(func() {
 			mu.Lock()
 			counter++
 			mu.Unlock()
-		}()
+		})
 	}
 	wg.Wait()
-	return counter // siempre 1000
+	return counter // always 1000
 }
 ```
 
 ```go
-// GOOD (channel): un solo owner toca el estado; el resto le envía trabajo
+// GOOD (channel): one owner touches the state; everyone else sends it work
 func channelCounter() int {
 	inc := make(chan struct{})
 	result := make(chan int)
 	go func() {
 		counter := 0
 		for range inc {
-			counter++ // ninguna otra goroutine ve counter
+			counter++ // no other goroutine can see counter
 		}
 		result <- counter
 	}()
-	// ... goroutines hacen `inc <- struct{}{}`, luego close(inc)
-	return <-result
+
+	var wg sync.WaitGroup
+	for range 1000 {
+		wg.Go(func() { inc <- struct{}{} })
+	}
+	wg.Wait()
+	close(inc)
+	return <-result // always 1000
 }
 ```
 
-Corre `-race` en CI sobre los tests concurrentes. No detecta races en caminos que el test no ejercita, pero cero falsos positivos: lo que reporta es real.
+Run `-race` in CI over the concurrent tests. It cannot see races on paths the tests don't exercise, but it has no false positives: whatever it reports is real.
 
 ---
 
 ## "Don't communicate by sharing memory; share memory by communicating"
 
-El proverbio de Go: en lugar de que varias goroutines lean y escriban la misma variable bajo locks, pasa la propiedad del dato por un channel — en cada instante solo una goroutine lo posee, y transferirlo es un `send`. Elimina la clase entera de bugs de "olvidé tomar el lock".
+The Go proverb: instead of several goroutines reading and writing the same variable under locks, pass ownership of the data through a channel. At any moment only one goroutine owns it, and handing it over is a send. That removes the whole class of "forgot to take the lock" bugs.
 
-Pero tiene un **límite**, y tratarlo como dogma produce código peor:
+It has a **limit**, though, and treating it as dogma produces worse code:
 
-| Usa **channels** cuando... | Usa **`sync.Mutex`** cuando... |
+| Use **channels** when… | Use **`sync.Mutex`** when… |
 |---|---|
-| transfieres la propiedad de un dato | proteges estado compartido de vida larga |
-| coordinas el ciclo de vida de goroutines | el estado es un struct con invariantes entre campos |
-| construyes un pipeline o fan-out/in | el acceso es un simple get/set con contención |
-| la unidad natural es "un mensaje" | mover el dato por un canal sería más caro que un lock |
+| you transfer ownership of data | you protect long-lived shared state |
+| you coordinate goroutine lifecycles | the state is a struct with invariants across fields |
+| you build a pipeline or fan-out/in | access is a simple get/set under contention |
+| the natural unit is "a message" | moving the data through a channel would cost more than a lock |
 
-Un cache concurrente, un contador de conexiones, un registro de métricas — todo eso es estado compartido de vida larga que un `sync.Mutex` (o `sync.RWMutex`, o `atomic`) protege de forma más simple y rápida que orquestar una goroutine-dueña con channels. Forzar channels ahí añade una goroutine, latencia y complejidad sin ganancia. Elige la herramienta por la forma del problema, no por el eslogan.
+A concurrent cache, a connection counter, a metrics registry: all long-lived shared state that a `sync.Mutex` (or `sync.RWMutex`, or `atomic`) protects more simply and faster than an owner goroutine orchestrated with channels. Forcing channels there adds a goroutine, latency and complexity for no gain. Pick the tool from the shape of the problem, not from the slogan.
 
 ---
 
 ## Checklist
 
-- [ ] La capacidad del canal deriva de una razón concreta (N workers, tamaño de lote), nunca de prueba y error para tapar un bug.
-- [ ] El productor/owner cierra el canal; el receptor nunca — codificado con `<-chan T` en la firma.
-- [ ] Ningún `send` sobre un canal potencialmente cerrado, ni doble `close`, ni `close` de canal `nil`.
-- [ ] Toda goroutine tiene salida garantizada: `for`-`select` con `case <-ctx.Done()`.
-- [ ] Se usa un unbuffered para señalización/handoff y buffered solo para desacoplar o evitar leaks del emisor.
-- [ ] `len(ch)`/`cap(ch)` solo para métricas, jamás para control de flujo de sincronización.
-- [ ] Contadores y flags simples usan `sync/atomic`; estado con invariantes usa `sync.Mutex`; transferencia de propiedad usa channels.
-- [ ] `go test -race` corre en CI sobre todo el código concurrente y pasa limpio.
+- [ ] Channel capacity comes from a concrete reason (N workers, batch size), not trial and error to hide a bug.
+- [ ] The producer/owner closes the channel, the receiver does not; encoded with `<-chan T` in the signature.
+- [ ] No send on a possibly closed channel, no double `close`, no `close` of a `nil` channel.
+- [ ] Every goroutine has a guaranteed exit: `for`-`select` with `case <-ctx.Done()`.
+- [ ] Unbuffered for signaling/handoff; buffered only to decouple or to keep a sender from leaking.
+- [ ] `len(ch)`/`cap(ch)` only for metrics, not for synchronization.
+- [ ] Simple counters and flags use `sync/atomic`; state with invariants uses `sync.Mutex`; ownership transfer uses channels.
+- [ ] `go test -race` runs in CI over all concurrent code and passes.

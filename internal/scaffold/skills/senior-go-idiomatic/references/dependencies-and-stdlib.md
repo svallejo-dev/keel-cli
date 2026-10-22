@@ -1,245 +1,321 @@
 # Dependencies & Stdlib — Go Idiomatic Reference
 
-## Filosofía stdlib-first
+## Contents
 
-La stdlib no es un fallback — es la primera respuesta. Go se diseñó "batteries included": `net/http` es un servidor de producción, `encoding/json` parsea sin dependencias, `crypto/*` cubre TLS, AEAD y hashing, `log/slog` (Go 1.21+) hace logging estructurado. Antes de `go get`, la pregunta es siempre: **¿ya lo resuelve la stdlib o el sub-repo oficial `golang.org/x/...`?**
-
-Dos propiedades hacen a la stdlib estructuralmente superior a cualquier dep:
-
-- **Go 1 compatibility promise** — el código que compila hoy compilará en cada release de Go 1.x. La stdlib no rompe tu build; una dep de terceros no te debe nada.
-- **Cero costo de supply-chain** — no añade nada al grafo de módulos, no tiene CVEs que no sean los del propio toolchain, no depende de que un maintainer siga vivo.
-
-Regla mental: **cada dependencia es un pasivo, no un activo.** Un activo produce valor; un pasivo hay que mantenerlo, auditarlo y parchearlo para siempre. La dep se justifica solo cuando el valor que aporta supera ese pasivo permanente.
+- Stdlib-first and the real cost of a dependency
+- Evaluating a dependency; audit tools (`go mod why/graph`, `govulncheck`), MVS
+- "A little copying is better than a little dependency"
+- Libraries, not frameworks (ServeMux patterns, sqlc over ORMs)
+- When to take the dependency; pre-approved dependencies
+- Module hygiene: `go.sum`, annotated `go.mod`, the `tool` directive, vendoring, upgrades
 
 ---
 
-## El costo real de una dependencia
+## Stdlib-First
 
-Una línea en `require` no es "una" dependencia. Es todo lo que arrastra:
+The standard library is the first answer, not the fallback. `net/http` is a production
+server and, since Go 1.22, a router with method and wildcard patterns; `encoding/json`
+parses without dependencies; `crypto/*` covers TLS, AEAD and hashing; `log/slog` (Go 1.21)
+does structured logging; `slices`, `maps` and `iter` replace most "collection utils"
+libraries. Before `go get`, ask: **does the stdlib or the official `golang.org/x/...`
+sub-repositories already cover this?**
 
-| Costo | Qué significa | Cómo se paga |
+Two properties make the stdlib structurally cheaper than any dependency:
+
+- **The Go 1 compatibility promise** — code that compiles today keeps compiling on every
+  Go 1.x release. A third-party module promises nothing of the kind.
+- **No supply-chain cost** — it adds nothing to the module graph, has no CVEs beyond the
+  toolchain's own, and does not depend on a maintainer staying active.
+
+Treat every dependency as a liability, not an asset: something you maintain, audit and
+patch for as long as you ship. It is justified only when its value exceeds that ongoing
+cost.
+
+---
+
+## The Real Cost of a Dependency
+
+One `require` line is not one dependency. It is everything it pulls in:
+
+| Cost | What it means | How you pay |
 |---|---|---|
-| Transitive deps | Cada dep trae las suyas — un grafo, no un nodo | `go mod graph` explota; builds más lentos |
-| Superficie de CVE | Más código de terceros = más vulnerabilidades que te afectan | `govulncheck` reporta lo que tú ni escribiste |
-| Bugs ajenos | Sus bugs son tus bugs en producción | Debugging en código que no controlas |
-| Mantenimiento | ¿El repo sigue vivo? ¿Un solo maintainer? | Fork de emergencia cuando lo abandonan |
-| Tiempo de build | Cada módulo se descarga, verifica y compila | CI más lento, feedback loop más largo |
-| Breaking changes | Un `v2` ajeno rompe tu API sin avisar | Migraciones no planificadas |
+| Transitive deps | Each dep brings its own — a graph, not a node | `go mod graph` grows; slower builds |
+| CVE surface | More third-party code, more vulnerabilities that reach you | `govulncheck` reports code you never wrote |
+| Someone else's bugs | Their bugs are your production incidents | Debugging code you do not control |
+| Maintenance | Is it alive? A single maintainer? | An emergency fork when it is abandoned |
+| Build time | Every module is downloaded, verified and compiled | Slower CI, longer feedback loop |
+| Breaking changes | Their `v2` breaks your code on their schedule | Unplanned migrations |
 
-El caso canónico: añades una lib de "utils" de 200 líneas y `go mod graph` revela que trajo 40 módulos transitivos, uno de ellos sin commits en tres años. Ese módulo abandonado es ahora **tu** responsabilidad de seguridad.
+The typical story: a 200-line "utils" library turns out, in `go mod graph`, to bring 40
+transitive modules, one without a commit in three years. That abandoned module is now
+**your** security responsibility.
 
 ---
 
-## Cómo evaluar una dep antes de añadirla
+## Evaluating a Dependency Before Adding It
 
-Checklist de decisión — si alguna respuesta es "no" o "no sé", para y reconsidera:
+If any answer is "no" or "I don't know", stop and reconsider:
 
-- [ ] **¿Lo resuelve la stdlib o `golang.org/x/...`?** Si sí, no hay debate.
-- [ ] **¿Cuántas transitive deps arrastra?** Cuéntalas con `go mod graph` en un módulo de prueba antes de comprometerte.
-- [ ] **¿Está viva?** Última release y último commit recientes; issues abiertos con respuesta del maintainer.
-- [ ] **¿Bus factor > 1?** Un solo maintainer es un riesgo de abandono y de supply-chain (cuenta comprometida = tu build comprometido).
-- [ ] **¿Licencia compatible?** MIT / BSD / Apache-2.0 son seguras; GPL/AGPL contaminan según tu distribución.
-- [ ] **¿API estable v1+?** Un módulo en `v0.x` declara explícitamente que puede romper compat en cualquier minor.
+- [ ] **Does the stdlib or `golang.org/x/...` solve it?** If yes, there is no debate.
+- [ ] **How many transitive deps does it bring?** Count them with `go mod graph` in a scratch module first.
+- [ ] **Is it alive?** Recent releases and commits; issues answered by a maintainer.
+- [ ] **Bus factor above one?** A single maintainer is an abandonment risk and a supply-chain risk (one compromised account compromises your build).
+- [ ] **Compatible license?** MIT / BSD / Apache-2.0 are safe; GPL/AGPL obligations depend on how you distribute.
+- [ ] **Stable API (v1+)?** A `v0.x` module explicitly reserves the right to break compatibility in any release.
 
 ```bash
-# Sondear una dep en un módulo desechable ANTES de añadirla al proyecto real
+# Probe a candidate in a throwaway module before adding it to the real project.
 mkdir -p /tmp/probe && cd /tmp/probe && go mod init probe
-go get github.com/some/candidate@latest   # descárgala aislada
-go mod graph | wc -l                       # ¿cuántas aristas transitivas?
-go mod graph | awk '{print $2}' | sort -u  # lista de módulos que entran a tu build
+go get github.com/some/candidate@latest
+go mod graph | wc -l                       # how many transitive edges?
+go mod graph | awk '{print $2}' | sort -u  # every module that would enter your build
 ```
 
 ---
 
-## Herramientas de auditoría
+## Audit Tools
 
-Comandos reales, todos verificados. Ninguno modifica el proyecto salvo `tidy`, `vendor` y `go get`.
+Only `tidy`, `vendor` and `go get` modify the project; the rest just report.
 
 ```bash
-go mod why golang.org/x/sync/errgroup   # POR QUÉ está en el grafo: cadena de import que la trae
-go mod why -m github.com/foo/bar        # -m razona a nivel módulo, no paquete
-go mod graph                            # grafo completo de dependencias (origen -> destino)
-go mod tidy                             # añade lo usado, elimina lo no usado; sincroniza go.sum
-go mod verify                           # confirma que los módulos en caché no fueron alterados
-go list -m all                          # lista plana de todos los módulos del build
-go list -m -u all                       # igual, marcando upgrades disponibles [available]
-go mod download                         # baja el grafo a la caché sin construir
+go mod why golang.org/x/sync/errgroup   # WHY it is in the graph: the import chain
+go mod why -m github.com/foo/bar        # -m reasons at module level, not package level
+go mod graph                            # full dependency graph (from -> to)
+go mod tidy                             # add what is used, drop what is not; sync go.sum
+go mod verify                           # check cached modules were not altered
+go list -m all                          # flat list of every module in the build
+go list -m -u all                       # same, flagging available upgrades
+go mod download                         # fetch the graph into the cache without building
 ```
 
-Escaneo de vulnerabilidades — `govulncheck` cruza tu código contra la Go Vulnerability Database y, crucialmente, solo reporta CVEs que tu código **realmente llama** (analiza call graph, no solo el `require`):
+`govulncheck` checks your code against the Go vulnerability database and, crucially,
+reports only vulnerabilities your code **actually calls** — it analyzes the call graph,
+not just the `require` lines:
 
 ```bash
-go install golang.org/x/vuln/cmd/govulncheck@latest
-govulncheck ./...
-# Salida típica:
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...   # or pin it as a tool (see go.mod below)
 #   Your code is affected by 0 vulnerabilities.
 #   This scan also found 3 vulnerabilities in packages you import ... but your code
-#   doesn't appear to call these  ← ruido filtrado por análisis de reachability
+#   doesn't appear to call these  ← noise filtered out by reachability analysis
 ```
 
-Blindaje de CI — que el build **falle** si `go.mod`/`go.sum` no están sincronizados, en vez de mutarlos silenciosamente:
+Make CI fail when `go.mod`/`go.sum` are out of sync instead of letting the build edit
+them silently:
 
 ```bash
-GOFLAGS=-mod=readonly go build ./...   # prohíbe modificaciones implícitas de go.mod en el build
+GOFLAGS=-mod=readonly go build ./...
 ```
 
 ### Minimal Version Selection (MVS)
 
-MVS (módulos, Go 1.11+): Go elige para cada dependencia la **versión mínima** que satisface todos los `require` del grafo — nunca "la más nueva disponible". Consecuencia directa: **el build es una función determinista de `go.mod`** — el mismo `go.mod` produce el mismo grafo en cualquier máquina y en cualquier momento, sin resolución "sorpresa" en cada CI ni rangos que floten. Reproducibilidad por construcción, no por lockfile de rangos.
+For each dependency, Go picks the **minimum** version that satisfies every `require` in
+the graph — never "the newest available". So the build is a deterministic function of
+`go.mod`: the same `go.mod` yields the same graph on any machine at any time, with no
+floating ranges re-resolved on each CI run. Reproducibility comes from the algorithm, not
+from a lockfile of ranges.
 
 ---
 
 ## "A little copying is better than a little dependency"
 
-Proverbio de Go (Rob Pike). Traer un módulo entero — con sus transitivas, su CVE surface y su maintainer — para usar 30 líneas es un mal negocio. A veces copiar esas 30 líneas, testeadas y bajo tu control, es estrictamente superior.
+A Go proverb. Pulling in a whole module — transitive deps, CVE surface, maintainer — to
+use 30 lines of it is a bad trade. And many of the 30-line helpers people used to import
+are now in the stdlib:
 
 ```go
-// BAD: go get github.com/foo/sliceutil  → trae 40 transitivas para esto
+// BAD: go get github.com/foo/sliceutil — 40 transitive modules for this
 keys := sliceutil.MapKeys(m)
 
-// GOOD: 6 líneas copiadas, cero deps, cero superficie de ataque, tuyas para siempre
-func keys[K comparable, V any](m map[K]V) []K {
-	out := make([]K, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
+// GOOD: the stdlib already does it (Go 1.23: maps.Keys returns an iterator)
+keys := slices.Sorted(maps.Keys(m))     // sorted []K
+all := slices.Collect(maps.Keys(m))     // []K in map order
+```
+
+When the stdlib does not cover it, copying beats depending if:
+
+- The code is **small and stable** (a closed algorithm, not an evolving domain).
+- You can **test it fully** yourself — copy the tests along with the code.
+- The dependency would bring **more transitive modules than lines** it saves you.
+- It is **not** cryptography, a parser for a standard, or correctness-critical code in a
+  domain you do not master (see below).
+
+Credit the source and its license in a comment. Copying is not plagiarism; hiding the
+origin is.
+
+---
+
+## Libraries, Not Frameworks
+
+Go favors small, composable libraries over frameworks that **take over control flow**
+(inversion of control, reflection magic, a runtime that calls you). You call a library; a
+framework calls you and dictates your architecture.
+
+```go
+// GOOD: net/http alone. Since Go 1.22 ServeMux matches methods and wildcards.
+mux := http.NewServeMux()
+mux.HandleFunc("GET /users/{id}", getUser) // POST /users/42 gets a 405 automatically
+handler := logging(mux)                    // middleware is just func(http.Handler) http.Handler
+http.ListenAndServe(":8080", handler)
+
+func getUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// ...
 }
 ```
 
-Criterio para copiar en vez de depender:
+A thin router such as `chi` is still a reasonable choice when you need what ServeMux
+lacks — route groups with their own middleware stacks, sub-router mounting — because it
+keeps handlers as plain `http.Handler`s. Reach for it when that need is real, not by
+default.
 
-- El código es **pequeño y estable** (algoritmo cerrado, no un dominio que evoluciona).
-- Puedes **testearlo tú** por completo — al copiar, copias también el test.
-- La dep aportaría **más transitivas que líneas** te ahorra.
-- **No** es crypto, no es un parser de un estándar, no es correctness-critical de un dominio que no dominas (ver abajo).
-
-Atribuye la fuente y su licencia en un comentario. Copiar no es plagiar; ocultar el origen sí.
-
----
-
-## Evitar frameworks: library, not framework
-
-Go prefiere librerías pequeñas y componibles sobre frameworks que **toman el control del flujo** (inversión de control, magia por reflection, un runtime que te llama a ti). Una librería la llamas tú; un framework te llama a él y dicta tu arquitectura.
-
-```go
-// GOOD: net/http (stdlib) + un router pequeño y explícito (chi). Tú controlas el flujo.
-r := chi.NewRouter()
-r.Use(middleware.Logger)                 // middleware es solo func(http.Handler) http.Handler
-r.Get("/users/{id}", getUser)            // el handler es un http.HandlerFunc normal
-http.ListenAndServe(":8080", r)          // el server sigue siendo el de la stdlib
-```
-
-Contraste con el mundo de ORM y mega-frameworks:
-
-| Necesidad | GOOD (library) | BAD (framework) |
+| Need | GOOD (library) | BAD (framework) |
 |---|---|---|
-| Routing HTTP | `net/http` + `chi` (router fino, `http.Handler` estándar) | Mega-framework que envuelve request/response en tipos propios |
-| Acceso a datos | `database/sql` / `pgx` + `sqlc` (SQL real, código generado) | ORM pesado con reflection en runtime y queries opacas |
-| Config | `flag` / `env` + structs explícitas | Framework de config con lifecycle y DI container |
+| HTTP routing | `net/http` ServeMux; a thin router only for groups/mounting | A mega-framework that wraps request/response in its own types |
+| Data access | `database/sql` / `pgx` + `sqlc` (real SQL, generated code) | A heavy ORM with runtime reflection and opaque queries |
+| Configuration | `flag` / environment + explicit structs | A config framework with its own lifecycle and DI container |
 
-El ORM cobra su factura en runtime: reflection en cada query, N+1 invisibles, y SQL que no ves hasta que el `EXPLAIN` te sorprende en producción. `sqlc` mueve todo eso a compile-time — escribes SQL, obtienes Go type-safe, cero reflection. El router fino deja tus handlers como `http.HandlerFunc` puros, testeables con `httptest` sin arrancar nada.
+An ORM bills you at runtime: reflection on every query, invisible N+1s, and SQL you only
+see when `EXPLAIN` surprises you in production. `sqlc` moves all of that to build time —
+you write SQL and get type-safe Go with no reflection. Handlers that stay plain
+`http.HandlerFunc`s are testable with `httptest` without starting anything.
 
 ---
 
-## Cuándo SÍ tomar la dep
+## When to Take the Dependency
 
-Copiar y evitar frameworks no es dogma anti-dependencias. Hay categorías donde tomar la dep es la decisión de ingeniería correcta:
+Copying and avoiding frameworks is not an anti-dependency dogma. In these categories the
+dependency is the right engineering call:
 
-- **Drivers de base de datos** — `pgx` habla el wire protocol de Postgres. No lo reimplementas.
-- **Primitivas de crypto que no debes escribir tú** — argon2, bcrypt, JWT firmado, X.509. Un bug tuyo aquí es un CVE. Usa `golang.org/x/crypto` o libs auditadas.
-- **Parsers de estándares complejos** — `protobuf`, `yaml`, `toml`. Reimplementar el estándar es reintroducir sus edge cases.
-- **Utilidades correct-by-design del sub-repo oficial** — `golang.org/x/*` lo mantiene el equipo de Go con el mismo rigor que la stdlib, solo fuera del compatibility promise estricto: `x/sync/errgroup`, `x/time/rate` (token bucket), `x/sync/singleflight` (colapsa llamadas duplicadas concurrentes).
+- **Database drivers** — `pgx` speaks the Postgres wire protocol. You do not rewrite it.
+- **Crypto you must not write yourself** — argon2, bcrypt, signed JWTs, X.509. A bug of
+  yours here is a CVE. Use `golang.org/x/crypto` or audited libraries.
+- **Parsers for complex standards** — protobuf, YAML, TOML. Reimplementing the standard
+  reintroduces its edge cases.
+- **The official sub-repositories** — `golang.org/x/*` is maintained by the Go team with
+  stdlib-level rigor, just outside the strict compatibility promise:
+  `x/sync/errgroup`, `x/sync/singleflight`, `x/time/rate`.
 
 ```go
 import (
-	"golang.org/x/sync/errgroup"      // goroutines con propagación de error + cancelación
-	"golang.org/x/sync/singleflight" // dedup de llamadas concurrentes idénticas
-	"golang.org/x/time/rate"         // rate limiting con token bucket
+	"golang.org/x/sync/errgroup"     // goroutines with error propagation + cancellation
+	"golang.org/x/sync/singleflight" // collapse identical concurrent calls
+	"golang.org/x/time/rate"         // token-bucket rate limiting
 )
 ```
 
-### Deps "bendecidas" que esta skill ya usa
+### Pre-approved dependencies used in this skill
 
-Aprobadas: probadas, mantenidas, con grafo transitivo controlado. Añádelas sin ceremonia.
+Proven, maintained, with a controlled transitive graph. Add them without ceremony.
 
-| Módulo | Rol | Por qué se bendice |
+| Module | Role | Why it is approved |
 |---|---|---|
-| `github.com/jackc/pgx/v5` | Driver Postgres de producción | Pool nativo, Copy protocol, tipos nativos |
-| `sqlc` (herramienta) | SQL → Go type-safe | Genera en compile-time; cero reflection en runtime |
-| `golang.org/x/sync/errgroup` | Goroutines con error + context | Sub-repo oficial; correct-by-design |
-| `github.com/golang-migrate/migrate/v4` | Migrations versionadas | Estándar de facto; embebible con `go:embed` |
-| `github.com/testcontainers/testcontainers-go` | Postgres real en tests de integración | Fidelidad total vs. mock; ver `references/testing-advanced.md` |
-| `go.uber.org/goleak` | Detección de goroutine leaks en tests | Un assert en teardown atrapa toda una clase de bugs |
+| `github.com/jackc/pgx/v5` | Production Postgres driver | Native pool, COPY protocol, native types |
+| `sqlc` (tool) | SQL → type-safe Go | Generates at build time; no runtime reflection |
+| `golang.org/x/sync/errgroup` | Goroutines with errors + context | Official sub-repository |
+| `github.com/golang-migrate/migrate/v4` | Versioned migrations | De facto standard; embeddable with `go:embed` |
+| `github.com/testcontainers/testcontainers-go` | Real Postgres in integration tests | Full fidelity vs. a fake; see `references/testing-advanced.md` |
+| `go.uber.org/goleak` | Goroutine leak detection in tests | One assertion in teardown catches a whole class of bugs |
 
 ---
 
-## Higiene de módulos
+## Module Hygiene
 
-### go.sum es el lockfile de integridad
+### go.sum is the integrity lockfile
 
-`go.mod` declara qué versiones; `go.sum` fija el **hash criptográfico** de cada módulo y de cada `go.mod` transitivo. Si el contenido descargado no coincide con el hash registrado, el build **falla** — así detectas un módulo alterado en tránsito o en un proxy comprometido. `go.sum` **siempre** se commitea.
+`go.mod` declares which versions; `go.sum` pins the **cryptographic hash** of every module
+and every transitive `go.mod`. If downloaded content does not match the recorded hash, the
+build fails — that is how you catch a module altered in transit or on a compromised
+proxy. Commit `go.sum`.
 
 ```bash
-go mod verify   # ¿la caché coincide con go.sum? -> "all modules verified"
-go mod tidy     # única forma correcta de editar require/go.sum: nunca a mano
+go mod verify   # does the cache match go.sum? -> "all modules verified"
+go mod tidy     # the way to edit require/go.sum; do not hand-edit them
 ```
 
-### go.mod anotado
+### Annotated go.mod
 
 ```go.mod
-module github.com/acme/billing
+module example.com/billing
 
-go 1.26                      // versión mínima del lenguaje que el código exige
-toolchain go1.26.0           // toolchain con la que buildear (go la descarga si falta)
+go 1.26                // minimum language version the code requires
+toolchain go1.26.0     // preferred toolchain; the go command downloads it if missing
+
+tool (
+	github.com/sqlc-dev/sqlc/cmd/sqlc
+	golang.org/x/tools/cmd/stringer
+)
 
 require (
-	github.com/jackc/pgx/v5 v5.7.6          // versión exacta, fijada por MVS
+	github.com/jackc/pgx/v5 v5.7.6   // exact version, chosen by MVS
 	golang.org/x/sync v0.22.0
 )
 
 require (
-	github.com/jackc/puddle/v2 v2.2.2 // indirect  ← transitiva, no la importas tú directamente
+	github.com/jackc/puddle/v2 v2.2.2 // indirect ← transitive; you do not import it directly
 )
 ```
 
-`// indirect` marca una transitiva que no aparece en tus `import`. `go mod tidy` mantiene esta sección; no la edites a mano.
+Versions above are illustrative. `// indirect` marks a module that none of your own
+packages import; `go mod tidy` maintains it, so do not edit it by hand.
 
-### Vendoring — cuándo sí
+### Developer tools: the `tool` directive
 
-`go mod vendor` copia el grafo entero a `./vendor/`. Úsalo cuando el build debe ser **hermético** — CI sin acceso a red, auditorías que exigen el árbol de deps commiteado, o para no depender de la disponibilidad de un proxy. Coste: un `vendor/` grande en el repo y `go mod vendor` tras cada cambio de deps.
-
-```bash
-go mod vendor            # materializa deps en ./vendor
-go build -mod=vendor ./... # construye solo desde vendor, ignora la caché y la red
-```
-
-### Fijar y renovar con cuidado
+Since Go 1.24, code generators and linters are tracked in `go.mod` with the `tool`
+directive, replacing the old `tools.go` file with blank imports. Their versions are pinned
+by the same `require` / `go.sum` machinery as everything else, so every developer and CI
+run the same binary.
 
 ```bash
-go get github.com/jackc/pgx/v5@v5.7.6   # fija una versión exacta (reproducibilidad)
-go list -m -u all                       # audita qué upgrades hay disponibles
-go get -u ./...                          # sube minors/patches — SIEMPRE seguido de:
-go test -race ./... && govulncheck ./... # nada se mergea sin pasar esto
+go get -tool golang.org/x/tools/cmd/stringer     # adds a tool line + its requirements
+go get -tool github.com/sqlc-dev/sqlc/cmd/sqlc
+go tool stringer -type=State                     # runs the pinned version
+go tool sqlc generate
 ```
 
-Renovar es una acción deliberada con tests detrás, no un `-u` a ciegas antes de un release.
+In source, `//go:generate go tool stringer -type=State` uses the pinned version instead of
+whatever happens to be on `PATH`. Remove a tool with `go get -tool <pkg>@none`.
 
-### GOPROXY / GOSUMDB en una línea
+### Vendoring — when it pays off
 
-`GOPROXY` (default `https://proxy.golang.org,direct`) sirve los módulos; `GOSUMDB` (default `sum.golang.org`) es el checksum database global que verifica que nadie reescribió una versión ya publicada — juntos dan descargas cacheadas y a prueba de manipulación.
+`go mod vendor` copies the whole graph into `./vendor/`. Use it when the build must be
+**hermetic**: CI without network access, audits that require the dependency tree in the
+repository, or independence from proxy availability. The cost is a large `vendor/` in the
+repo and re-running `go mod vendor` after every dependency change.
+
+```bash
+go mod vendor                # materialize dependencies in ./vendor
+go build -mod=vendor ./...   # build only from vendor, ignoring the cache and the network
+```
+
+### Pin and upgrade deliberately
+
+```bash
+go get github.com/jackc/pgx/v5@v5.7.6   # pin an exact version
+go list -m -u all                       # see which upgrades exist
+go get -u ./...                         # minor/patch upgrades, always followed by:
+go test -race ./... && govulncheck ./... # nothing merges without this passing
+```
+
+Upgrading is a deliberate change with tests behind it, not a blind `-u` before a release.
+
+### GOPROXY / GOSUMDB in one line
+
+`GOPROXY` (default `https://proxy.golang.org,direct`) serves modules; `GOSUMDB` (default
+`sum.golang.org`) is the global checksum database that proves no one rewrote an already
+published version — together they give cached, tamper-evident downloads.
 
 ---
 
 ## Checklist
 
-- [ ] ¿La stdlib o `golang.org/x/...` ya lo resuelve antes de `go get`?
-- [ ] Antes de añadir una dep: transitivas contadas (`go mod graph`), maintainer vivo, bus factor > 1, licencia compatible, API estable v1+
-- [ ] `go mod tidy` corrido; `go.mod` y `go.sum` commiteados y sincronizados
-- [ ] CI corre con `GOFLAGS=-mod=readonly` (el build falla si go.mod está sucio)
-- [ ] `govulncheck ./...` en el pipeline; falla el build ante vulnerabilidad alcanzable
-- [ ] 30 líneas copiadas y testeadas preferidas sobre una dep con 40 transitivas
-- [ ] Libraries componibles, no frameworks: `net/http`+router fino, `sqlc` sobre ORM
-- [ ] Deps solo en categorías justificadas: drivers, crypto, parsers de estándares, sub-repo `x/*`
-- [ ] Upgrades deliberados: `go get -u` seguido de `go test -race` + `govulncheck`, nunca a ciegas
-- [ ] `go.sum` versionado; `go mod vendor` solo si el build debe ser hermético
+- [ ] The stdlib or `golang.org/x/...` was checked before `go get` (`slices`, `maps`, ServeMux patterns, `slog`)
+- [ ] Before adding a dep: transitive count (`go mod graph`), active maintainer, bus factor > 1, compatible license, stable v1+ API
+- [ ] `go mod tidy` run; `go.mod` and `go.sum` committed and in sync
+- [ ] CI builds with `GOFLAGS=-mod=readonly`
+- [ ] `govulncheck ./...` in the pipeline, failing on a reachable vulnerability
+- [ ] A few copied and tested lines preferred over a dep with dozens of transitive modules
+- [ ] Composable libraries, not frameworks: `net/http` ServeMux, `sqlc` over an ORM
+- [ ] Dependencies only in justified categories: drivers, crypto, standard parsers, `x/*`
+- [ ] Code generators and linters pinned with the `tool` directive and run via `go tool`
+- [ ] Upgrades are deliberate: `go get -u` followed by `go test -race` and `govulncheck`
+- [ ] `go.sum` committed; `go mod vendor` only when the build must be hermetic

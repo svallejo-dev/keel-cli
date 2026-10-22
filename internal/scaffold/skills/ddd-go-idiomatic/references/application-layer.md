@@ -1,134 +1,139 @@
-# Application Layer — orquestación en DDD idiomático
+# Application Layer — Use Cases, Ports and Files
 
-La capa de aplicación es la costura entre el mundo de afuera (HTTP, colas, cron) y el dominio puro. No contiene reglas de negocio: las **orquesta**. Aquí viven los casos de uso, las interfaces de repository que necesitan, y la traducción entre formatos externos y tipos de dominio.
+## Contents
 
-> **Regla #0 — go-idiomatic gana.** Ante un conflicto entre un patrón DDD y el Go idiomático, gana Go. Nada de Java-ismos: sin capa `mapper/`, sin una interfaz por cada struct, sin `AbstractServiceFactory`. Un caso de uso es un tipo concreto en su propio archivo; un DTO es un struct; una interfaz se define donde se consume. Si un patrón "canónico" de DDD te empuja a escribir Go que un senior rechazaría en review, el patrón está mal traducido.
+1. Business vs application, and the import purity test
+2. One use case = one type + one file (shape, verb forms, forbidden names, port placement)
+3. The repository interface is consumer-defined; infrastructure translates driver errors
+4. DTOs without ceremony
+5. Domain errors → HTTP status at the edge; transport layout
+6. The full flow and who knows whom
 
-Este archivo no redefine los building blocks tácticos: `Email` es un value object (ver [value-objects.md](value-objects.md)), `User` es una entity (ver [entities.md](entities.md)), y una raíz transaccional es un aggregate (ver [aggregates.md](aggregates.md)). Aquí se muestra cómo la aplicación los **usa**. Los ejemplos viven en el contexto `identity`: dominio y casos de uso comparten paquete, la infra (`pgstore`) y el transporte (`identityhttp`) son sub-paquetes.
+The application layer is the seam between the outside world (HTTP, queues, cron) and the
+pure domain. It holds no business rules; it **orchestrates** them. Use cases live here, with
+the ports they need and the translation between external formats and domain types.
 
----
+A use case is a concrete type in its own file; a DTO is a struct; an interface is declared
+where it is consumed. No `mapper/` layer, no interface per struct, no
+`AbstractServiceFactory`. If a "canonical" DDD pattern pushes you towards Go a reviewer
+would reject, the pattern was translated badly and the Go idiom wins.
 
-## 1. Negocio vs Aplicación: qué es puro y qué orquesta
+Examples use the `identity` context: domain and use cases share the package; infrastructure
+(`pgstore`, `memstore`) and transport (`identityhttp`) are subpackages. The complete,
+compiled version is [worked-example.md](worked-example.md).
 
-La lógica de **negocio** (entities + value objects) es pura: valida invariantes, calcula, decide. No sabe de `context.Context`, de SQL ni de HTTP. La lógica de **aplicación** orquesta: recibe input externo, construye tipos de dominio, consulta repositories, coordina un aggregate y devuelve output.
+## 1. Business vs application
 
-| Rol | Dónde vive | Responsabilidad | Prohibido importar |
+**Business** logic (entities + value objects) is pure: it validates invariants, computes,
+decides. It knows nothing about SQL or HTTP. **Application** logic orchestrates: it takes
+external input, builds domain types, calls ports, coordinates one aggregate and returns
+output.
+
+| Role | Where | Responsibility | Must not import |
 |---|---|---|---|
-| Dominio | `identity/user.go`, `email.go`… | invariantes, cálculo, VOs/entities | `database/sql`, `net/http`, drivers |
-| Caso de uso | `identity/register_user.go`… | orquestar dominio + puertos | `net/http`, drivers concretos |
-| Infra / transporte | `identity/pgstore`, `identity/identityhttp` | implementar puertos, traducir | — |
+| Domain | `identity/user.go`, `email.go`... | invariants, computation | `database/sql`, `net/http`, drivers |
+| Use case | `identity/register_user.go`... | orchestrate domain + ports | `net/http`, concrete drivers |
+| Infra / transport | `identity/pgstore`, `identity/identityhttp` | implement ports, translate | — |
 
-Dominio y casos de uso comparten paquete: la separación es **por archivo**, no por carpeta `domain/` + `app/` (ver [bounded-contexts.md](bounded-contexts.md)).
+Domain and use cases share a package: the split is **by file**, not by `domain/` + `app/`
+folders (see [bounded-contexts.md](bounded-contexts.md)).
 
-### El test de pureza es una verificación de arquitectura real
+### The import purity test is a real architecture check
 
-El `import` del paquete del contexto **no** debe contener `database/sql`, `net/http` ni libs externas de infra. Si aparecen, la infraestructura se filtró hacia el núcleo. Esto no es una guía de estilo: es un check ejecutable que puedes poner en CI.
+The context package must not import `database/sql`, `net/http` or infrastructure libraries.
+It is an executable check you can put in CI:
 
 ```bash
-go list -deps ./internal/identity | grep -E 'database/sql|net/http|jackc|redis' \
-  && echo "FUGA: infraestructura en el dominio" && exit 1 || echo "dominio puro"
+go list -deps ./internal/identity | grep -E '^(database/sql|net/http)$|jackc|redis' \
+  && { echo "infrastructure leaked into the domain"; exit 1; } || echo "domain is pure"
 ```
 
-`go list -deps` expande el cierre transitivo, así que también atrapa fugas indirectas (un VO que importa un helper que importa `pgx`). Fíjate en que se lista el paquete del contexto, no `./internal/identity/...`: los sub-paquetes de infra sí importan drivers, y está bien.
+`go list -deps` expands the transitive closure, so it also catches indirect leaks (a VO that
+imports a helper that imports `pgx`). List the context package itself, not
+`./internal/identity/...`: the infrastructure subpackages are supposed to import drivers.
 
----
+## 2. One use case = one type + one file
 
-## 2. Un caso de uso = un tipo + un archivo
+A use case is **a concrete type named after the action**, in a file with the same name in
+snake_case. It is not one more method on a `Service` that groups the whole context, nor a
+`UseCase → AbstractUseCase → Command` tree.
 
-En Go un caso de uso es **un tipo concreto con el nombre de la acción**, en un archivo con ese mismo nombre: `RegisterUser` en `register_user.go`, `Login` en `login.go`, `SearchUsers` en `search_users.go`. No es un método más de un `Service` que agrupa todo el contexto, ni un árbol `UseCase → AbstractUseCase → Command`.
+Why: a file name should say what the file does. `service.go` says nothing, and a `Service`
+with `LogIn()` and `SignUp()` mixes two intents, two dependency sets and two reasons to change
+in one place. With one type per use case:
 
-La razón es semántica: el nombre de un archivo debe decir qué hace. `service.go` no dice nada, y un `Service` con `Login()` y `Signup()` mezcla dos intenciones, dos sets de dependencias y dos razones para cambiar en el mismo lugar. Con un tipo por caso de uso:
+- The package listing is the index of what the context can do; `ls internal/identity` answers "which use cases exist?".
+- Each use case declares **only** the dependencies it uses, so its tests build only those.
+- Adding a use case adds a file; it never edits someone else's.
 
-- El árbol del paquete es el índice de lo que el contexto sabe hacer.
-- Cada caso de uso declara **solo** las dependencias que usa.
-- Añadir un caso de uso es añadir un archivo; nunca editar uno ajeno.
+### Canonical shape
+
+| Piece | Shape |
+|---|---|
+| File | `<action>.go` in snake_case: `register_user.go` |
+| Type | `type RegisterUser struct{ ...dependencies }` |
+| Constructor | `func NewRegisterUser(deps...) *RegisterUser` |
+| Method | exactly one exported: `Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error)` |
+| DTOs | `RegisterUserInput` / `RegisterUserOutput`, in the same file; input is a struct even for a single ID |
+| Narrow ports | declared in the same file when only this use case uses them (`IDGenerator`) |
+
+Verb forms follow the action as people say it: `sign_up.go` → `SignUp`, `log_in.go` →
+`LogIn`, `change_email.go` → `ChangeEmail`, `search_users.go` → `SearchUsers`. One file never
+holds two use cases, however short.
 
 ```go
-// internal/identity/register_user.go
-package identity
-
-type RegisterUserInput struct {
-	Email string
-}
-
-type RegisterUserOutput struct {
-	ID    string
-	Email string
-}
-
-// RegisterUser da de alta un usuario con un email que nadie más use.
+// RegisterUser signs up a user whose email nobody else owns.
 type RegisterUser struct {
 	users UserRepository
 	ids   IDGenerator
+	now   func() time.Time
 }
 
-func NewRegisterUser(users UserRepository, ids IDGenerator) *RegisterUser {
-	return &RegisterUser{users: users, ids: ids}
-}
+// NewRegisterUser takes the clock as a dependency so tests can freeze time; nil means time.Now.
+func NewRegisterUser(users UserRepository, ids IDGenerator, now func() time.Time) *RegisterUser
 
-func (uc *RegisterUser) Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error) {
-	email, err := NewEmail(in.Email)
-	if err != nil {
-		return RegisterUserOutput{}, err
-	}
-
-	exists, err := uc.users.ExistsByEmail(ctx, email)
-	if err != nil {
-		return RegisterUserOutput{}, fmt.Errorf("register user: check email: %w", err)
-	}
-	if exists {
-		return RegisterUserOutput{}, ErrEmailTaken
-	}
-
-	u := NewUser(uc.ids.NewUserID(), email)
-	if err := uc.users.Save(ctx, u); err != nil {
-		return RegisterUserOutput{}, fmt.Errorf("register user: save: %w", err)
-	}
-	return RegisterUserOutput{ID: string(u.ID()), Email: u.Email().String()}, nil
-}
+// Execute fails with ErrInvalidEmail, ErrInvalidName or ErrEmailTaken when the input is rejected.
+func (uc *RegisterUser) Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error)
 ```
 
-La forma canónica es siempre la misma:
+`Execute` is the **integration** column: parse VOs (`NewEmail`, `NewName`) → ask the port
+(`ExistsByEmail`) → build the entity (`NewUser(id, email, name, uc.now())`) → `Save` → map to
+`RegisterUserOutput`. The full file is in [worked-example.md](worked-example.md) §4. The use
+case **knows** the repository; the domain does not. Invariants are built by the domain; the
+use case invokes them and decides the flow.
 
-| Pieza | Forma |
-|---|---|
-| Archivo | `<accion>.go` en snake_case: `register_user.go` |
-| Tipo | `type RegisterUser struct{ ...dependencias }` |
-| Constructor | `func NewRegisterUser(deps...) *RegisterUser` |
-| Método | un único exportado: `Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error)` |
-| DTO | `RegisterUserInput` / `RegisterUserOutput`, en el mismo archivo |
+### Forbidden names inside a context
 
-El caso de uso **conoce** el repository; el dominio **no**. La construcción de invariantes (`NewEmail`) vive en el dominio; el caso de uso solo la invoca y decide el flujo.
-
-Nombres prohibidos dentro de un contexto, porque no dicen qué hace el archivo o porque agrupan varias acciones:
-
-| Prohibido | Por qué | En su lugar |
+| Forbidden | Why | Instead |
 |---|---|---|
-| `service.go`, `services.go` + `type Service` | cajón de casos de uso | `register_user.go` + `type RegisterUser` |
-| `usecase.go`, `usecases.go`, `use_cases.go` + `type UseCase` | nombra la capa, no la acción | un archivo por caso de uso |
-| `application.go`, `app.go` | nombra la capa | el nombre de la acción |
-| `manager.go` + `type Manager` | "gestiona" no es una intención | el nombre de la acción |
-| `helpers.go`, `utils.go`, `common.go` | cajón sin concepto | el concepto que contiene |
-| `handler.go`/`handlers.go` con varios endpoints | mezcla casos de uso en el transporte | un archivo por endpoint + `routes.go` |
+| `service.go`, `services.go` + `type Service` | a drawer of use cases | `register_user.go` + `type RegisterUser` |
+| `usecase.go`, `usecases.go`, `use_cases.go` + `type UseCase` | names the layer, not the action | one file per use case |
+| `application.go`, `app.go` | names the layer | the action's name |
+| `manager.go` + `type Manager` | "manages" is not an intent | the action's name |
+| `helpers.go`, `utils.go`, `common.go` | a drawer without a concept | the concept it belongs to |
+| `handler.go`/`handlers.go` with several endpoints | mixes use cases in the transport | one file per endpoint + `routes.go` |
 
-Lo que esta forma **no** es: CQRS ceremonial. No hay `RegisterUserCommand` + `RegisterUserHandler` + bus + interfaz `UseCase[I, O]` genérica. Un caso de uso es un struct concreto con un método; el wiring lo construye y el transporte lo llama directamente.
+Allowed because they name something concrete: concepts (`user.go`, `email.go`), `errors.go`
+(the context's sentinels), shared ports (`user_repository.go`), `routes.go`. Outside the
+contexts, a composition root such as `internal/handlers/handlers.go` or `cmd/<app>/main.go` is
+fine: its single intent is wiring.
 
----
+What this shape is **not**: ceremonial CQRS. No `RegisterUserCommand` + `RegisterUserHandler`
++ bus + generic `UseCase[I, O]`. A use case is a concrete struct with one method; wiring builds
+it and the transport calls it directly.
 
-## 3. La interfaz de repository es consumer-defined
+## 3. The repository interface is consumer-defined
 
-**La interfaz de repository se define en quien la usa (el caso de uso), no en quien la implementa (infra).** Esto es exactamente el "accept interfaces, return structs" de Go y, a la vez, la inversión de dependencias de Clean Architecture: son la misma idea. El contexto declara qué necesita; `pgstore` lo cumple.
+**The interface is defined by whoever uses it (the use cases), not by whoever implements it
+(infrastructure).** That is Go's "accept interfaces, return structs" and Clean
+Architecture's dependency inversion at once. Where to declare it depends on how many use
+cases consume it:
 
-Dónde se declara depende de cuántos casos de uso la consumen:
-
-- **Solo uno** → en el archivo de ese caso de uso, con el método justo que necesita. `IDGenerator` vive en `register_user.go`.
-- **Varios** → en su propio archivo, con el nombre del puerto: `user_repository.go` → `type UserRepository interface`.
+- **One** → in that use case's file, with exactly the methods it needs (`IDGenerator` in `register_user.go`).
+- **Several** → in its own file named after the port: `user_repository.go` → `type UserRepository interface`.
 
 ```go
-// internal/identity/user_repository.go
-package identity
-
-// UserRepository lo comparten RegisterUser y ChangeEmail.
+// UserRepository is shared by RegisterUser and ChangeEmail; Save reports ErrEmailTaken like a unique index.
 type UserRepository interface {
 	FindByID(ctx context.Context, id UserID) (*User, error)
 	ExistsByEmail(ctx context.Context, email Email) (bool, error)
@@ -136,201 +141,206 @@ type UserRepository interface {
 }
 ```
 
-La interfaz es **estrecha**: solo los métodos que sus consumidores usan. No un `Repository` gigante con veinte métodos que ninguna implementación necesita entera. Si un caso de uso solo lee, puede declarar su propia interfaz de un método en su archivo aunque exista `UserRepository`.
+Keep it **narrow**: only the methods its consumers call. A use case that only reads may
+declare its own one-method interface in its file even though `UserRepository` exists.
 
-### La implementación traduce errores de driver en la frontera
+### Infrastructure translates driver errors at the border
 
-La impl de Postgres vive en un sub-paquete (`pgstore`) y **nunca deja salir un `*pgconn.PgError`**. En la frontera traduce el error del driver a un error de dominio: un `23505` (unique violation) se convierte en `identity.ErrEmailTaken`; un `pgx.ErrNoRows` se convierte en `identity.ErrUserNotFound`.
+The Postgres implementation lives in a subpackage and **never lets a `*pgconn.PgError` or
+`pgx.ErrNoRows` escape**: `23505` (unique violation) becomes `identity.ErrEmailTaken`, no rows
+becomes `identity.ErrUserNotFound`. Rows are rebuilt through the domain constructors, so a
+corrupt row is caught on load.
+
+**internal/identity/pgstore/pgstore.go**
 
 ```go
-// internal/identity/pgstore/pgstore.go
-var _ identity.UserRepository = (*Store)(nil)
+// Package pgstore implements the identity ports on PostgreSQL.
+package pgstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"example.com/shop/internal/identity"
+)
 
 const uniqueViolation = "23505"
 
+// Store is safe for concurrent use; the pool handles connections.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// New wraps an existing pool; main owns its lifecycle.
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+var _ identity.UserRepository = (*Store)(nil)
+
+// Save upserts u and maps the unique index on email to identity.ErrEmailTaken.
 func (s *Store) Save(ctx context.Context, u *identity.User) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO users (id, email) VALUES ($1, $2)`,
-		u.ID(), u.Email().String())
-
+		`INSERT INTO users (id, email, name, created_at) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name`,
+		u.ID(), u.Email().String(), u.Name().String(), u.CreatedAt())
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
 		return identity.ErrEmailTaken
 	}
 	if err != nil {
-		return fmt.Errorf("pgstore: save user: %w", err)
+		return fmt.Errorf("pgstore: save user %s: %w", u.ID(), err)
 	}
 	return nil
 }
 
+// FindByID returns identity.ErrUserNotFound when no row matches.
 func (s *Store) FindByID(ctx context.Context, id identity.UserID) (*identity.User, error) {
-	var raw string
-	err := s.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, id).Scan(&raw)
+	var rawEmail, rawName string
+	var createdAt time.Time
+	err := s.pool.QueryRow(ctx, `SELECT email, name, created_at FROM users WHERE id = $1`, id).
+		Scan(&rawEmail, &rawName, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, identity.ErrUserNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: find user %s: %w", id, err)
 	}
-	email, err := identity.NewEmail(raw)
+	email, err := identity.NewEmail(rawEmail)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: corrupt email for user %s: %w", id, err)
 	}
-	return identity.NewUser(id, email), nil
+	name, err := identity.NewName(rawName)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: corrupt name for user %s: %w", id, err)
+	}
+	return identity.NewUser(id, email, name, createdAt)
+}
+
+// ExistsByEmail is a cheap pre-check; Save still enforces uniqueness.
+func (s *Store) ExistsByEmail(ctx context.Context, email identity.Email) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE email = $1)`, email.String()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("pgstore: check email: %w", err)
+	}
+	return exists, nil
 }
 ```
 
-```go
-// BAD: el error del driver se escapa; el caso de uso queda acoplado a pgconn.
-func (s *Store) Save(ctx context.Context, u *identity.User) error {
-	_, err := s.pool.Exec(ctx, `INSERT ...`, u.ID(), u.Email().String())
-	return err
-}
+Returning the raw driver error instead (`return err` from `Exec`) would force every use case
+to import `pgconn` to recognise a duplicate: the driver would leak through the port.
 
-// GOOD: la frontera traduce; el caso de uso solo ve vocabulario de dominio.
-if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
-	return identity.ErrEmailTaken
-}
-```
+`var _ identity.UserRepository = (*Store)(nil)` makes the compiler check the direction:
+`pgstore` depends on `identity`, never the reverse. There is no `IUserRepository` duplicated
+next to the implementation; that is interface-per-class (see [antipatterns.md](antipatterns.md) §2).
 
-El compilador verifica la dirección con `var _ identity.UserRepository = (*Store)(nil)`: `pgstore` depende de `identity`, nunca al revés. No hay una interfaz `IUserRepository` duplicada junto a la impl: eso es interfaz-por-clase, un Java-ismo (ver [antipatterns.md](antipatterns.md)).
+## 4. DTOs without ceremony
 
----
+The `XInput`/`XOutput` structs **are** the DTOs. They live in the use case's file, not in a
+`dto/` or `mapper/` package, and carry the use case's name as a prefix because they share
+the package with the others (`RegisterUserInput`, `ChangeEmailInput`). They hold
+transport-friendly primitives, so transports never depend on value objects.
 
-## 4. La columna de transformación: DTO sin ceremonia
-
-Los structs `XInput`/`XOutput` del caso de uso **son** los DTO. Se definen en el mismo archivo que el caso de uso, no en un paquete `dto/` ni `mapper/`. Llevan el nombre del caso de uso como prefijo porque comparten paquete con los demás: `RegisterUserInput`, `ChangeEmailInput`.
-
-La traducción `HTTP request → Input` y `Output → HTTP response` es una función **delgada** en el endpoint. Sin auto-mappers (reflection + una dependencia + errores en runtime), sin una capa `mapper/` que solo copia campos.
+Translating `HTTP request → Input` and `Output → HTTP response` is a **thin** function in
+the endpoint. No reflection-based auto-mappers (a dependency plus runtime errors the
+compiler cannot see), no `mapper/` layer that only copies fields.
 
 ```go
-// BAD: capa mapper + auto-mapper. Ceremonia, reflection, y un panic esperando.
+// BAD: mapper layer + reflection; a renamed field breaks at runtime.
 out := mapper.Map[RegisterUserOutput](entity)
 
-// GOOD: copia explícita de dos campos. Legible, sin dependencias, sin reflection.
+// GOOD: two explicit fields, checked by the compiler.
 resp := registerUserResponse{ID: out.ID, Email: out.Email}
 ```
 
-Si el mapeo es trivial (copiar campos), escríbelo a mano. Si es no-trivial (aplanar un aggregate, formatear fechas), sigue siendo una función normal con un nombre — no un framework. Reservar `mapper/` para "por si crece" es diseño especulativo.
+If the mapping is non-trivial (flattening an aggregate, formatting dates), it is still an
+ordinary named function, not a framework. A `mapper/` "in case it grows" is speculative design.
 
----
+## 5. Domain errors → HTTP status at the edge
 
-## 5. Errores de dominio → status HTTP en la frontera
+Mapping domain errors to HTTP status happens at the **edge** (the transport), with
+`errors.Is`/`errors.As`. The domain exposes sentinels; the transport maps them. Anything
+unknown becomes 500 **without leaking internal details**.
 
-El mapeo de error de dominio a status HTTP ocurre en la **frontera** (el transporte), con `errors.Is`/`errors.As`. El dominio expone errores centinela (`ErrInvalidEmail`, `ErrUserNotFound`, `ErrEmailTaken`); el transporte los traduce a 400/404/409. Lo desconocido cae a 500 **sin filtrar detalles internos**.
-
-| Error de dominio | Status | Semántica |
+| Domain error | Status | Meaning |
 |---|---|---|
-| `ErrInvalidEmail` | 400 Bad Request | input inválido |
-| `ErrUserNotFound` | 404 Not Found | recurso ausente |
-| `ErrEmailTaken` | 409 Conflict | violación de invariante de unicidad |
-| (cualquier otro) | 500 Internal | fallo no clasificado, mensaje genérico |
+| `ErrInvalidEmail`, `ErrInvalidName` | 400 Bad Request | invalid input |
+| `ErrUserNotFound` | 404 Not Found | missing resource |
+| `ErrEmailTaken` | 409 Conflict | uniqueness invariant violated |
+| anything else | 500 Internal Server Error | generic message; details go to the log |
 
-El transporte sigue la misma regla de nombres que el contexto: un archivo por endpoint con el nombre del caso de uso que expone, un `routes.go` que los monta, y el mapeo de errores en un solo lugar.
+The transport follows the same naming rule as the context: one file per endpoint named after
+the use case it exposes, a `routes.go` that mounts them with `net/http` method patterns
+(Go 1.22+), and the error mapping in one place.
 
 ```
 internal/identity/identityhttp/
-├── routes.go          # Mount(mux, UseCases)
+├── routes.go          # Mount: mux.Handle("POST /users", ...), mux.Handle("PUT /users/{id}/email", ...)
 ├── register_user.go   # POST /users
 ├── change_email.go    # PUT /users/{id}/email
 └── responses.go       # writeJSON + writeError
 ```
 
-```go
-// internal/identity/identityhttp/register_user.go
-func registerUser(uc *identity.RegisterUser) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req registerUserRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "cuerpo inválido", http.StatusBadRequest)
-			return
-		}
-		out, err := uc.Execute(r.Context(), identity.RegisterUserInput{Email: req.Email})
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, registerUserResponse{ID: out.ID, Email: out.Email})
-	}
-}
-```
+The code for each file is in [worked-example.md](worked-example.md) §6. Use `errors.Is` for
+sentinels and `errors.As` when you need data from the error (a `*ValidationError` with the
+failing field). A `default` branch that echoes the internal error text is an information
+leak: return a generic message and log the detail.
 
-```go
-// internal/identity/identityhttp/responses.go
-
-// writeError nunca devuelve el texto de un error desconocido: filtraría SQL, hosts o stack.
-func writeError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, identity.ErrInvalidEmail):
-		http.Error(w, "email inválido", http.StatusBadRequest)
-	case errors.Is(err, identity.ErrUserNotFound):
-		http.Error(w, "usuario no encontrado", http.StatusNotFound)
-	case errors.Is(err, identity.ErrEmailTaken):
-		http.Error(w, "email ya registrado", http.StatusConflict)
-	default:
-		http.Error(w, "error interno", http.StatusInternalServerError)
-	}
-}
-```
-
-Usa `errors.Is` para centinelas y `errors.As` cuando necesitas datos del error (p. ej. un `*ValidationError` con el campo que falló). El `default` que devuelve el mensaje del error interno es una fuga de información: siempre un texto genérico y el detalle al log.
-
----
-
-## 6. El flujo completo y quién conoce a quién
+## 6. The full flow and who knows whom
 
 ```
-   HTTP request
-        │  decode + validación de forma (identityhttp/register_user.go)
-        ▼
-   RegisterUserInput ──────────► RegisterUser.Execute (identity/register_user.go)
-                                    │  orquesta:
-                                    │   1. NewEmail(in.Email)           ← dominio (VO)
-                                    │   2. users.ExistsByEmail(...)     ← UserRepository
-                                    │   3. NewUser(id, email)           ← dominio (entity)
-                                    │   4. users.Save(ctx, u)           ← UserRepository
-                                    ▼
-                                RegisterUserOutput
-        │  Output → response                   │  error → writeError → 4xx/5xx
-        ▼                                       ▼
-   HTTP response
+HTTP request
+   │ decode (identityhttp/register_user.go)
+   ▼
+RegisterUserInput ──► RegisterUser.Execute (identity/register_user.go)
+                        1. NewEmail, NewName            ← domain (VOs)
+                        2. users.ExistsByEmail(...)     ← UserRepository
+                        3. NewUser(id, email, name, now) ← domain (entity)
+                        4. users.Save(ctx, u)           ← UserRepository
+                        ▼
+                     RegisterUserOutput ──► response   (error ──► writeError ──► 4xx/5xx)
 ```
 
-Dirección de dependencias, siempre hacia adentro:
+Dependencies always point inwards:
 
 ```
-cmd/  ──►  identityhttp ──►  identity   (define UserRepository, IDGenerator)
-                                 ▲
-           pgstore ──────────────┘      (implementa UserRepository)
+cmd/ ──► identityhttp ──► identity   (defines UserRepository, IDGenerator)
+                             ▲
+         pgstore ────────────┘       (implements UserRepository)
 ```
 
-- **Casos de uso → dominio**: viven en el mismo paquete; usan VOs/entities y devuelven sus errores.
-- **Infra y transporte → contexto**: `pgstore` implementa sus puertos e `identityhttp` llama a sus casos de uso.
-- **El contexto no conoce a nadie de afuera**: `identity` no importa `pgstore`, `identityhttp` ni `net/http`. Las flechas nunca vuelven; un ciclo lo rechaza el compilador, y eso es una feature.
+- **Use cases → domain**: same package; they use VOs/entities and return their errors.
+- **Infrastructure and transport → context**: `pgstore` implements its ports; `identityhttp` calls its use cases.
+- **The context knows nobody outside**: `identity` imports neither `pgstore`, `identityhttp` nor `net/http`. An import cycle is rejected by the compiler, and that is a feature.
 
-El wiring vive en `cmd/` y es lo único que conoce todos los paquetes a la vez. Construye cada caso de uso por separado:
+Wiring lives in `cmd/` and is the only code that knows every package. It builds each use
+case separately:
 
 ```go
 store := pgstore.New(pool)
 identityhttp.Mount(mux, identityhttp.UseCases{
-	RegisterUser: identity.NewRegisterUser(store, uuidgen.New()),
+	RegisterUser: identity.NewRegisterUser(store, uuidgen.New(), time.Now),
 	ChangeEmail:  identity.NewChangeEmail(store),
 })
 ```
 
-Los bounded contexts (ver [bounded-contexts.md](bounded-contexts.md)) se ensamblan aquí: cada uno expone sus casos de uso, y `cmd/` los cablea sin que se importen entre sí. El ejemplo completo y compilable está en [worked-example.md](worked-example.md).
-
----
+Bounded contexts ([bounded-contexts.md](bounded-contexts.md)) are assembled here too: each
+exposes its use cases and `cmd/` wires them without the contexts importing each other.
 
 ## Checklist
 
-- [ ] El `import` del paquete del contexto no contiene `database/sql`, `net/http` ni drivers — verificado con `go list -deps` en CI.
-- [ ] Cada caso de uso es un tipo propio (`RegisterUser`) en un archivo con su nombre (`register_user.go`), con `NewRegisterUser` y un único método `Execute(ctx, RegisterUserInput) (RegisterUserOutput, error)`.
-- [ ] Ningún archivo contiene dos casos de uso; no hay `service.go`, `usecase.go`, `app.go`, `manager.go` ni tipos `Service`/`UseCase`/`Manager` que agrupen operaciones.
-- [ ] Sin jerarquías Command/Handler/`UseCase[I, O]`: un struct concreto con un método.
-- [ ] Los puertos se declaran en el consumidor: en el archivo del caso de uso si solo él los usa, en `<puerto>.go` si son compartidos. La impl vive en un sub-paquete de infra.
-- [ ] La implementación traduce errores de driver (`pgconn.PgError`, `pgx.ErrNoRows`) a errores de dominio en la frontera; nunca los deja salir.
-- [ ] Los DTO son `XInput`/`XOutput` junto al caso de uso: sin capa `mapper/`, sin auto-mappers por reflection.
-- [ ] El transporte tiene un archivo por endpoint + `routes.go`; el mapeo error → status está centralizado; lo desconocido → 500 con mensaje genérico.
-- [ ] `var _ identity.UserRepository = (*Store)(nil)` verifica en compilación que la infra satisface el puerto.
-- [ ] Las dependencias forman un DAG hacia adentro; el contexto no importa a nadie; el wiring vive solo en `cmd/`.
+- [ ] The context package imports no `database/sql`, `net/http` or drivers, checked with `go list -deps` in CI.
+- [ ] Each use case is its own type (`RegisterUser`) in a file with its name (`register_user.go`), with `NewRegisterUser` and exactly one `Execute(ctx, RegisterUserInput) (RegisterUserOutput, error)`.
+- [ ] Input is always a struct, even for a single ID; DTOs and single-use ports sit in the use case's file.
+- [ ] No file holds two use cases; no `service.go`, `usecase.go`, `app.go`, `manager.go`, and no `Service`/`UseCase`/`Manager` types.
+- [ ] No Command/Handler/`UseCase[I, O]` hierarchies: one concrete struct, one method.
+- [ ] Ports are declared by the consumer: in the use case's file if only it uses them, in `<port>.go` if shared; the implementation lives in an infrastructure subpackage.
+- [ ] Infrastructure translates driver errors (`pgconn.PgError`, `pgx.ErrNoRows`) into domain errors and rebuilds entities through constructors.
+- [ ] Transport: one file per endpoint + `routes.go` with method patterns; one error → status mapping; unknown → 500 with a generic message.
+- [ ] `var _ identity.UserRepository = (*Store)(nil)` checks at compile time that infrastructure satisfies the port.
+- [ ] Dependencies form a DAG pointing inwards; wiring lives only in `cmd/`.

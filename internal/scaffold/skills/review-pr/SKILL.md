@@ -1,127 +1,148 @@
 ---
 name: review-pr
 description: >
-  Fetch a GitHub pull request with the gh CLI, review it against a universal rubric
-  (plus a Go/DDD layer for .go files), and post an actionable, constructive review —
-  fully automatic, but never auto-approving. Use when the user says "review this PR",
-  "revisa este PR", "code review PR", "review pull request", "review PR #123", or
-  "revisión de PR". Triggers on a PR number, URL, or branch handed to you for review.
+  Review a GitHub pull request (number, URL or branch) with a severity rubric plus a
+  Go/DDD layer for .go files, reading the PR's own head rather than the local checkout.
+  Returns the review in the conversation; posts to GitHub only when explicitly asked
+  ("post the review", "publica el review", "comenta en el PR") and never approves.
+  Triggers: "review PR #123", "revisa este PR", "code review this pull request",
+  "revisión de PR". For a bug hunt of local uncommitted changes use /code-review; for a
+  security audit, /security-review.
 ---
 
-# Review PR (flujo GitHub)
+# Review PR
 
-Revisas un pull request de GitHub de punta a punta con `gh`: lo traes, entiendes su
-intención y alcance, lo pasas por una rúbrica universal (y una capa Go/DDD para archivos
-`.go`), produces hallazgos accionables con severidad, y **posteas** el review. Es una skill
-de **acción**: corre `gh` sin pausar. El único freno absoluto es que **nunca auto-aprueba**
-—postea `--comment` o `--request-changes`, jamás `--approve`— y nunca filtra secretos.
+Review a GitHub pull request end to end: understand its intent, run the diff through a
+universal rubric (plus a Go/DDD layer for `.go` files), and hand back findings with
+severity, location, reason and a concrete fix. What sets this apart from a generic bug
+hunt is the rubric, the Go/DDD layer, and the GitHub PR as the unit of review.
 
-## Flujo
+The default output is the review in the conversation. Posting under the user's GitHub
+identity is a separate, explicit step (step 6), because a review comment is public and
+notifies the author.
 
-### 1. Traer el PR y entenderlo
-
-`<n>` puede ser un número, una URL o una rama; sin argumento, `gh` usa el PR de la rama actual.
+## 1. Environment
 
 ```bash
-# Contexto: intención, archivos tocados, tamaño, ramas, autor
-gh pr view <n> --json title,body,files,additions,deletions,headRefName,baseRefName,author
+gh auth status                 # installed and logged in?
+gh api user --jq .login        # the current user, needed in step 6
+```
 
-# El diff completo (léelo entero); en PRs grandes, primero solo los nombres
-gh pr diff <n>
-gh pr diff <n> --name-only
+Without `gh` (Claude Desktop, claude.ai, or not logged in), ask the user to paste the diff
+or the PR description and review what they give you; mention `gh auth login` if they want
+the full flow. For a PR URL, pass `--repo <owner>/<repo>` to every `gh` call; for a bare
+number, `gh` uses the current repo (in a fork it may need `--repo <parent>`).
 
-# Estado de CI/checks
+## 2. Fetch the PR
+
+```bash
+gh pr view <n> --json number,url,title,body,author,isDraft,baseRefName,headRefName,headRefOid,isCrossRepository,additions,deletions,files
+gh pr diff <n>                 # read all of it; for large PRs start with --name-only
 gh pr checks <n>
 ```
 
-Antes de revisar el código, fija tres cosas:
-- **Intención**: qué problema resuelve (título + cuerpo + issue vinculado). Un cambio correcto
-  que no cumple la intención sigue estando mal.
-- **Alcance y blast radius**: qué módulos/consumidores toca; ¿cambia un contrato público?
-- **Tamaño y revisabilidad**: mira `additions`/`deletions` y el nº de archivos. Si el PR es
-  **demasiado grande** para revisarlo bien o **mezcla concerns** (refactor + feature + fix),
-  díselo y **pide un split** — es el feedback de mayor valor y va primero.
-
-### 2. Rúbrica universal
-
-Aplica las dimensiones de `references/review-rubric.md` a todo el diff:
-corrección y edge cases · seguridad (injection, authz, secrets, validación de input) ·
-tests (¿cubren el cambio y sus bordes?) · manejo de errores · compatibilidad de API/contratos
-(breaking changes) · performance y concurrencia (races) · tamaño/revisabilidad (incluye
-archivos nombrados por intención y comentarios mínimos) · docs/migraciones · observabilidad.
-
-### 3. Capa Go/DDD (solo archivos `.go`)
-
-Para el subconjunto `.go` del diff, aplica como estándar `senior-go-idiomatic`,
-`ddd-go-idiomatic` y —si está instalada— `go-design-rules`.
-
-- Si esas skills están disponibles, **invócalas** para mayor profundidad.
-- Si no lo están (p. ej. `go-design-rules` puede no existir aún), usa el **checklist inline
-  autocontenido** de `references/go-review-layer.md`. La capa funciona sin las compañeras.
-- Corre siempre la **detección rápida** de `references/go-review-layer.md`: archivos cajón
-  (`service.go`, `usecase.go`, `manager.go`, `utils.go`…) o dos casos de uso en un archivo =
-  **major**; exceso de comentarios narrativos o banners = **minor**.
-
-### 4. Hallazgos
-
-Cada hallazgo lleva: **SEVERIDAD** (blocker / major / minor / nit), `archivo:línea`,
-**por qué** es un problema, y un **fix concreto** (no "mejóralo": el cambio exacto).
-Ordénalos de más grave a menos. Sé específico, accionable y amable (kind).
-
-### 5. Veredicto
-
-Sintetiza honestamente: `approve` / `comment` / `request-changes`.
-- Hay ≥1 **blocker** o **major** → `request-changes`.
-- Solo minors/nits o dudas → `comment`.
-- Todo correcto → recomiéndalo, pero **la aprobación la da un humano** (paso 6).
-
-### 6. Postear el review
-
-Escribe el resumen (formato en `references/review-rubric.md`) a un archivo y postéalo.
+The local working tree is usually **not** the PR head (another branch, uncommitted edits),
+so never read PR files from it. When the diff is not enough context, read files at the
+PR's head commit:
 
 ```bash
-# Comentario general — NO aprueba
-gh pr review <n> --comment --body-file review.md
-
-# Solicitar cambios cuando hay blocker/major
-gh pr review <n> --request-changes --body-file review.md
+git fetch <remote> "pull/<n>/head"        # updates FETCH_HEAD only; nothing checked out
+git show "<headRefOid>:path/to/file.go"
+# without a local clone:
+gh api "repos/<owner>/<repo>/contents/path/to/file.go?ref=<headRefOid>" -H "Accept: application/vnd.github.raw"
 ```
 
-Comentarios **inline** por archivo/línea (donde aporten más que en el resumen) vía API REST,
-con un payload JSON `{ body, event, comments:[{path,line,side,body}] }`; `{owner}/{repo}` los
-resuelve `gh` desde el repo actual:
+To build or test the PR, use a throwaway worktree instead of `gh pr checkout`, which would
+switch the user's branch:
 
 ```bash
-cat > review.json <<'JSON'
+wt=$(mktemp -d "${TMPDIR:-/tmp}/pr-review.XXXXXX")
+git worktree add --detach "$wt" "<headRefOid>"
+# ... go test ./... inside "$wt" ...
+git worktree remove --force "$wt"
+```
+
+Before judging code, pin down three things:
+
+- **Intent** — what problem it solves (title, body, linked issue). Correct code that misses
+  the intent is still wrong.
+- **Scope** — modules and consumers touched; any public contract change.
+- **Size** — if it is too large to review well or mixes concerns, asking for a split is the
+  most valuable finding and goes first.
+
+## 3. Universal rubric
+
+Apply [references/review-rubric.md](references/review-rubric.md) to the whole diff:
+correctness and edge cases, security, tests, error handling, API compatibility,
+performance and concurrency, size and readability, docs and migrations, observability. It
+also defines the severities and the output format.
+
+## 4. Go/DDD layer (only `.go` files)
+
+Read [references/go-review-layer.md](references/go-review-layer.md). In short: general Go
+correctness findings (swallowed errors, leaks, races) apply to every repo; the house
+layout rules (one use case per file, no grab-bag files, comment density) count as
+**major** only when the repo adopts them, and are otherwise offered as minor or nit
+suggestions. When the companion skills `senior-go-idiomatic`, `ddd-go-idiomatic` or
+`go-design-rules` are available, use them for depth.
+
+## 5. Findings and verdict
+
+Each finding: **severity** (blocker / major / minor / nit), `file:line`, why it is a
+problem, and a concrete fix. Order from most to least severe; criticize code, not people;
+also say what the PR does well.
+
+Recommended verdict: any blocker or major → request changes; only minor/nit → comment;
+nothing found → say it looks ready, while approval stays with a human.
+
+Return the review in the conversation using the format in the rubric, plus a one-line
+count by severity. Offer to post it.
+
+## 6. Post to GitHub (only when asked)
+
+Post only when the user explicitly asks to post, publish or comment on the PR. Then:
+
+- **Event**: if the PR author is the current user, use `--comment` (GitHub rejects
+  "request changes" on your own PR). Otherwise `--request-changes` when there is a blocker
+  or major, `--comment` for the rest.
+- **Never approve**, even when asked: approval is a human sign-off, so tell the user to
+  approve in GitHub themselves.
+- Write payloads to temp files outside the repo so they cannot be committed by accident.
+
+```bash
+body=$(mktemp "${TMPDIR:-/tmp}/review.XXXXXX")
+# write the review markdown into "$body"
+gh pr review <n> --comment --body-file "$body"      # or --request-changes
+rm -f "$body"
+```
+
+Inline comments go through the reviews API in one request. Each `line` must fall inside a
+diff hunk on the `RIGHT` (new) side, or GitHub answers 422; put anything else in the
+summary body.
+
+```bash
+payload=$(mktemp "${TMPDIR:-/tmp}/review-json.XXXXXX")
+cat > "$payload" <<'JSON'
 {
-  "body": "Resumen del review. Ver comentarios inline.",
+  "commit_id": "<headRefOid>",
+  "body": "Summary of the review. See inline comments.",
   "event": "COMMENT",
   "comments": [
     { "path": "internal/user/register_user.go", "line": 42, "side": "RIGHT",
-      "body": "major: error tragado; envuélvelo con %w: `return fmt.Errorf(\"getUser id=%d: %w\", id, err)`" }
+      "body": "major: the error is dropped; wrap it: `return fmt.Errorf(\"find user %d: %w\", id, err)`" }
   ]
 }
 JSON
-gh api --method POST repos/{owner}/{repo}/pulls/<n>/reviews --input review.json
+gh api --method POST "repos/<owner>/<repo>/pulls/<n>/reviews" --input "$payload"
+rm -f "$payload"
 ```
 
-`event` debe ser `COMMENT` o `REQUEST_CHANGES`. **NUNCA** postees `--approve` ni
-`event=APPROVE` de forma automática: la aprobación es una decisión humana.
-
-### 7. Reportar
-
-Devuelve al usuario: veredicto, conteo de hallazgos por severidad, el link del review posteado
-y los blockers que faltan por resolver.
+`event` is `COMMENT` or `REQUEST_CHANGES`, chosen by the same rule. Report the review URL.
 
 ## Guardrails
 
-- **Nunca auto-aprueba.** Solo `--comment` o `--request-changes` (API: `event=COMMENT` /
-  `REQUEST_CHANGES`). Jamás `--approve`/`event=APPROVE` automático — eso lo decide un humano.
-- **Nunca filtres secretos ni credenciales** en los comentarios; si detectas un secreto en el
-  diff, márcalo como **blocker** describiendo el patrón, sin reproducir el valor.
-- **Específico, accionable y amable.** Cada hallazgo con `archivo:línea`, el porqué y un fix
-  concreto. Critica el código, no a la persona.
-- **Sé honesto con el veredicto.** No pidas cambios por nits; no dejes pasar un blocker.
-- **PR demasiado grande o que mezcla concerns** → el mejor feedback es pedir un split.
-- Corre `gh` sin pausar, pero **no hagas `push`, `merge`, `close` ni edites el PR**: la skill
-  solo revisa y comenta.
+- **Never approve** a PR (`--approve`, `event: APPROVE`).
+- **Never reproduce a secret** found in the diff; describe the pattern and location and
+  mark it blocker.
+- **Review only**: no push, merge, close, label or edit of the PR, and no checkout in the
+  user's working tree.

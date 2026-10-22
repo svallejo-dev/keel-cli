@@ -1,68 +1,82 @@
 # Value vs Reference Semantics — Go Idiomatic Reference
 
-## Go SIEMPRE Pasa por Valor
+## Contents
 
-En Go no existe pass-by-reference. **Toda asignación y todo paso de parámetro COPIA el valor.** No hay excepciones y no hay una sintaxis para pedir "pásame el original" como el `&T` de C++.
-
-```go
-func mutate(n int) { n = 99 } // opera sobre una copia
-
-x := 1
-mutate(x)
-fmt.Println(x) // 1 — el original nunca cambió
-```
-
-El contraste con otros lenguajes es la fuente de casi todos los malentendidos:
-
-| Lenguaje | Semántica |
-|---|---|
-| C++ | pass-by-value por defecto; `T&` da pass-by-reference real |
-| Java | pass-by-value siempre; las referencias a objetos **también** se pasan por valor (copias del handle) |
-| Go | pass-by-value siempre; para mutar el original pasas un `*T` explícito — y ese puntero también se copia |
-
-El punto clave: cuando "pasas un puntero", Go copia el puntero (8 bytes en 64-bit), no lo que apunta. La mutación funciona porque la copia del puntero apunta al mismo dato. Sigue siendo pass-by-value; lo que compartes es el pointee.
+- Go always passes by value
+- Value types vs "reference" types
+- Slice header and `append` aliasing
+- Maps (nil map, copying)
+- Arrays vs slices
+- Structs: shallow copy, copylocks, `range` copies
+- Receiver semantics
+- Defensive copies
+- Checklist
 
 ---
 
-## Tipos Valor vs Tipos "Referencia"
+## Go Always Passes by Value
 
-La categoría "tipo referencia" es informal: el valor se copia por valor como todo lo demás, pero contiene un puntero interno a datos compartidos. Copiar el header es barato; los datos apuntados no se duplican.
+There is no pass-by-reference in Go. **Every assignment and every argument copies the value.** There are no exceptions and no syntax to ask for "the original", like C++'s `T&`.
 
-| Categoría | Tipos | Qué se copia al pasar |
+```go
+func mutate(n int) { n = 99 } // works on a copy
+
+x := 1
+mutate(x)
+fmt.Println(x) // 1 — the original never changed
+```
+
+The contrast with other languages is the source of most misunderstandings:
+
+| Language | Semantics |
+|---|---|
+| C++ | pass-by-value by default; `T&` gives real pass-by-reference |
+| Java | always pass-by-value; object references are **also** passed by value (copies of the handle) |
+| Go | always pass-by-value; to mutate the original you pass an explicit `*T`, and that pointer is copied too |
+
+When you "pass a pointer", Go copies the pointer (8 bytes on 64-bit), not what it points to. Mutation works because the copy points at the same data. It is still pass-by-value; what you share is the pointee.
+
+---
+
+## Value Types vs "Reference" Types
+
+"Reference type" is an informal category: the value is copied like everything else, but it contains an internal pointer to shared data. Copying the header is cheap; the data it points to is not duplicated.
+
+| Category | Types | What is copied when passed |
 |---|---|---|
-| Valor | `bool`, numéricos, `string`, array, `struct` | Todo el contenido (el struct/array entero) |
-| "Referencia" (informal) | `slice`, `map`, `chan`, `func`, pointer | Solo el header/handle; los datos apuntados se comparten |
+| Value | `bool`, numerics, `string`, arrays, `struct` | The whole content (the entire struct/array) |
+| "Reference" (informal) | slice, map, `chan`, `func`, pointer | Only the header/handle; the pointed-to data is shared |
 
-`string` es un caso especial: es un header `{ptr, len}` pero **inmutable**, así que compartir el backing es seguro y no hay aliasing observable. Los demás tipos referencia sí exponen aliasing: mutar a través de una copia se ve en el original.
+`string` is a special case: it is a `{ptr, len}` header but **immutable**, so sharing the backing bytes is safe and there is no observable aliasing. The other reference-like types do expose aliasing: mutating through a copy shows up in the original.
 
 ---
 
 ## Slice Header — {ptr, len, cap}
 
-Un slice es un header de tres words. En 64-bit ocupa **24 bytes**: puntero al backing array, `len` y `cap`.
+A slice is a three-word header. On 64-bit it takes **24 bytes**: pointer to the backing array, `len` and `cap`.
 
 ```go
 type sliceHeader struct {
-	ptr *T  // apunta al backing array
-	len int // elementos accesibles
-	cap int // capacidad hasta el final del backing array
+	ptr *T  // points into the backing array
+	len int // accessible elements
+	cap int // capacity up to the end of the backing array
 }
 ```
 
-Pasar un slice copia esos 24 bytes, pero el `ptr` copiado apunta al mismo backing array. Por eso mutar `s[i]` dentro de una función **sí** afecta al llamador.
+Passing a slice copies those 24 bytes, but the copied `ptr` points to the same backing array. That is why assigning `s[i]` inside a function **does** affect the caller.
 
 ```go
-// BAD: mutación accidental — el llamador no espera que le pisen los datos
+// BAD: surprise mutation — the caller doesn't expect its data overwritten
 func normalize(s []float64) {
+	m := maxOf(s)
 	for i := range s {
-		s[i] /= maxOf(s) // escribe en el backing array del llamador
+		s[i] /= m // writes into the caller's backing array
 	}
 }
 
-// GOOD: si NO debes mutar al llamador, copia primero y retorna
+// GOOD: when you must not mutate the caller's data, copy first and return
 func normalized(s []float64) []float64 {
-	out := make([]float64, len(s))
-	copy(out, s) // copia elementos a un backing array propio
+	out := slices.Clone(s) // own backing array
 	m := maxOf(out)
 	for i := range out {
 		out[i] /= m
@@ -71,82 +85,83 @@ func normalized(s []float64) []float64 {
 }
 ```
 
-Regla: mutar los elementos de un slice recibido es un efecto secundario sobre el llamador. Hazlo solo si el contrato de la función lo documenta.
+Mutating the elements of a received slice is a side effect on the caller. Do it only when the function's contract says so (`slices.Sort` does, by name).
 
 ---
 
-## append — El Detalle que Rompe Código
+## append — The Detail That Breaks Code
 
-`append` comparte el backing array cuando hay `cap` suficiente, pero **realloca** (copia a un array nuevo) cuando se excede `cap`. El efecto sobre el llamador es NO determinista: depende del `cap` en runtime.
+`append` shares the backing array when there is enough `cap`, but **reallocates** (copies into a new array) when `cap` is exceeded. Which one happens depends on the runtime `cap`, so the effect on other holders of the slice is not visible from the call site.
 
 ```go
-// cap suficiente → escribe in-place en el backing compartido
+// enough cap → writes in place into the shared backing array
 a := make([]int, 3, 10)
-b := append(a, 99) // b comparte backing con a; b[0:3] alias a
+b := append(a, 99) // b shares a's backing array; b[0:3] aliases a
 
-// cap excedido → realloca: b apunta a OTRO array, a queda intacto
+// cap exceeded → reallocates: d points to a NEW array, c is untouched
 c := make([]int, 3, 3)
-d := append(c, 99) // d es un array nuevo, c no cambió
+d := append(c, 99)
 ```
 
-Como no puedes predecir cuál rama se ejecuta, **siempre reasigna el resultado**:
+Because you can't tell which branch ran, assign the result back to the same slice:
 
 ```go
-s = append(s, x) // el único uso correcto — nunca ignores el retorno
+s = append(s, x) // t := append(s, x) followed by more use of s is the classic aliasing bug
 ```
 
-### Aliasing entre sub-slices
+### Aliasing between sub-slices
 
-Un sub-slice hereda el `cap` del padre hasta el final del backing array. Un `append` sobre el sub-slice puede pisar elementos del padre.
+A sub-slice inherits the parent's `cap` up to the end of the backing array. An `append` on the sub-slice can overwrite elements of the parent.
 
 ```go
-// BAD: sub hereda cap=5 → append pisa base[2]
+// BAD: sub inherits cap=5 → append overwrites base[2]
 base := []int{1, 2, 3, 4, 5}
 sub := base[0:2]      // len=2, cap=5
-sub = append(sub, 99) // escribe en base[2]
-// base == {1, 2, 99, 4, 5}  ← corrupción silenciosa
+sub = append(sub, 99) // writes into base[2]
+// base == {1, 2, 99, 4, 5}  ← silent corruption
 
-// GOOD: three-index slice s[a:b:c] recorta cap=c-a → append realloca
-sub := base[0:2:2]    // len=2, cap=2
-sub = append(sub, 99) // cap agotado → array nuevo
-// base == {1, 2, 3, 4, 5}  ← intacto
+// GOOD: the three-index slice s[a:b:c] caps it at c-a → append reallocates
+base = []int{1, 2, 3, 4, 5}
+sub = base[0:2:2]     // len=2, cap=2
+sub = append(sub, 99) // cap exhausted → new array
+// base == {1, 2, 3, 4, 5}  ← untouched
 ```
 
-El three-index slice `s[low:high:max]` produce `len = high-low`, `cap = max-low`. Úsalo para aislar el `cap` cuando entregues un sub-slice que el receptor podría hacer crecer.
+The three-index slice `s[low:high:max]` yields `len = high-low`, `cap = max-low`. Use it to isolate `cap` when you hand out a sub-slice the receiver might grow.
 
 ---
 
-## Map — Puntero a hmap
+## Maps — A Pointer to Runtime State
 
-Un `map` es internamente un puntero a una estructura `hmap`. Pasar un map copia ese puntero, así que add/delete dentro de una función **se ven fuera**.
+A map value is a pointer to a runtime-managed structure. Passing a map copies that pointer, so inserts and deletes inside a function **are visible outside**.
 
 ```go
 func addKey(m map[string]int) {
-	m["new"] = 1 // visible en el llamador — mutamos el mismo hmap
+	m["new"] = 1 // visible to the caller — same underlying map
 	delete(m, "old")
 }
 ```
 
-### nil map — Lectura OK, Escritura Panic
+### nil map — reads OK, writes panic
 
 ```go
-var m map[string]int // nil, no inicializado
-_, ok := m["x"]      // OK: lectura de nil map retorna el zero value, ok=false
+var m map[string]int // nil, not initialized
+_, ok := m["x"]      // fine: reading a nil map returns the zero value, ok=false
 m["x"] = 1           // panic: assignment to entry in nil map
 ```
 
-Inicializa siempre antes de escribir: `m := make(map[string]int)` o `m := map[string]int{}`.
+Initialize before writing: `m := make(map[string]int)` or `m := map[string]int{}`.
 
-### Copiar un Map
+### Copying a map
 
-No existe una copia implícita: asignar un map copia el puntero, no las entradas. Para una copia real, itera o usa `maps.Clone`.
+There is no implicit copy: assigning a map copies the pointer, not the entries. For a real copy use `maps.Clone` (Go 1.21+) or iterate.
 
 ```go
-// Go 1.21+ — shallow copy: las claves y valores se copian por valor,
-// pero si el valor es a su vez un slice/map/pointer, sigue compartido
+// Shallow copy: keys and values are copied by value, but a value that is
+// itself a slice, map or pointer is still shared.
 clone := maps.Clone(m)
 
-// Equivalente manual
+// Manual equivalent
 clone := make(map[string]int, len(m))
 for k, v := range m {
 	clone[k] = v
@@ -155,50 +170,50 @@ for k, v := range m {
 
 ---
 
-## Array vs Slice — Por Qué en Go se Pasan Slices
+## Array vs Slice — Why Go APIs Take Slices
 
-Un array tiene semántica de valor pura: pasar un `[N]T` **copia los N elementos enteros**. Un slice comparte el backing. Esta es la razón por la que las APIs de Go aceptan slices, no arrays.
+An array has pure value semantics: passing a `[N]T` **copies all N elements**. A slice shares its backing array. That is why Go APIs accept slices, not arrays.
 
 ```go
-// array: la copia es del array completo → el original no cambia
+// array: the whole array is copied → the original doesn't change
 func mutArr(a [3]int) { a[0] = 99 }
 
-// slice: comparte backing → el original sí cambia
+// slice: shares the backing array → the original changes
 func mutSlice(s []int) { s[0] = 99 }
 
 arr := [3]int{1, 2, 3}
 mutArr(arr)
-fmt.Println(arr) // [1 2 3] — se copiaron los 24 bytes del array
+fmt.Println(arr) // [1 2 3] — the function got its own 24-byte copy
 
 sl := []int{1, 2, 3}
 mutSlice(sl)
-fmt.Println(sl) // [99 2 3] — se compartió el backing
+fmt.Println(sl) // [99 2 3] — the backing array was shared
 ```
 
-Pasar un `[1024]byte` por valor copia 1 KB en cada llamada. Pasa `sl[:]` (un slice) o `*[1024]byte` cuando el array es grande.
+Passing a `[1024]byte` by value copies 1 KB per call. Pass `arr[:]` (a slice) or `*[1024]byte` when the array is large.
 
 ---
 
-## Structs — Copia Shallow
+## Structs — Shallow Copy
 
-Copiar un struct copia todos sus campos, pero la copia es **shallow**: los campos que son punteros, slices o maps siguen apuntando a los mismos datos que el original.
+Copying a struct copies all its fields, but the copy is **shallow**: fields that are pointers, slices or maps still point to the same data as the original.
 
 ```go
 type User struct {
 	Name  string
-	Tags  []string // slice header copiado; backing COMPARTIDO
-	Prefs *Prefs   // puntero copiado; el Prefs apuntado COMPARTIDO
+	Tags  []string // header copied; backing array SHARED
+	Prefs *Prefs   // pointer copied; the Prefs it points to SHARED
 }
 
 u1 := User{Name: "a", Tags: []string{"x"}}
-u2 := u1        // copia shallow
-u2.Name = "b"   // independiente (string es valor)
-u2.Tags[0] = "z" // ¡muta u1.Tags[0] también! backing compartido
+u2 := u1         // shallow copy
+u2.Name = "b"    // independent (string is a value)
+u2.Tags[0] = "z" // also changes u1.Tags[0]: shared backing array
 ```
 
-### go vet copylocks — Copiar un Mutex es un Bug
+### go vet copylocks — copying a mutex is a bug
 
-Un `sync.Mutex` (o cualquier tipo con `sync.Locker`) no debe copiarse: la copia tiene su propio estado de lock y no protege nada. `go vet` lo detecta.
+A `sync.Mutex` must not be copied: the copy has its own lock state and protects nothing. The same holds for anything containing one, and for `sync.WaitGroup`, `sync.Once`, `sync.Cond` and the `sync/atomic` types. `go vet` (the `copylocks` analyzer) reports it.
 
 ```go
 type Counter struct {
@@ -206,15 +221,15 @@ type Counter struct {
 	count int
 }
 
-// BAD: value receiver copia el struct → copia el Mutex.
+// BAD: a value receiver copies the struct, and with it the mutex.
 // go vet: "Inc passes lock by value: Counter contains sync.Mutex"
 func (c Counter) Inc() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.count++ // además, muta una copia — inútil
+	c.count++ // also mutates a copy — useless
 }
 
-// GOOD: pointer receiver opera sobre el Mutex original
+// GOOD: the pointer receiver works on the original mutex
 func (c *Counter) Inc() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -222,93 +237,93 @@ func (c *Counter) Inc() {
 }
 ```
 
-Corolario: cualquier struct que embeba un `sync.Mutex`, `sync.WaitGroup`, `sync.Once`, etc., debe pasarse y recibirse por puntero, nunca por valor.
+Corollary: a struct that contains a `sync.Mutex`, `sync.WaitGroup`, `sync.Once`, etc. is passed and received by pointer.
 
-### range Copia el Elemento
+### range copies the element
 
-`for _, v := range xs` asigna a `v` una **copia** de cada elemento. Escribir en `v` no toca el slice.
+`for _, v := range xs` assigns a **copy** of each element to `v`. Writing to `v` does not touch the slice.
 
 ```go
 type Point struct{ X, Y int }
 xs := []Point{{1, 1}, {2, 2}}
 
-// BAD: v es una copia; la mutación se descarta
+// BAD: v is a copy; the write is discarded
 for _, v := range xs {
-	v.X = 100 // no muta nada
+	v.X = 100
 }
 
-// GOOD: indexa el slice original
+// GOOD: index into the original slice
 for i := range xs {
-	xs[i].X = 100 // muta el elemento real
+	xs[i].X = 100
 }
 ```
 
-(Nota: en Go 1.22+ la variable de loop es per-iteración, lo que arregla el capture en closures, pero `v` sigue siendo una copia del elemento — esto no cambia.)
+Go 1.22 made loop variables per-iteration, which fixed closure capture, but `v` is still a copy of the element; that did not change.
 
 ---
 
-## Receiver Value vs Pointer (Semántica de Copia)
+## Receiver: Value vs Pointer (Copy Semantics)
 
-Un **value receiver** opera sobre una copia del receiver: mutaciones al receiver se pierden. Un **pointer receiver** opera sobre el original: las mutaciones persisten.
+A **value receiver** works on a copy of the receiver: changes to it are lost. A **pointer receiver** works on the original: changes persist.
 
 ```go
 type Meter struct{ n int }
 
-func (m Meter) BumpByValue() { m.n++ } // opera sobre una copia; no persiste
-func (m *Meter) BumpByPtr()  { m.n++ } // opera sobre el original; persiste
+func (m Meter) BumpByValue() { m.n++ } // works on a copy; lost on return
+func (m *Meter) BumpByPtr()  { m.n++ } // works on the original; persists
 ```
 
-Aquí solo cubrimos la semántica de copia. La decisión completa value vs pointer receiver — coste de copia según el tamaño del struct, escape analysis, consistencia del method set, y el criterio de performance — vive en `references/memory-pointers.md`.
+This file only covers the copy semantics. The full value-vs-pointer receiver decision (copy cost by struct size, escape analysis, method-set consistency, performance) lives in `references/memory-pointers.md`.
 
 ---
 
-## Copia Defensiva
+## Defensive Copies
 
-Cuando guardas un slice/map recibido en un campo, o retornas un slice/map interno, el llamador conserva un header que apunta a **tu** backing. Puede mutar tu estado interno sin pasar por tus métodos. La copia defensiva corta ese aliasing en la frontera.
+When you store a received slice or map in a field, or return an internal slice or map, the caller keeps a header pointing at **your** backing data. It can change your internal state without going through your methods. A defensive copy cuts that aliasing at the boundary.
 
 ```go
 type Config struct {
 	tags []string
 }
 
-// BAD: guarda el slice del llamador — aliasing del backing array
+// BAD: stores the caller's slice — aliases its backing array
 func (c *Config) SetTags(tags []string) {
-	c.tags = tags // el caller puede mutar c.tags después
+	c.tags = tags // the caller can mutate c.tags later
 }
 
-// GOOD: copia al entrar → estado interno aislado del llamador
+// GOOD: copy on the way in → internal state isolated from the caller
 func (c *Config) SetTags(tags []string) {
-	c.tags = slices.Clone(tags) // Go 1.21+
+	c.tags = slices.Clone(tags)
 }
 
-// BAD: expone el slice interno — el caller puede pisar tu estado
+// BAD: exposes the internal slice — the caller can overwrite your state
 func (c *Config) Tags() []string { return c.tags }
 
-// GOOD: retorna una copia → el caller muta la suya, no la tuya
+// GOOD: return a copy → the caller mutates theirs, not yours
 func (c *Config) Tags() []string { return slices.Clone(c.tags) }
 ```
 
-Cuándo copiar defensivamente:
+When to copy defensively:
 
-- Al **almacenar** un slice/map/pointer que el llamador aún conserva y podría mutar.
-- Al **retornar** un slice/map interno que representa estado protegido (especialmente si hay un mutex de por medio).
-- **No** copies cuando el dato es efímero, inmutable por contrato, o el coste de la copia domina en un hot path — mide antes.
+- When **storing** a slice, map or pointer the caller still holds and might mutate.
+- When **returning** an internal slice or map that represents protected state (especially behind a mutex).
+- **Not** when the data is ephemeral, immutable by contract, or the copy dominates a hot path; measure first.
 
-`slices.Clone` y `maps.Clone` (Go 1.21+) hacen shallow copy: bastan cuando los elementos son valores. Si los elementos contienen punteros y necesitas aislamiento total, la copia debe ser deep — clona cada elemento a mano.
+`slices.Clone` and `maps.Clone` (Go 1.21+) make shallow copies, enough when the elements are values. If elements contain pointers and you need full isolation, the copy must be deep: clone each element yourself.
 
 ---
 
 ## Checklist
 
-- [ ] Recuerda que todo paso de parámetro copia; pasa `*T` explícito para mutar el original
-- [ ] No mutes los elementos de un slice recibido salvo que el contrato lo documente
-- [ ] Siempre `s = append(s, ...)` — nunca ignores el retorno de `append`
-- [ ] Usa el three-index slice `s[a:b:c]` para aislar el `cap` de un sub-slice que el receptor podría hacer crecer
-- [ ] Inicializa los maps con `make` antes de escribir — escribir en un nil map es panic
-- [ ] `maps.Clone` / `slices.Clone` para copiar (shallow); deep copy manual si los elementos tienen punteros
-- [ ] Pasa arrays grandes como slice (`arr[:]`) o `*[N]T`, no por valor
-- [ ] Recuerda que copiar un struct es shallow: slices/maps/punteros internos siguen compartidos
-- [ ] Nunca copies un struct con `sync.Mutex` embebido — pointer receiver siempre; corre `go vet`
-- [ ] En `range`, indexa `xs[i]` para mutar; `v` es una copia
-- [ ] Copia defensiva al guardar o retornar slices/maps que representan estado interno protegido
-- [ ] Para el framework completo value vs pointer receiver desde performance, ver `references/memory-pointers.md`
+- [ ] Every argument is a copy; pass an explicit `*T` to mutate the original
+- [ ] Don't mutate the elements of a received slice unless the contract says so
+- [ ] `s = append(s, ...)` — never discard `append`'s result
+- [ ] Three-index slice `s[a:b:c]` to cap a sub-slice the receiver might grow
+- [ ] Maps initialized with `make` (or a literal) before writing — writing to a nil map panics
+- [ ] `maps.Clone` / `slices.Clone` for shallow copies; deep copy by hand if elements hold pointers
+- [ ] Large arrays passed as a slice (`arr[:]`) or `*[N]T`, not by value
+- [ ] Struct copies are shallow: inner slices, maps and pointers stay shared
+- [ ] No struct containing a `sync.Mutex` is copied — pointer receivers, and `go vet` clean
+- [ ] In `range`, index `xs[i]` to mutate; `v` is a copy
+- [ ] Defensive copy when storing or returning slices/maps that are protected internal state
+- [ ] For the full value-vs-pointer receiver decision from a performance angle, see `references/memory-pointers.md`

@@ -1,48 +1,34 @@
-# DRY & SOLID en Go — cuándo el canon OOP aplica y cuándo estorba
+# DRY and SOLID in Go: When the OOP Canon Applies and When It Gets in the Way
 
-DRY y SOLID nacieron con la herencia (Smalltalk, Java, C#). Go no la tiene: usa
-satisfacción implícita de interfaces y composición. Trasplantar el canon entero sin
-traducir produce Java-ismos que **rompen** en Go — ciclos de import, interface pollution,
-indirección que no paga su costo. Esta referencia separa lo que aplica tal cual, lo que
-se reinterpreta y lo que se descarta. Compañeras opcionales (no enlazadas; este doc es
-autocontenido): `senior-go-idiomatic` y `ddd-go-idiomatic`. Verificado con toolchain
-1.24.7 (estándar: Go 1.26).
+DRY and SOLID were born alongside inheritance (Smalltalk, Java, C#). Go has none: it uses
+implicit interface satisfaction and composition. Transplanting the whole canon without
+translation produces Java-isms that **break** in Go: import cycles, interface pollution,
+indirection that does not pay for itself. This file separates what applies as-is, what gets
+reinterpreted and what gets dropped.
 
----
+When a principle (DRY, any SOLID letter, getters/setters) clashes with Go's idiom, Go wins.
+DRY and SOLID are quoted **with an asterisk**: they are worth it when they reduce real
+coupling and get in the way when they invent it.
 
-## Regla #0 — Ante conflicto principio ↔ Go, gana Go
+## 1. DRY, subordinate to decoupling
 
-Es el corazón de este archivo. Cuando un principio OOP (DRY, cualquier letra de SOLID,
-getters/setters) choca con el idioma de Go, **gana Go, siempre**. El canon es heurística
-de otra familia de lenguajes; Go optimiza lectura, compilación explícita y composición.
+**Rule.** DRY is not "do not duplicate code that looks alike"; it is **do not duplicate
+knowledge**. Two fragments identical today that encode **different decisions** are not
+duplication, they are a coincidence. Deduplicating them ties them to change together.
 
-Corolario: en Go, DRY y SOLID se citan **con asterisco** — valen cuando reducen
-acoplamiento real, estorban cuando lo inventan. El resto es la lista de asteriscos.
+**Why in Go.** The proverb: *"a little copying is better than a little dependency"*.
+Extracting what "looks alike" in two unrelated domains into `common/`, `shared/` or `base/`
+creates the coupling DRY wanted to avoid: both now depend on a third package, and a change
+for one drags the other.
 
----
+> Would the two copies change for the **same reason**?
+> **Yes** → it is the same knowledge; extract it. **No** → keep them apart.
 
-## 1. DRY subordinado al desacople
-
-**Regla.** DRY no es "no dupliques código que se parece", es **no dupliques
-conocimiento**. Dos fragmentos idénticos hoy que representan **decisiones distintas** no
-son una duplicación: son una coincidencia. Deduplicarlos los ata a cambiar juntos.
-
-**Por qué en Go.** El proverbio canónico (Rob Pike): *"a little copying is better than a
-little dependency"*. Extraer lo que "se parece" de dos dominios sin relación a un paquete
-`common/`, `shared/` o `base/` crea el acoplamiento que DRY quería evitar: ambos pasan a
-depender de un tercero y un cambio en uno arrastra al otro. Ver
-`references/coupling-behavior.md` (acoplamiento) y `references/dependencies.md` (copiar vs. depender).
-
-### Criterio de decisión
-
-> ¿Las dos copias cambiarían por la **misma razón**?
-> **Sí** → es el mismo conocimiento; extráelo. **No** → déjalas separadas.
-
-Es SRP disfrazado (§2, S) aplicado a la duplicación: si las razones de cambio difieren,
-unificar es un error aunque el código sea idéntico al carácter.
+That is SRP (§2) applied to duplication: if the reasons to change differ, unifying is a
+mistake even if the code is identical to the character.
 
 ```go
-// BAD: un Validate compartido acopla user y payment.
+// BAD: one shared Validate couples user and payment.
 package common
 
 func Validate(name string, amount int) error {
@@ -57,56 +43,58 @@ func Validate(name string, amount int) error {
 ```
 
 ```go
-// GOOD: cada dominio valida solo lo suyo.
+// GOOD: each domain owns its rule, as a type that cannot hold an invalid value.
 package user
 
-func (u User) Validate() error {
-	if u.Name == "" {
-		return errors.New("user: name required")
+// Name is a non-empty display name.
+type Name struct{ v string }
+
+// NewName rejects blank names.
+func NewName(raw string) (Name, error) {
+	if strings.TrimSpace(raw) == "" {
+		return Name{}, errors.New("user: name required")
 	}
-	return nil
+	return Name{v: raw}, nil
 }
 ```
 
-`payment.Validate` hace lo propio con `Amount` en su paquete: no comparte una línea con
-`user` y nada las obliga a cambiar juntas. Cada dominio nombra su regla con su vocabulario
-(`references/domain-naming.md`); mejor aún, el tipo hace el estado ilegal irrepresentable
-y la validación sobra (`references/illegal-states.md`). `common.Validate` impide ambas.
+`payment.NewAmount` does the same for amounts in its own package: it shares no line with
+`user`, and nothing forces them to change together. Each domain names its rule in its own
+vocabulary ([domain-naming.md](domain-naming.md)), and parsing into a type makes later
+re-validation unnecessary ([illegal-states.md](illegal-states.md)). `common.Validate`
+prevents both.
 
----
+## 2. Selective SOLID
 
-## 2. SOLID selectivo
+The five letters do not weigh the same: two are native, two get reinterpreted, one almost
+disappears.
 
-No las cinco letras pesan igual: dos son nativas, dos se reinterpretan, una casi desaparece.
-
-| Principio | ¿Aplica en Go? | Cómo se expresa |
+| Principle | Applies in Go? | How it shows up |
 |---|---|---|
-| **S** — SRP | Sí, tal cual | Un paquete/tipo con **una** razón para cambiar |
-| **O** — OCP | Reinterpretado | Extensión por **composición e interfaces**, nunca por herencia |
-| **L** — LSP | Casi irrelevante | Sin herencia se reduce a **respetar el contrato** de la interfaz |
-| **I** — ISP | Sí, y es **nativo** | Interfaces pequeñas y **consumer-defined**; el más Go de todos |
-| **D** — DIP | Sí | Depender de **abstracciones definidas por el consumidor**: accept interfaces + inyección |
+| **S**: SRP | Yes, as-is | A package or type with **one** reason to change |
+| **O**: OCP | Reinterpreted | Extension by **composition and interfaces**, never inheritance |
+| **L**: LSP | Barely | Without inheritance it reduces to **honouring the interface contract** |
+| **I**: ISP | Yes, **native** | Small, **consumer-defined** interfaces; the most Go of all |
+| **D**: DIP | Yes | Depend on **consumer-defined abstractions**: accept interfaces + injection |
 
-### S — Single Responsibility
+### S: Single Responsibility
 
-**Regla.** Un paquete o tipo tiene **una** razón para cambiar. En Go la unidad natural
-de responsabilidad es el **paquete**, no la clase.
+**Rule.** A package or type has **one** reason to change. In Go the natural unit of
+responsibility is the **package**, not the class.
 
 ```go
+// Config is the parsed server configuration.
 type Config struct {
 	Addr string
-	TLS  bool
 }
 
+// ParseConfig reads key=value lines; unknown keys are ignored.
 func ParseConfig(r io.Reader) (*Config, error) {
 	cfg := &Config{}
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		k, v, ok := strings.Cut(sc.Text(), "=")
-		if !ok {
-			continue
-		}
-		if strings.TrimSpace(k) == "addr" {
+		if ok && strings.TrimSpace(k) == "addr" {
 			cfg.Addr = strings.TrimSpace(v)
 		}
 	}
@@ -117,20 +105,21 @@ func ParseConfig(r io.Reader) (*Config, error) {
 }
 ```
 
-Si `ParseConfig` empezara a loguear, abrir conexiones o aplicar reglas de negocio,
-tendría varias razones para cambiar: sepáralas en paquetes distintos.
+If `ParseConfig` started logging, opening connections or applying business rules, it would
+have several reasons to change: split them into separate packages.
 
-### O — Open/Closed, reinterpretado
+### O: Open/Closed, reinterpreted
 
-**Regla.** Abierto a extensión, cerrado a modificación — pero en Go la extensión es por
-**composición e interfaces**, jamás por subclases (no existen). "Abierto vía interfaces,
-no vía herencia."
+**Rule.** Open to extension, closed to modification, but in Go extension is by
+**composition and interfaces**, never by subclasses (there are none).
 
 ```go
+// Notifier delivers a message on one channel.
 type Notifier interface {
 	Notify(ctx context.Context, msg string) error
 }
 
+// Dispatch stops at the first failing notifier.
 func Dispatch(ctx context.Context, ns []Notifier, msg string) error {
 	for _, n := range ns {
 		if err := n.Notify(ctx, msg); err != nil {
@@ -139,39 +128,29 @@ func Dispatch(ctx context.Context, ns []Notifier, msg string) error {
 	}
 	return nil
 }
-
-type EmailNotifier struct{ From string }
-
-func (e EmailNotifier) Notify(_ context.Context, msg string) error { return nil }
-
-type SlackNotifier struct{ Channel string }
-
-func (s SlackNotifier) Notify(_ context.Context, msg string) error { return nil }
 ```
 
-Añadir un canal de notificación no toca `Dispatch`. La versión OOP de esto sería una
-jerarquía `AbstractNotifier`; en Go es una interfaz de un método más tipos concretos.
+Adding a channel (`EmailNotifier`, `SlackNotifier`) is a new type with one method;
+`Dispatch` does not change. The OOP version would be an `AbstractNotifier` hierarchy.
 
-### L — Liskov Substitution
+### L: Liskov Substitution
 
-**Regla.** Sin herencia, LSP casi no tiene dónde aplicarse. Su versión Go es: **respeta
-el contrato de la interfaz**. Un tipo que satisface `io.Reader`, `error` o `sort.Interface`
-debe cumplir su contrato documentado, no solo la firma de los métodos.
+**Rule.** Without inheritance, LSP has little to apply to. Its Go version: **honour the
+interface's contract**. A type satisfying `io.Reader`, `error` or `sort.Interface` must
+fulfil its documented contract, not just the method signatures.
 
 ```go
-// BAD: al agotarse devuelve (0, nil) en vez de io.EOF.
+// BAD: when exhausted it returns (0, nil) instead of io.EOF.
 func (r *badReader) Read(p []byte) (int, error) {
 	if r.pos >= len(r.data) {
-		return 0, nil // debia ser io.EOF
+		return 0, nil // should be io.EOF
 	}
 	n := copy(p, r.data[r.pos:])
 	r.pos += n
 	return n, nil
 }
-```
 
-```go
-// GOOD: entrega bytes y luego io.EOF.
+// GOOD: delivers bytes, then io.EOF.
 func (r *goodReader) Read(p []byte) (int, error) {
 	if r.pos >= len(r.data) {
 		return 0, io.EOF
@@ -182,16 +161,18 @@ func (r *goodReader) Read(p []byte) (int, error) {
 }
 ```
 
-Con `badReader`, `io.Copy` y `bufio.Scanner` entran en busy-loop: la firma calza pero no se comporta como un `io.Reader`. El compilador verifica la firma; el contrato lo verificas tú (y los tests). La firma
-que calca sin respetar el contrato es el LSP que Go sí puede violar.
+With `badReader`, `io.Copy` and `bufio.Scanner` spin forever: the signature fits but it does
+not behave as an `io.Reader`. The compiler checks the signature; you (and your tests) check
+the contract.
 
-### I — Interface Segregation
+### I: Interface Segregation
 
-**Regla.** Interfaces pequeñas y **definidas por el consumidor**. Es el principio más Go
-de todos: `io.Reader` tiene **un** método por diseño, y las interfaces viven donde se
-**usan**, no donde se implementan.
+**Rule.** Small, **consumer-defined** interfaces. It is the most Go of the principles:
+`io.Reader` has **one** method by design, and interfaces live where they are **used**, not
+where they are implemented.
 
 ```go
+// WriteReport accepts any io.Writer: a file, a buffer, a socket or a test fake.
 func WriteReport(w io.Writer, lines []string) error {
 	for _, l := range lines {
 		if _, err := fmt.Fprintln(w, l); err != nil {
@@ -202,75 +183,65 @@ func WriteReport(w io.Writer, lines []string) error {
 }
 ```
 
-`WriteReport` acepta `*os.File`, `*bytes.Buffer`, un socket o un mock porque pide el
-mínimo. Una interfaz de cinco métodos "por completitud" es el opuesto: nadie los usa todos.
+A five-method interface "for completeness" is the opposite: nobody uses all of them.
 
-### D — Dependency Inversion
+### D: Dependency Inversion
 
-**Regla.** Depende de abstracciones, no de concreciones — y en Go la abstracción la
-**define el consumidor** y se **inyecta**. Es "accept interfaces" elevado a política de
-arquitectura.
+**Rule.** Depend on abstractions, not concretions, and in Go the abstraction is **defined by
+the consumer** and **injected**. It is "accept interfaces" raised to architecture policy.
 
 ```go
-// show_profile.go
-type userRepo interface {
-	ByID(ctx context.Context, id int64) (User, error)
+// userFinder is all ShowProfile needs from storage.
+type userFinder interface {
+	FindByID(ctx context.Context, id UserID) (*User, error)
 }
 
+// ShowProfile renders a user's public profile.
 type ShowProfile struct {
-	users userRepo
+	users userFinder
 }
 
-func NewShowProfile(users userRepo) *ShowProfile {
+// NewShowProfile accepts any store with FindByID; tests pass a stub.
+func NewShowProfile(users userFinder) *ShowProfile {
 	return &ShowProfile{users: users}
 }
 ```
 
-`ShowProfile` depende de `userRepo`, una abstracción que **él mismo** define, no del Postgres concreto. La interfaz vive en el archivo que la consume: el `*postgres.Store` concreto
-la satisface sin importar al consumidor —cero ciclos, y el test inyecta un stub—. Por qué
-el sentido de la dependencia importa: `references/coupling-behavior.md`.
+`ShowProfile` depends on `userFinder`, an abstraction **it** defines, not on a concrete
+Postgres store. The concrete `*postgres.Store` satisfies it without importing the consumer:
+no cycles, and the test injects a stub. Wiring is covered in
+[dependencies.md](dependencies.md).
 
----
+## 3. The general principle: do not import the whole canon
 
-## 3. El principio general: no importes el canon entero
+Importing SOLID/DRY **wholesale**, with their inheritance baggage, pushes towards Java-isms
+that are expensive in Go:
 
-Importar SOLID/DRY **completos**, con su bagaje de herencia (jerarquías de clases,
-abstract factories, interfaz-por-clase, getters/setters ceremoniales), empuja a
-Java-ismos que en Go se pagan caro:
-
-| Java-ismo importado | Qué rompe en Go |
+| Imported Java-ism | What it breaks in Go |
 |---|---|
-| Jerarquías de herencia | No existen; se emulan con embedding y salen frágiles |
-| Interfaz-por-clase | Interface pollution: indirección sin un segundo implementador |
-| Abstract factories / DI containers | Indirección y reflection donde bastaba un constructor |
-| Getters/setters por defecto | Ruido; en Go el campo exportado o un método con nombre de dominio |
-| `common/` / `base/` de utilidades | Acoplamiento entre módulos sin relación (§1) |
+| Inheritance hierarchies | They do not exist; emulated with embedding they come out fragile |
+| Interface per class | Interface pollution: indirection without a second implementation |
+| Abstract factories / DI containers | Indirection and reflection where a constructor was enough |
+| Getters/setters by default | Noise; use intent-revealing methods |
+| `common/` / `base/` utilities | Coupling between unrelated modules (§1) |
 
-La política correcta es **selectiva**, no de bloque:
+The right policy is **selective**:
 
-- **Toma tal cual** lo que ya es nativo: ISP y DIP (interfaces pequeñas, consumer-defined,
-  inyectadas) y SRP a nivel de paquete.
-- **Reinterpreta** OCP (composición, no subclases) y LSP (contrato de interfaz, no
-  subtipado nominal).
-- **Descarta** todo lo que exige herencia o inventa acoplamiento: jerarquías,
-  interfaz-por-clase especulativa, dedup de conocimiento no relacionado.
+- **Take as-is** what is already native: ISP and DIP (small, consumer-defined, injected interfaces) and SRP at package level.
+- **Reinterpret** OCP (composition, not subclasses) and LSP (interface contract, not nominal subtyping).
+- **Drop** whatever needs inheritance or invents coupling: hierarchies, speculative interface per class, deduplicating unrelated knowledge.
 
-El sesgo por defecto en Go es **menos abstracción, más código explícito**: una capa de
-indirección se gana su lugar cuando hay un segundo implementador real o un test double
-concreto, no antes. DRY y SOLID sirven al desacople, no al revés — y cuando chocan con
-el idioma, Regla #0.
-
----
+Go's default bias is **less abstraction, more explicit code**: a layer of indirection earns
+its place when there is a real second implementation or a concrete test double, not before.
 
 ## Checklist
 
-- [ ] Regla #0 interiorizada: ante conflicto principio ↔ Go, gana Go; DRY/SOLID se citan con asterisco
-- [ ] Antes de deduplicar: ¿las dos copias cambian por la **misma razón**? Si no, quedan separadas
-- [ ] Cero paquetes `common/`/`shared/`/`base/` que unan dominios sin relación
-- [ ] SRP por paquete: una única razón para cambiar; parseo, logging y negocio separados
-- [ ] OCP por interfaces + composición; añadir un comportamiento no modifica el dispatcher
-- [ ] LSP = contrato de interfaz respetado (`io.Reader` devuelve `io.EOF`, no `(0, nil)`)
-- [ ] ISP nativo: interfaces mínimas, definidas por el consumidor, sin interfaz-por-clase
-- [ ] DIP: la interfaz la define y la inyecta el consumidor; el implementador no lo importa
-- [ ] Sin Java-ismos: nada de jerarquías de herencia, abstract factories ni getters/setters ceremoniales
-- [ ] La abstracción se añade cuando hay segundo implementador o test double real, no "por si acaso"
+- [ ] Before deduplicating: do both copies change for the **same reason**? If not, keep them apart.
+- [ ] No `common/`/`shared/`/`base/` packages joining unrelated domains.
+- [ ] SRP per package: one reason to change; parsing, logging and business rules separated.
+- [ ] OCP via interfaces + composition; adding a behaviour does not modify the dispatcher.
+- [ ] LSP = interface contract honoured (`io.Reader` returns `io.EOF`, not `(0, nil)`).
+- [ ] ISP: minimal interfaces, defined by the consumer, no interface per class.
+- [ ] DIP: the consumer defines and receives the interface; the implementer does not import it.
+- [ ] No Java-isms: no inheritance hierarchies, abstract factories or ceremonial getters/setters.
+- [ ] Abstraction is added for a second implementation or a real test double, not "just in case".

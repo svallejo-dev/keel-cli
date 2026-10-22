@@ -1,548 +1,358 @@
 ---
 name: senior-go-idiomatic
 description: >
-  Expert-level Go code generation, review, and explanation following idiomatic Go standards
-  as applied at companies like Cloudflare, HashiCorp, and Uber. Use this skill whenever the
-  user writes, reviews, asks about, or debugs Go code — including concurrency patterns,
-  I/O pipelines, error handling, interfaces, generics, testing, databases, toolchain, or
-  security. Also trigger for architecture decisions in Go, performance questions, or when
-  the user asks "is this idiomatic?" or "how would a senior Go engineer do this?". Trigger
-  even for partial Go snippets or pseudocode the user wants translated into proper Go.
+  Writes, reviews and explains idiomatic Go (baseline Go 1.26): errors, interfaces, generics,
+  goroutines, channels and context, I/O, testing, benchmarks, pgx/sqlc databases, slog, go.mod and
+  dependencies, project layout, security, and Go comment policy. Use whenever the user writes,
+  reviews, debugs or asks about Go code or a Go snippet, mentions a goroutine, channel, context,
+  go.mod, go test, benchmark, pgx, sqlc, slog or generics, asks "is this idiomatic?", or complains
+  about too many comments / over-commented Go. Spanish triggers: "¿es idiomático?", "revisa este
+  código Go", "mi goroutine se queda colgada", "demasiados comentarios en Go".
 ---
 
-# Senior Go Idiomatic Skill
+# Senior Go Idiomatic
 
-You are operating as a **Principal Go Engineer** with deep expertise across the entire Go ecosystem. Your output must meet the bar of a code review at Cloudflare, HashiCorp, or Uber — not just "code that compiles."
+Write and review Go the way an experienced Go reviewer would: correct first, then idiomatic, then
+fast. The rules below are short on purpose; each section names the reference to open when the
+question goes deeper. Read only the reference you need.
 
-## Core Criterion
+Bounded-context structure (one use case per file, `Execute(ctx, XInput) (XOutput, error)`,
+ports, value objects) belongs to the **ddd-go-idiomatic** skill; design principles (LoD,
+Tell-Don't-Ask, CQS, illegal states) to **go-design-rules**.
 
-**Before writing any Go code, ask yourself:** Would this pass a strict idiomatic code review? If not, rewrite it until it does.
+## Priorities
 
----
+When generating or reviewing code, weigh concerns in this order, because a later one never
+justifies breaking an earlier one:
 
-## Go Quality Hierarchy
+1. **Correctness** — no data races, no goroutine leaks, no silently dropped errors.
+2. **Idiomaticity** — Go conventions, not patterns transplanted from Java or JavaScript.
+3. **Composability** — accept interfaces, return concrete types; play well with the stdlib.
+4. **Performance** — measured, not guessed: avoid needless allocations on hot paths.
+5. **Observability** — errors with context, structured logs.
 
-Apply these in order when generating or reviewing code:
+## Go Version Baseline
 
-1. **Correctness** — No data races, no goroutine leaks, no silent errors
-2. **Idiomaticity** — Follows Go conventions, not patterns transplanted from other languages
-3. **Composability** — Accepts interfaces, returns concrete types; plays well with the stdlib
-4. **Performance** — Avoids unnecessary allocations; uses buffering where I/O is involved
-5. **Observability** — Errors are wrapped with context; structured logging is preferred
+Target Go 1.26, but read the module's `go` line first: language semantics (loop variables, timer
+behavior) follow that version, and `go vet` flags stdlib APIs newer than it. Features worth
+reaching for, by the version that introduced them:
 
----
+- **1.21** `slices`, `maps`, `min`/`max`/`clear`, `log/slog`.
+- **1.22** per-iteration loop variables (no more `x := x`), `for i := range n`, ServeMux
+  patterns with methods and wildcards (`"GET /users/{id}"`, `r.PathValue`).
+- **1.23** range-over-func iterators (`maps.Keys`, `slices.Collect`); unreferenced timers are
+  collected without `Stop`.
+- **1.24** `for b.Loop()` benchmarks, `t.Context()`, the `tool` directive in go.mod,
+  `encoding/json` `omitzero`, `crypto/rand.Text`.
+- **1.25** `sync.WaitGroup.Go`, `testing/synctest`, container-aware `GOMAXPROCS`.
+- **1.26** `errors.AsType[E]`, `new(expr)`.
 
-## Go Version Awareness
+## Values, Pointers and Memory
 
-Target the current Go release (**1.26** as of this writing; the pinned toolchain here is 1.24.7). Idioms are tagged with the version they require (e.g. `// Go 1.21+`). Modern baselines worth internalizing:
+- Go passes everything by value; slices, maps and pointers copy a small header that still shares
+  the underlying data. Mutating a received slice's elements or keeping it in a field affects the
+  caller — copy at the boundary (`slices.Clone`) when that is not the contract.
+  → `references/value-vs-reference.md` for aliasing, `append`, shallow struct copies.
+- Use pointer receivers when a method mutates, the struct is large or holds a `sync.Mutex`, and
+  keep one receiver kind per type so the method set is predictable. Small immutable values
+  (`time.Time`, a `Point`) take value receivers.
+- Do not guess about allocations: `go build -gcflags=-m` shows what escapes, `-benchmem` shows
+  allocs/op. Reorder struct fields for padding only in hot structs with many instances, backed by
+  a benchmark or `fieldalignment`; otherwise order fields for readability.
+  → `references/memory-pointers.md` for escape analysis, GC tuning, cache locality, pprof.
 
-- **Per-iteration loop variables** (Go 1.22) — the classic `i := i` capture bug is gone in `for` / `for range`
-- **`slices` / `maps` packages, `min` / `max` / `clear` builtins** (Go 1.21)
-- **`errors.Join`** (Go 1.20) and **range-over-func iterators** (Go 1.23)
+## Interfaces, Composition and Generics
 
-Always check the module's `go` directive in `go.mod` before applying a version-specific idiom — the language semantics follow that declared version.
-
----
-
-## Language & Runtime (M1 — Memory & Pointers)
-
-### Stack vs Heap
-- Prefer value semantics for small, short-lived data
-- Use pointer semantics when the struct is large, mutable, or needs to satisfy an interface with pointer receivers
-- Never guess — use `go build -gcflags="-m"` to verify escape analysis
-
-### Struct Memory Layout
-Always order struct fields from largest to smallest alignment to minimize padding:
-```go
-// BAD — 24 bytes due to padding
-type Bad struct {
-    a bool    // 1 byte + 7 pad
-    b int64   // 8 bytes
-    c bool    // 1 byte + 7 pad
-}
-
-// GOOD — 16 bytes
-type Good struct {
-    b int64   // 8 bytes
-    a bool    // 1 byte
-    c bool    // 1 byte + 6 pad
-}
-```
-
-### Closures — Loop Variable Capture (Version-Dependent)
-
-**Go 1.22+ (current default):** loop variables are per-iteration — the classic bug is gone, no `i := i` needed:
-```go
-for i := range 5 {
-    go func() { fmt.Println(i) }() // Go 1.22+: prints 0..4, each iteration owns its i
-}
-```
-
-**Go ≤1.21 (legacy modules):** every closure shared ONE variable:
-```go
-// BUG on Go ≤1.21: prints 5,5,5,5,5 — all goroutines observe the final i
-for i := 0; i < 5; i++ {
-    go func() { fmt.Println(i) }()
-}
-// FIX on ≤1.21: shadow per iteration
-for i := 0; i < 5; i++ {
-    i := i
-    go func() { fmt.Println(i) }()
-}
-```
-
-The semantics follow the module's `go` directive. On `go 1.21` or lower the shadow is still required; `go vet`'s `loopclosure` flags the old pattern.
-
-### Interface Nil Footgun (Critical)
-```go
-// BUG: (*MyError)(nil) wrapped in interface is NOT nil
-func getError() error {
-    var err *MyError = nil
-    return err // returns non-nil interface!
-}
-
-// FIX: return untyped nil
-func getError() error {
-    return nil
-}
-```
-
-### Compile-Time Interface Check
-```go
-// Fails at compile time if *Server doesn't implement http.Handler
-var _ http.Handler = (*Server)(nil)
-```
-
----
-
-## Type System (M2 — Interfaces & Composition)
-
-### The Golden Rule
-```
-Accept interfaces → Return concrete types
-```
-
-### Interface Design
-- Keep interfaces small — `io.Reader` has one method for a reason
-- Define interfaces at the point of use, not at the point of definition
-- Avoid empty `interface{}` / `any` unless truly necessary
-
-### Functional Options Pattern
-```go
-type ServerOption func(*Server)
-
-func WithTimeout(d time.Duration) ServerOption {
-    return func(s *Server) { s.timeout = d }
-}
-
-func NewServer(addr string, opts ...ServerOption) *Server {
-    s := &Server{addr: addr, timeout: 30 * time.Second} // safe defaults
-    for _, opt := range opts {
-        opt(s)
-    }
-    return s
-}
-```
-
-### Generics — When to Use
-- Use generics when the logic is truly type-agnostic (collections, algorithms)
-- Use interfaces when behavior varies by type
-- Never use generics to avoid writing a 5-line function twice
-
-### Composition via Embedding
-Go has no inheritance. **Embed a struct** to promote its fields and methods (reuse behavior); **embed an interface** to build decorators/wrappers. Prefer composition over any inheritance-shaped design. See `references/interfaces-composition.md`.
-
-### Enums — iota + Stringer
-Use `iota` for enumerated constants and generate their `String()` with `stringer` — never magic strings or ints. See `references/idioms-and-style.md`.
-
----
-
-## Strings, Runes & UTF-8 (M2 — Critical Footguns)
-
-Go strings are **immutable byte sequences**, not character sequences. A `rune` is an alias for `int32` representing a Unicode code point. The difference matters the moment you leave ASCII.
-
-### The Core Footgun
+- **Accept interfaces, return concrete types.** Callers get the full API; inputs stay flexible.
+- **The consumer defines the interface**, with only the methods it calls. An interface next to
+  its only implementation, "for mocking later", is pollution: add it when a second
+  implementation or a test double actually exists.
+- A typed nil pointer stored in an interface is not a nil interface; return a literal `nil` on
+  the success path. → `references/interfaces-composition.md` §7.
+- `var _ Port = (*Adapter)(nil)` is worth writing where a type is meant to satisfy an interface
+  its own package never mentions (an adapter for a consumer's port, an `http.Handler`), so a
+  signature drift fails locally instead of at the wiring site. → §8.
+- Go has no inheritance: embed a struct to reuse behavior, embed an interface to build a
+  decorator that overrides one method.
+- Generics fit type-agnostic code (containers, algorithms over `cmp.Ordered`); interfaces fit
+  behavior that varies by type. Do not add type parameters to avoid writing five lines twice.
+- Optional configuration uses functional options with safe defaults:
 
 ```go
-s := "café"
-fmt.Println(len(s))        // 5 — bytes, NOT characters ("é" is 2 bytes in UTF-8)
-fmt.Println(len([]rune(s))) // 4 — Unicode code points (what humans call "characters")
-```
+type Option func(*Server)
 
-### Iteration — Bytes vs Runes
+func WithTimeout(d time.Duration) Option { return func(s *Server) { s.timeout = d } }
 
-```go
-s := "café"
-
-// BAD: iterates over bytes — breaks multi-byte characters
-for i := 0; i < len(s); i++ {
-    fmt.Printf("%c", s[i]) // "cafÃ©" — garbage for non-ASCII
-}
-
-// GOOD: range on string iterates over runes automatically
-for i, r := range s {
-    fmt.Printf("index=%d rune=%c\n", i, r)
-    // index=0 rune=c
-    // index=1 rune=a
-    // index=2 rune=f
-    // index=3 rune=é  ← i jumps from 3 to 5 (é is 2 bytes)
+func NewServer(addr string, opts ...Option) *Server {
+	s := &Server{addr: addr, timeout: 30 * time.Second}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 ```
 
-### String Building — Never Concatenate in Loops
+→ `references/interfaces-composition.md` for method sets, embedding, segregation.
+→ `references/idioms-and-style.md` for naming, zero values, early return, enums with
+`iota` + `go tool stringer`, defer subtleties, `slices`/`maps`.
+
+## Packages and Layout
+
+- A package is a unit of design, not a folder. Describe it in one sentence that starts with its
+  name ("Package user models accounts…"); if you cannot, it has no identity yet.
+- No `util`, `helper`, `common`, `shared`, `models`, `types`, `base` or `manager` packages: they
+  collect unrelated code and become everyone's dependency. Name packages after the concept.
+- Flat by default. Nesting creates no hierarchy and no access to the parent's unexported names;
+  only `internal/` is a compiler-enforced boundary.
+- Dependencies point inward: the domain package imports no driver, HTTP or JSON packages; infra
+  lives in a subpackage of the context (`user/pgstore`) and implements the context's ports.
+- Files are `snake_case` and named by what they contain; inside a bounded context, one use case
+  per file — the rules live in the ddd-go-idiomatic skill.
+
+→ `references/project-layout.md` for `cmd/`, `internal/`, `platform/`, the composition root, and
+anti-patterns.
+
+## Dependencies
+
+The standard library and `golang.org/x/...` come first. Each dependency adds transitive modules,
+CVE surface and upgrades you do not control, so it has to pay for itself. Before adding one, check
+`go mod why`, `go mod graph` and `govulncheck ./...`; prefer small libraries over frameworks that
+take over control flow. Pin build tools with `go get -tool` (Go 1.24) instead of a `tools.go`.
+→ `references/dependencies-and-stdlib.md`.
+
+## Concurrency
+
+- **Know how every goroutine ends** before starting it: a closed input channel, a canceled
+  context, or a `WaitGroup`/`errgroup` that someone waits on. A goroutine blocked forever is a
+  leak that only shows up as slowly growing memory.
+- **"Don't communicate by sharing memory; share memory by communicating."** Use channels to hand
+  off ownership and coordinate lifecycles; use a `sync.Mutex` (or `atomic`) for long-lived shared
+  state with invariants. Pick by the shape of the problem, not the slogan.
+- The sender owns a channel and is the only one that closes it; return `<-chan T` so the
+  compiler stops receivers from closing it.
+- `context.Context` is the first parameter of anything that does I/O or may block, and it is
+  passed down, never stored in a struct.
+- Run `go test -race` on concurrent code; use `goleak` or a `testing/synctest` bubble to catch
+  leaks and time-dependent bugs without real sleeps.
 
 ```go
-// BAD: O(n²) — each += allocates a new string
-result := ""
-for _, s := range parts {
-    result += s
-}
-
-// GOOD: strings.Builder — one allocation, amortized O(n)
-var b strings.Builder
-b.Grow(estimatedSize) // optional but reduces re-allocations
-for _, s := range parts {
-    b.WriteString(s)
-}
-result := b.String()
-```
-
-### strings vs bytes — When to Use Each
-
-```go
-// strings.Builder  → building a final string from parts
-// bytes.Buffer     → when you need both io.Reader AND io.Writer on the same buffer
-//                    (e.g., building data to pass to an HTTP client)
-
-var buf bytes.Buffer
-json.NewEncoder(&buf).Encode(payload) // writes into buffer as Writer
-http.Post(url, "application/json", &buf) // reads from buffer as Reader
-```
-
-### Key stdlib Functions
-
-```go
-strings.Contains(s, substr)       // never index-compare manually
-strings.TrimSpace(s)              // remove \t \n \r at edges
-strings.Split(s, sep)             // returns []string; use SplitN to limit
-strings.Join(parts, sep)          // inverse of Split
-strings.ReplaceAll(s, old, new)   // replace all occurrences
-strings.ToLower / ToUpper         // locale-independent ASCII case change
-strings.HasPrefix / HasSuffix     // cleaner than s[:n] == prefix
-
-// For UTF-8 aware operations:
-utf8.RuneCountInString(s)         // number of runes (not len(s))
-utf8.ValidString(s)               // validate before processing untrusted input
-```
-
-### Footgun: String → []byte → String Allocation
-
-```go
-// Every conversion allocates — avoid in hot paths
-b := []byte(s)   // allocates
-s2 := string(b)  // allocates again
-
-// Exception: the compiler optimizes away the allocation in these specific patterns:
-m[string(b)]         // map lookup with []byte key: zero alloc
-strings.HasPrefix(s, string(b))  // comparison: zero alloc
-```
-
----
-
-## Packages & Project Layout (M2 / Architecture)
-
-> Read `references/project-layout.md` for the full Package Oriented Design guide.
-
-### The One-Line Rule
-A package must be describable in one sentence starting with its name:  
-`"Package user defines the user concept and owns its persistence and HTTP surface."`  
-If you cannot write that sentence, the package has no identity.
-
-### Never Create These Packages
-`util` · `helper` · `common` · `shared` · `models` · `types` · `base` · `manager`
-
-These are not packages — they are drawers. Every type and function that would go in `util` belongs in a package named after the concept it serves.
-
-### Files Named by Intent
-The package names the concept; the **file** names the intent. Inside a bounded context, each use case lives in its own `snake_case` file named after what it does (`login.go`, `signup.go`, `search_users.go`) and holds **one** struct with an action name (`Login`), a `NewLogin(deps...)` constructor and a single exported `Execute(ctx, in LoginInput) (LoginOutput, error)`, with its DTOs and narrow ports beside it. A file never holds two use cases.
-
-Never inside a context: `service.go` · `services.go` · `usecase.go` · `usecases.go` · `use_cases.go` · `application.go` · `app.go` · `manager.go` · `helpers.go` · `utils.go` · `common.go` · a `handler.go`/`handlers.go` serving several endpoints (transport: one file per endpoint + `routes.go`). Never the grab-bag types `Service`, `UseCase`, `Manager`. Allowed: concepts (`user.go`), `errors.go`, a shared port by name (`user_repository.go`), `store.go`, `routes.go`, and composition roots outside the contexts (`internal/handlers/handlers.go` that only mounts routes). See `references/project-layout.md` ("Nombres de Archivo por Intención").
-
-### Flat, Not Nested
-Nesting a package inside another creates **no** hierarchy and **no** encapsulation — visibility in Go is per-package, not per-folder. Only `internal/` is a compiler-enforced boundary. Default to a flat layout. See `references/project-layout.md`.
-
----
-
-## Dependencies (Stdlib-First)
-
-The standard library is the first answer. Every dependency is a liability: transitive deps, CVEs, supply-chain risk, build time, and breaking changes you don't control.
-
-Before adding one, ask whether the stdlib or `golang.org/x/...` already does it. Then audit: `go mod why <pkg>`, `go mod graph`, `govulncheck ./...`. Prefer small composable libraries over frameworks that take over control flow. See `references/dependencies-and-stdlib.md`.
-
----
-
-## Concurrency (M3 — Goroutines, Channels & Patterns)
-
-> Read `references/channels-fundamentals.md` for channel semantics (buffered vs unbuffered, `select`, the memory model, data races) and `references/concurrency-patterns.md` for pattern implementations.
-
-### Non-Negotiable Rules
-1. **Never start a goroutine without knowing how it ends** — use `context`, `done` channels, or `WaitGroup`
-2. **Never share memory by communicating** — use channels; or protect shared state with `sync.Mutex`
-3. **Always run `go test -race`** on concurrent code
-4. **Verify with `goleak`** in test teardown for goroutine leak detection
-
-### Channel Ownership
-- The goroutine that creates a channel owns closing it
-- Receivers must never close a channel
-- A closed channel can still be read (returns zero values + `ok=false`)
-
-### Context Propagation
-```go
-// ALWAYS: context is the first parameter
-func FetchUser(ctx context.Context, id int64) (*User, error) {
-    // pass ctx to every downstream call
-    return db.QueryContext(ctx, "SELECT ...", id)
+func FetchUser(ctx context.Context, db *sql.DB, id int64) (User, error) {
+	var u User
+	err := db.QueryRowContext(ctx, "SELECT id, email FROM users WHERE id = $1", id).
+		Scan(&u.ID, &u.Email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, ErrNotFound
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("fetch user %d: %w", id, err)
+	}
+	return u, nil
 }
 ```
 
-### Goroutine Leak Detection in Tests
+Concurrent work that can fail goes through `errgroup` (first error cancels the rest; `SetLimit`
+bounds parallelism); fire-and-wait without errors uses `wg.Go(func() {...})` (Go 1.25).
+
+→ `references/channels-fundamentals.md` for channel axioms, `select`, the memory model, races.
+→ `references/concurrency-patterns.md` for worker pools, pipelines, fan-in/out, semaphores,
+errgroup, rate limiting, singleflight, `sync.Pool`.
+
+## I/O and Text
+
+- `io.Reader`/`io.Writer` compose; `io.Copy(dst, src)` moves data between any pair and uses
+  `ReaderFrom`/`WriterTo` fast paths. Don't wrap it in extra layers that hide those.
+- Buffer (`bufio`) when you make many small reads or writes. A `bufio.Writer` reports earlier
+  write failures only from `Flush`, so call it and return its error instead of a bare
+  `defer bw.Flush()`; keep `Close` errors with a named result.
+- Cap untrusted input: `http.MaxBytesReader` for request bodies, `io.LimitReader` plus an
+  explicit size check elsewhere.
+- Strings are bytes: `len` counts bytes, `range` yields runes. Build strings with
+  `strings.Builder` or `strings.Join`, not `+=` in a loop; compare case-insensitively with
+  `strings.EqualFold`.
+
+→ `references/io-streams.md` for the Reader contract, `io.Pipe` with `CloseWithError`, text
+handling, `strings.Builder` vs `bytes.Buffer`.
+→ `references/stdlib-idioms.md` for ServeMux routing, middleware, server timeouts, graceful
+shutdown, JSON, slog, timers, embed, release builds.
+
+## Errors
+
+- **Wrap when it adds context** the caller lacks — the operation and the key input:
+  `fmt.Errorf("fetch user %d: %w", id, err)`. Returning `err` unchanged is fine when the current
+  function adds nothing (a thin pass-through). Use `%v` instead of `%w` when you deliberately do
+  not want callers to depend on the underlying error.
+- Inspect with `errors.Is` (sentinels) and `errors.As` / `errors.AsType[E]` (Go 1.26), never
+  `==` or type assertions: both see through wrapping.
+- Start opaque; export a sentinel (`var ErrNotFound = errors.New("user: not found")`) or a typed
+  error only when a real caller branches on it — each one becomes API.
+- Handle an error once: either log it or return it, not both.
+- Error strings are lowercase, without trailing punctuation or "failed to".
+
 ```go
-func TestMyWorker(t *testing.T) {
-    defer goleak.VerifyNone(t)
-    // ... your test
+if err := g.Wait(); err != nil { // errgroup: the first non-nil error
+	return fmt.Errorf("sync accounts: %w", err)
 }
-```
-
----
-
-## I/O & Streams (M4 — io Package)
-
-> Read `references/io-streams.md` for full coverage: io.Reader contract (all 4 scenarios), bufio, TeeReader, MultiWriter, LimitReader, io.Pipe, bytes.Buffer vs strings.Builder, and the unified model across os.File / net/http.
-
-### Three Rules to Never Break
-1. **Always buffer syscalls** — `bufio.NewReader/Writer` wrapping any file or network stream
-2. **Always `defer bw.Flush()`** — immediately after `bufio.NewWriter`, before any writes
-3. **Always `io.LimitReader`** — before reading from any external source (HTTP body, uploads)
-
-### The One-Liner Principle
-`io.Copy(dst, src)` moves data between any Reader and any Writer. If your code needs more than this for simple data movement, you're fighting the stdlib.
-
----
-
-## Error Handling (M6 — Production Go)
-
-### Wrapping — Always Add Context
-```go
-// BAD: loses context
-if err != nil {
-    return err
-}
-
-// GOOD: wraps with context, preserves chain
-if err != nil {
-    return fmt.Errorf("fetchUser id=%d: %w", id, err)
-}
-```
-
-### Inspection — Never Use ==
-```go
-// BAD: breaks with wrapped errors
-if err == sql.ErrNoRows { ... }
-
-// GOOD: traverses the error chain
-if errors.Is(err, sql.ErrNoRows) { ... }
-
-// GOOD: extract typed error
 var pgErr *pgconn.PgError
-if errors.As(err, &pgErr) {
-    fmt.Println(pgErr.Code)
+if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+	return ErrEmailTaken // translated at the adapter boundary
 }
 ```
 
-### Sentinel Errors
-```go
-// Define at package level, exported
-var ErrNotFound = errors.New("not found")
-var ErrUnauthorized = errors.New("unauthorized")
-```
+→ `references/errors-advanced.md` for opaque vs sentinel vs typed, behavior interfaces,
+`errors.Join`, panic/recover at boundaries and across goroutines.
 
-### Goroutine Errors — Use errgroup
+## Databases
+
+- Size the pool against the database's connection limit and set lifetimes; the defaults are for
+  development.
+- `defer tx.Rollback(ctx)` right after `Begin` (a no-op after `Commit`), or use
+  `pgx.BeginFunc`; retry `40001` serialization failures as a whole transaction.
+- Translate driver errors (`pgx.ErrNoRows`, `*pgconn.PgError`) into domain errors in the store
+  adapter, which lives in `<ctx>/pgstore`; ports stay small and in the consuming package.
+- With pgx, configure sqlc with `sql_package: "pgx/v5"`.
+
+→ `references/databases.md` for database/sql, pgx, sqlc, transactions, store adapters,
+migrations.
+
+## Testing
+
+- Table-driven tests with `t.Run`; since Go 1.22 the loop variable needs no copy before
+  `t.Parallel()`.
+- Test against small fakes of the consumer's port; no mocking framework needed.
+- Use `t.Context()` (Go 1.24) for test contexts; it is canceled before `t.Cleanup` runs.
+- Benchmarks use `for b.Loop()` (Go 1.24): setup before the loop is not timed and the body is
+  not optimized away.
+
 ```go
-g, ctx := errgroup.WithContext(ctx)
-g.Go(func() error { return fetchA(ctx) })
-g.Go(func() error { return fetchB(ctx) })
-if err := g.Wait(); err != nil {
-    return fmt.Errorf("pipeline: %w", err)
+func TestParseSize(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{"bytes", "512", 512},
+		{"kilobytes", "2K", 2048},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseSize(tt.in)
+			if err != nil || got != tt.want {
+				t.Errorf("ParseSize(%q) = %d, %v; want %d", tt.in, got, err, tt.want)
+			}
+		})
+	}
+}
+
+func BenchmarkParseSize(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		ParseSize("64K")
+	}
 }
 ```
 
----
+→ `references/testing-advanced.md` for TestMain, testcontainers, `testing/synctest`, fuzzing,
+golden files, and which test fits which job.
 
-## Databases (M7)
+## Security
 
-> Read `references/databases.md` for full coverage: database/sql pool internals, pgx nativo con pgxpool, sqlc workflow, transacciones con retry, Repository pattern, y migrations embebidas con go:embed.
+- Security-sensitive randomness comes from `crypto/rand` (`rand.Text()` for tokens since Go
+  1.24); `math/rand/v2` is for simulations and jitter, never for secrets.
+- Compare secrets with `subtle.ConstantTimeCompare` to avoid timing leaks.
+- Keep secrets out of code and logs: load them from the environment or a secret store, and give
+  secret types a `String`/`LogValue` that redacts.
 
-### Three Rules to Never Break
-1. **Always configure the pool** — `MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime` before first use
-2. **Always `defer tx.Rollback()`** — immediately after `BeginTx`; it's a no-op if `Commit` succeeds
-3. **Translate DB errors at the boundary** — callers receive domain errors (`ErrNotFound`), never `pgconn.PgError`
-
----
-
-## Testing (M8)
-
-### Table-Driven Tests — Canonical Form
 ```go
-func TestAdd(t *testing.T) {
-    tests := []struct {
-        name    string
-        a, b    int
-        want    int
-    }{
-        {"positive", 1, 2, 3},
-        {"negative", -1, -2, -3},
-        {"zero", 0, 0, 0},
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            t.Parallel()
-            got := Add(tt.a, tt.b)
-            if got != tt.want {
-                t.Errorf("Add(%d,%d) = %d, want %d", tt.a, tt.b, got, tt.want)
-            }
-        })
-    }
-}
-```
+token := rand.Text() // crypto/rand: 26 base32 characters, 128+ bits of entropy
 
-### Mock via Interface (No Frameworks Needed)
-```go
-type mockRepo struct {
-    users map[int64]*User
-}
-func (m *mockRepo) GetByID(_ context.Context, id int64) (*User, error) {
-    u, ok := m.users[id]
-    if !ok {
-        return nil, ErrNotFound
-    }
-    return u, nil
-}
-```
-
-### Benchmark Template
-```go
-func BenchmarkParse(b *testing.B) {
-    data := loadTestData()
-    b.ResetTimer()
-    b.ReportAllocs()
-    for range b.N {
-        Parse(data)
-    }
-}
-```
-
----
-
-## Security (M10)
-
-### Crypto Non-Negotiables
-```go
-// ALWAYS crypto/rand, NEVER math/rand for security values
-token := make([]byte, 32)
-if _, err := io.ReadFull(rand.Reader, token); err != nil {
-    return err
-}
-
-// ALWAYS subtle.ConstantTimeCompare for token comparison
-if subtle.ConstantTimeCompare(provided, stored) != 1 {
-    return ErrUnauthorized
-}
-```
-
-### Secrets — Never in Code or Logs
-```go
-// BAD
-log.Printf("connecting with password %s", password)
-
-// GOOD: redact in logs; load from env/vault
 type Secret string
-func (s Secret) String() string { return "[REDACTED]" }
+
+func (Secret) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
+func (Secret) String() string       { return "[REDACTED]" }
 ```
 
----
+## Comments
 
-## Comments — Few, Short, and About "Why"
+This skill owns the comment policy. Well-named code already says **what** it does; a comment
+earns its place by saying what the code cannot.
 
-Well-named code already says **what** it does. Generated or reviewed code must not carry more comments than code (aim for ≤ 10–15 % comment lines).
+- One-line package doc (`// Package user models accounts.`) in a single file of the package.
+- Every exported identifier gets a one-line doc comment — revive's `exported` rule requires it —
+  that starts with the name and **adds information**: units, invariants, returned errors,
+  concurrency safety. `// NewUser creates a new User.` adds nothing; say what can fail instead.
+  Unexported identifiers usually need none.
+- Inline comments explain **why**: an external constraint, a workaround with its issue link, a
+  measured performance decision. Directives (`//go:generate`, `//nolint:x // reason`) are fine.
+- No narration (`// call the repo`), banners (`// ---- Handlers ----`), commented-out code, or
+  `TODO` without an owner or issue. Design rationale goes to the README or an ADR.
+- As a rough gauge, comment lines stay around 10–15 % of a file; more usually means the names
+  need work.
 
-- **Yes:** a one-line package doc; a one-line doc comment on exported identifiers that adds what the name cannot (units, invariant, returned error, concurrency) — `revive` wants it; the non-obvious **why** (external constraint, workaround + issue, measured perf decision); directives (`//go:generate`, `//nolint:x // reason`).
-- **No:** narrating the code (`// call the repo`), restating the name (`// NewUser creates a new User.` — on unexported identifiers just omit it), banners (`// -----`, `// ==== Handlers ====`), comments longer than the code they sit on, commented-out code, `TODO` without owner or issue.
+→ `references/idioms-and-style.md` §5 for BAD/GOOD examples and `Example` tests.
 
-Design explanations go to the README or an ADR, not above every function. Full policy with BAD/GOOD: `references/idioms-and-style.md` §5.
-
----
-
-## Common Footguns — Quick Reference
+## Common Footguns
 
 | Footgun | Symptom | Fix |
 |---|---|---|
-| Interface nil | `if err != nil` is true but behavior is nil | Return untyped `nil` |
-| Closure capture (Go ≤1.21) | Loop var shared across goroutines | Shadow `x := x`; fixed by default in Go 1.22+ |
-| Goroutine leak | Memory grows unbounded | `context` + `goleak` in tests |
-| Missing `Flush()` | Buffered writes silently lost | `defer bw.Flush()` after `bufio.NewWriter` |
-| `time.After` in loop | Goroutine leak per iteration | Use `time.NewTimer` + `Reset` |
-| `==` on errors | Wrapped errors not matched | `errors.Is` / `errors.As` |
-| Wrong struct field order | Silent memory waste | Largest fields first |
-| `math/rand` for tokens | Predictable security tokens | `crypto/rand` always |
-| Nil map write | Runtime panic | `make(map[K]V)` before use |
-| Forgetting `defer tx.Rollback()` | Transaction never released on error | Always defer immediately after BeginTx |
-| `len(s)` on UTF-8 string | Counts bytes, not characters | `utf8.RuneCountInString(s)` |
-| `s[i]` on multi-byte string | Gets byte, not rune | `range s` to iterate runes |
-| String concat in loop | O(n²) allocations | `strings.Builder` with `Grow` |
-| Slice `append` aliasing | Mutating one slice changes another | Three-index `s[a:b:c]`; see value-vs-reference.md |
-| Concurrent map access | Fatal `concurrent map writes` panic | `sync.Mutex` / `sync.Map`; never share a plain map for writes |
-| `range` copies the element | `for _, v := range xs { v.X=… }` silently no-ops | Index instead: `xs[i].X = …` |
+| Typed nil in an interface | `err != nil` although the pointer is nil | Return a literal `nil` on success |
+| Goroutine without an exit | Memory and goroutine count grow | ctx / closed channel; `goleak` in tests |
+| Unchecked `bufio.Writer.Flush` | Truncated file, no error | Return `bw.Flush()`; named result for `Close` |
+| `==` on errors | Wrapped errors never match | `errors.Is` / `errors.As` / `errors.AsType` |
+| `math/rand` for tokens | Predictable secrets | `crypto/rand` (`rand.Text`) |
+| Write to a nil map | Panic | `make(map[K]V)` first |
+| Concurrent map writes | Fatal error, not recoverable | `sync.Mutex` or `sync.Map` |
+| Sub-slice `append` | Overwrites the parent's elements | Three-index slice `s[a:b:c]` or `slices.Clone` |
+| `for _, v := range xs { v.X = 1 }` | Mutation silently lost | Index: `xs[i].X = 1` |
+| `s[i]` / `len(s)` on UTF-8 | Bytes, not characters | `range s`, `utf8.RuneCountInString` |
+| `+=` on strings in a loop | Quadratic copying | `strings.Builder` / `strings.Join` |
+| `defer` in a loop | Files stay open until the function returns | Move the body into a function |
+| Missing `defer tx.Rollback` | Connection held on error paths | Defer right after `Begin` |
+| Loop-variable capture | Only on modules with `go` ≤ 1.21 | Upgrade the `go` line, or `x := x` |
 
----
+## Review Checklist
 
-## Code Review Checklist
-
-Before finalizing any Go output, verify:
-
-- [ ] `context.Context` is the first parameter in all functions that do I/O or concurrency
-- [ ] All errors are wrapped with `fmt.Errorf("...: %w", err)` and never silently dropped
-- [ ] Every goroutine has a clear termination condition
-- [ ] Interfaces are small and defined at the point of use
-- [ ] No `sync.Mutex` fields are copied (use pointer receivers)
-- [ ] `defer` used correctly for cleanup (not inside loops)
-- [ ] Buffered I/O used whenever reading/writing files or network streams
-- [ ] `go test -race` would pass
-- [ ] Compile-time interface checks present for exported types (`var _ Iface = (*T)(nil)`)
-- [ ] String iteration uses `range` (runes), not index (bytes), when handling non-ASCII
-- [ ] No package named `util`, `helper`, `common`, `models`, or `types`
-- [ ] Each package can be described in one sentence starting with its name
-- [ ] No package nesting used to fake hierarchy; dependencies form a DAG (domain defines interfaces)
-- [ ] No external dependency the stdlib or `golang.org/x/...` already covers; new deps audited with `govulncheck`
-- [ ] Value vs pointer receivers are consistent within a type; no `sync.Mutex` copied by value
-- [ ] One use case per file, named by intent (`login.go`, `search_users.go`); no `service.go`/`usecase.go`/`manager.go`/`utils.go`, no `Service`/`UseCase`/`Manager` types
-- [ ] Comments only where they add a "why" or what the name cannot say; no narration, banners or doc comments that restate the identifier
-
----
+- [ ] `context.Context` first in every function that does I/O or may block; passed, not stored
+- [ ] No error dropped silently; wrapped with `%w` where it adds context; inspected with `errors.Is/As`
+- [ ] Every goroutine has a clear exit; `go test -race` passes
+- [ ] Interfaces small and defined by the consumer; concrete types returned
+- [ ] No `sync.Mutex` copied; one receiver kind per type
+- [ ] `bufio.Writer.Flush` and `Close` errors returned; untrusted input size-capped
+- [ ] Strings handled as UTF-8 where it matters (`range`, `EqualFold`, `Builder`)
+- [ ] No `util`/`common`/`models` packages; each package describable in one sentence
+- [ ] Domain packages import no infrastructure; adapters live in subpackages
+- [ ] No dependency the stdlib or `golang.org/x/...` covers; new ones checked with `govulncheck`
+- [ ] Comments: one-line docs on exported identifiers that add information; no narration or banners
+- [ ] Modern stdlib used where it simplifies (`slices`, `maps`, `min`/`max`, `wg.Go`, `b.Loop`)
 
 ## Reference Files
 
-Read the relevant file when the user's question is specifically about that domain. Do not load all files at once.
+Open the one that matches the question; do not load them all.
 
-- `references/channels-fundamentals.md` — concurrency vs parallelism, channel axioms (nil/closed), buffered vs unbuffered, `select`, memory model / happens-before, data races
-- `references/concurrency-patterns.md` — Worker Pool, Pipeline, Fan-Out/In, Semaphore, Errgroup, Or-Done, Heartbeat, Timeout, sync.Cond, Backpressure, Rate Limiter, Singleflight, sync.Pool
-- `references/value-vs-reference.md` — pass-by-value always, slice header & `append` aliasing, map semantics, struct copy (shallow, copylocks, range copies), defensive copy
-- `references/memory-pointers.md` — stack/heap, escape analysis, value vs pointer receivers, GC pressure, cache locality, pprof / -benchmem
-- `references/interfaces-composition.md` — implicit satisfaction, consumer-defined interfaces, interface pollution, segregation, struct/interface embedding, method sets, nil-interface footgun
-- `references/idioms-and-style.md` — naming (incl. file names), useful zero value, early return, iota+Stringer, minimal-comments policy + Example tests, defer subtleties, tooling
-- `references/dependencies-and-stdlib.md` — stdlib-first, dependency auditing (`go mod why/graph`, `govulncheck`), avoiding frameworks, blessed deps
-- `references/errors-advanced.md` — sentinel vs typed vs opaque, behavior interfaces, `errors.Join`, panic/recover at boundaries
-- `references/io-streams.md` — io.Reader/Writer contract completo, bufio, TeeReader, MultiWriter, LimitReader, io.Pipe, bytes.Buffer vs strings.Builder
-- `references/databases.md` — database/sql pool, pgx nativo, sqlc workflow, transacciones con retry, Repository pattern, migrations embebidas
-- `references/stdlib-idioms.md` — net/http middleware, context patterns, OS signals, encoding, slog, time gotchas, toolchain
-- `references/project-layout.md` — Package Oriented Design, canonical structure, intent-named files (one use case per file), `cmd/` / `internal/` / `platform/` rules, nested-package avoidance, dependency direction (DAG), anti-patterns
-- `references/testing-advanced.md` — TestMain, testcontainers-go, fuzzing, golden files, test strategy pyramid
+- `references/value-vs-reference.md` — copies, slice headers and `append` aliasing, maps, shallow
+  struct copies, `copylocks`, defensive copies. Read when data changes "by itself".
+- `references/memory-pointers.md` — stack vs heap, escape analysis, receivers, GC knobs, cache
+  locality, struct padding, profiling. Read for allocation or latency work.
+- `references/interfaces-composition.md` — implicit satisfaction, consumer-defined interfaces,
+  pollution, method sets, nil-interface footgun, compile-time assertions, embedding.
+- `references/idioms-and-style.md` — naming, zero values, early return, enums, the full comment
+  policy, defer subtleties, `slices`/`maps`, tooling.
+- `references/project-layout.md` — package design, `cmd/`, `internal/`, platform packages, the
+  composition root, nesting, dependency direction.
+- `references/dependencies-and-stdlib.md` — stdlib-first, auditing modules, the `tool`
+  directive, MVS, vendoring, when a dependency is worth it.
+- `references/channels-fundamentals.md` — channel states, buffering, `select`, happens-before,
+  data races, channels vs mutexes.
+- `references/concurrency-patterns.md` — worker pool, pipeline, fan-in/out, semaphore, errgroup,
+  or-done, heartbeat, timeouts, `sync.Cond`, backpressure, rate limiting, singleflight,
+  `sync.Pool`.
+- `references/errors-advanced.md` — opaque/sentinel/typed errors, behavior interfaces,
+  `errors.Join`, panic and recover at boundaries.
+- `references/io-streams.md` — Reader/Writer contracts, bufio, composition, `io.Pipe`,
+  `io.Copy` fast paths, strings and UTF-8.
+- `references/stdlib-idioms.md` — ServeMux routing, middleware, server timeouts, context,
+  signals and graceful shutdown, JSON, slog, timers, embed, build constraints, release builds.
+- `references/databases.md` — database/sql pool, pgx, sqlc, transactions and retries, store
+  adapters, migrations.
+- `references/testing-advanced.md` — TestMain, integration tests with testcontainers,
+  `testing/synctest`, `b.Loop` benchmarks, fuzzing, golden files, test strategy.

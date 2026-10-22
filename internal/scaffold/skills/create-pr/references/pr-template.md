@@ -1,155 +1,103 @@
-# Plantilla del cuerpo del PR
+# Fallback PR body
 
-Cuerpo por defecto cuando el repo **no** trae su propia plantilla. Si existe
-`.github/PULL_REQUEST_TEMPLATE.md`, **esa manda**: úsala tal cual y rellénala; ignora esta.
+Use this only when the repo has no PR template and its recent PRs show no structure worth
+copying. Write it in the repo's language: for a Spanish repo the headings become Resumen,
+Motivación, Qué cambió, Cómo probar, Riesgo y reversa, Issues.
 
-El **título** del PR no va aquí: es Conventional Commits (`type(scope): subject`) y se pasa
-con `--title` (ver `SKILL.md`, paso 4). Esta plantilla es solo el `--body-file`.
+## Template
 
----
+~~~markdown
+## Summary
 
-## Plantilla (copiar y rellenar)
+<!-- One or two lines: what this PR does. -->
 
-```markdown
-## Resumen
+## Why
 
-<!-- 1-2 líneas: qué hace este PR, en cristiano. -->
+<!-- The problem it solves, the issue that asked for it, design decisions taken. -->
 
-## Motivación & contexto
+## What changed
 
-<!-- El PORQUÉ. Qué problema resuelve, qué issue lo pide, qué decisión de diseño hubo. -->
-
-## Qué cambió
-
-<!-- Bullets, uno por cambio relevante. Salen de los subjects de los commits. -->
 -
 
-## Cómo probar
+## How to test
 
-<!-- Pasos o comandos exactos para que el revisor lo verifique localmente. -->
 ```bash
 
 ```
 
-## Riesgo & rollout
+## Risk and rollback
 
-<!-- Blast radius (qué se rompe si esto falla), feature flags, migraciones de datos/BD,
-     y el plan de reversa (cómo se revierte). -->
 - **Blast radius:**
-- **Feature flags:**
-- **Migraciones:**
-- **Plan de reversa:**
+- **Migrations / flags:**
+- **Rollback:**
 
-## Screenshots / demos
+## Issues
 
-<!-- Solo si toca UI: antes/después, GIF o captura. Si no aplica: "N/A". -->
-
-## Issues vinculados
-
-<!-- `Closes #N` cierra el issue al mergear; `Refs #N` solo lo referencia. -->
 Closes #
+~~~
 
-## Checklist
+Drop sections that do not apply (nothing to link → no Issues section) rather than leaving
+them empty, and add a Screenshots section only when the PR changes UI.
 
-- [ ] Tests añadidos/actualizados y en verde
-- [ ] Docs/README actualizados si hacía falta
-- [ ] Self-review hecho (leí mi propio diff)
-- [ ] CI en verde
-- [ ] Sin secretos ni credenciales en el diff
-```
+## Filling each section
 
----
+With `BASE_REF` set as in SKILL.md (fetched base, e.g. `origin/main`):
 
-## Cómo autocompletar cada sección
-
-Define primero el rango contra la base (ver `SKILL.md`, pasos 3-5):
-
-```bash
-BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
-BRANCH=$(git branch --show-current)
-```
-
-| Sección | De dónde sale | Comando |
+| Section | Source | Command |
 |---|---|---|
-| **Resumen** | Síntesis en 1-2 líneas del conjunto de commits | `git log "origin/$BASE..$BRANCH" --pretty=format:'%s'` |
-| **Motivación & contexto** | El cuerpo de los commits (el porqué) + el issue vinculado | `git log "origin/$BASE..$BRANCH" --pretty=format:'%b'` |
-| **Qué cambió** | Un bullet por subject de commit | `git log "origin/$BASE..$BRANCH" --pretty=format:'- %s'` |
-| **Cómo probar** | Comandos reales del repo (tests, build, run) según lo tocado | inferir del diff: `git diff "origin/$BASE...$BRANCH" --stat` |
-| **Riesgo & rollout** | Archivos tocados (blast radius), migraciones, flags | `git diff "origin/$BASE...$BRANCH" --stat` y buscar migraciones/flags en el diff |
-| **Screenshots / demos** | Solo si el diff toca UI (`.tsx`, `.vue`, `.css`, plantillas) | `git diff "origin/$BASE...$BRANCH" --stat` → si no hay UI, "N/A" |
-| **Issues vinculados** | Footers `Closes #N`/`Refs #N` de los commits | `git log "origin/$BASE..$BRANCH" --pretty=format:'%b' \| grep -iE 'closes\|refs #'` |
+| Summary | Synthesis of the commits, not a dump | `git log "$BASE_REF"..HEAD --format=%s` |
+| Why | Commit bodies plus the linked issue | `git log "$BASE_REF"..HEAD --format=%b` |
+| What changed | One bullet per meaningful change | `git log "$BASE_REF"..HEAD --format='- %s'` |
+| How to test | Real commands for what was touched (tests, build, a curl) | `git diff "$BASE_REF"...HEAD --stat` |
+| Risk and rollback | Files touched, migrations, flags, contract changes | `git diff "$BASE_REF"...HEAD` |
+| Issues | `Closes`/`Refs` footers in the commits | `git log "$BASE_REF"..HEAD --format=%b \| grep -iE '(closes\|fixes\|refs) #'` |
 
-Recuerda: **`..`** (dos puntos) para el **log** de commits; **`...`** (tres puntos) para el
-**diff** contra el merge-base con la base. Reglas del contenido:
+Two dots for the commit log (commits on the branch), three dots for the diff (against the
+merge base, so unrelated changes that landed on the base do not show up).
 
-- **Resumen** conciso y en presente ("Añade…", "Corrige…"), no un volcado de commits.
-- **Cómo probar** con comandos que el revisor pueda copiar-pegar; nada de "probar la app".
-- **Riesgo & rollout**: si no hay migraciones/flags, dilo explícito ("Sin migraciones",
-  "Sin flags"); el plan de reversa suele ser "revert del merge" salvo que haya migración de
-  datos irreversible (entonces detállalo).
-- **Nunca** metas secretos, tokens ni `.env` en ninguna sección.
+Guidance:
 
----
+- "How to test" lists commands a reviewer can paste, not "test the app".
+- When there are no migrations or flags, say so; the rollback is usually "revert the
+  merge commit" unless a data migration makes that unsafe, in which case explain.
+- Never include secrets, tokens or `.env` contents.
 
-## Ejemplo completo (ya rellenado)
+## Example
 
-Cambio de ejemplo: se añade un endpoint de refresh de tokens porque las sesiones expiraban
-en silencio. Dos commits en la rama `feat/auth-refresh`:
-`feat(auth): add token refresh endpoint` y `test(auth): cover refresh happy path`.
+Branch `feat/auth-refresh`, commits `feat(auth): add token refresh endpoint` and
+`test(auth): cover refresh happy path`.
 
-**Título del PR:** `feat(auth): add token refresh endpoint`
+**Title:** `feat(auth): add token refresh endpoint`
 
-**Cuerpo (`--body-file`):**
+~~~markdown
+## Summary
 
-```markdown
-## Resumen
+Adds `POST /auth/refresh` so clients renew access tokens without a full re-login.
 
-Añade un endpoint `POST /auth/refresh` para renovar tokens de acceso sin forzar un
-re-login completo.
+## Why
 
-## Motivación & contexto
+Sessions expired silently after one hour and users were bounced to the login page
+mid-flow. Design agreed in #142.
 
-Las sesiones expiraban en silencio tras 1h y el cliente no tenía forma de renovar el token:
-el usuario era expulsado a la pantalla de login a mitad de flujo. Este PR introduce un
-refresh token de vida corta y el endpoint que lo canjea por un nuevo access token. Diseño
-acordado en el issue #142.
+## What changed
 
-## Qué cambió
+- New refresh endpoint backed by the existing `sessions` table
+- Tests for the happy path and an expired refresh token
 
-- feat(auth): add token refresh endpoint
-- test(auth): cover refresh happy path
-
-## Cómo probar
+## How to test
 
 ```bash
 go test ./internal/auth/...
-# Manual, con el server levantado:
-curl -sS -X POST localhost:8080/auth/refresh \
-  -H 'Authorization: Bearer <refresh-token>' | jq .access_token
+curl -sS -X POST localhost:8080/auth/refresh -H 'Authorization: Bearer <refresh-token>'
 ```
 
-## Riesgo & rollout
+## Risk and rollback
 
-- **Blast radius:** aislado a `internal/auth`; el resto de endpoints no cambia. Si el
-  refresh falla, el cliente cae al login actual (comportamiento previo).
-- **Feature flags:** ninguno; el endpoint es aditivo y opt-in desde el cliente.
-- **Migraciones:** ninguna (los refresh tokens se guardan en la tabla `sessions` existente,
-  sin cambio de esquema).
-- **Plan de reversa:** revert del merge commit; no hay estado persistido incompatible.
+- **Blast radius:** limited to `internal/auth`; if refresh fails, clients fall back to login.
+- **Migrations / flags:** none.
+- **Rollback:** revert the merge commit.
 
-## Screenshots / demos
-
-N/A (cambio de backend, sin UI).
-
-## Issues vinculados
+## Issues
 
 Closes #142
-
-## Checklist
-
-- [x] Tests añadidos/actualizados y en verde
-- [x] Docs/README actualizados si hacía falta
-- [x] Self-review hecho (leí mi propio diff)
-- [x] CI en verde
-- [x] Sin secretos ni credenciales en el diff
-```
+~~~

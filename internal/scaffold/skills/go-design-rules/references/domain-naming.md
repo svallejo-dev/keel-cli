@@ -1,116 +1,108 @@
-# Domain & Semantic Naming — Go Design Rules
+# Domain and Semantic Naming
 
-Cómo el modelo de tipos de Go convierte los nombres del dominio en garantías del
-compilador. Estándar hoy Go 1.26; snippets verificados contra el toolchain 1.24.7.
+How Go's type system turns domain names into compiler guarantees. There is no conflict with
+Go idioms here: named types and enums *are* the idiomatic form.
 
-> **Regla #0.** Ante conflicto entre un principio de diseño y un idiom de Go, gana
-> el idiom de Go. Aquí no hay conflicto: los named types y los enums *son* la forma
-> idiomática. Las skills compañeras `senior-go-idiomatic` y `ddd-go-idiomatic`
-> profundizan en el estilo léxico y en el modelado táctico de dominio.
+## 1. The two layers of naming
 
----
+Naming in Go has two independent layers:
 
-## 1. Las dos capas del naming
+- **Lexical** (how an identifier is written): MixedCaps, no stutter (`http.Server`, not
+  `http.HTTPServer`), no `Get` prefix on getters, short consistent receivers. That is
+  general Go style, covered by the `senior-go-idiomatic` skill.
+- **Semantic / domain** (what an identifier represents): what a `UserID` is, why `Status` is
+  not a `string`, why a method is called `Withdraw` and not `SetBalance`. **This file covers
+  this layer.**
 
-El naming en Go tiene dos capas independientes:
+The rule that joins them: the compiler should understand your domain as well as the reader
+does. A good name resting on a primitive type wastes half the work.
 
-- **Léxica** (cómo se escribe el identificador): MixedCaps, sin stutter
-  (`http.Server`, no `http.HTTPServer`), sin prefijo `Get` en getters, receivers
-  cortos y consistentes. Es territorio de las convenciones canónicas de Go y vive
-  en la skill compañera de idioms; no se repite aquí.
-- **Semántica / de dominio** (qué representa el identificador): qué es un `UserID`,
-  por qué `Status` no es un `string`, por qué un método se llama `Withdraw` y no
-  `SetBalance`. **Esta capa es la que cubre este archivo.**
+## 2. Named types over primitives
 
-La regla que une ambas: el compilador debe entender tu dominio tanto como el lector.
-Un nombre bueno que descansa sobre un tipo primitivo desperdicia la mitad del trabajo.
-
----
-
-## 2. Named types sobre primitivos
-
-Un `int64` que es un identificador de cuenta y otro `int64` que es dinero son, para
-el compilador, el mismo tipo: intercambiables sin aviso. Un **named type** los separa.
+An `int64` that identifies an account and another `int64` that is money are, to the compiler,
+the same type: interchangeable without warning. A **named type** separates them.
 
 ```go
-type UserID int64
-type AccountID int64
-type ProductID int64
-type Cents int64
-type Email string
+type (
+	UserID    int64
+	AccountID int64
+	ProductID int64
+	Cents     int64
+)
 ```
 
-La firma pasa de opaca a **self-documenting**, y el compilador caza el *parameter-swap*
-en tiempo de compilación en vez de en producción.
+The signature goes from opaque to self-documenting, and the compiler catches the
+*parameter swap* at build time instead of in production.
 
 ```go
-// BAD: cuatro int64 en fila; nada impide cruzar from/to ni pasar un ID como monto.
+// BAD: three int64 in a row; nothing stops crossing from/to or passing an ID as an amount.
 func Transfer(from, to int64, amount int64) error { /* ... */ }
 
-Transfer(toAcct, fromAcct, balance) // compila feliz aunque from/to estén cruzados
-```
+Transfer(toAcct, fromAcct, balance) // compiles happily with from/to swapped
 
-```go
-// GOOD: cada argumento tiene su tipo de dominio; el orden equivocado no compila.
+// GOOD: each argument has its domain type; the wrong order does not compile.
 func Transfer(from, to AccountID, amount Cents) error { /* ... */ }
 ```
 
-**Los named types NO son intercambiables aunque compartan el tipo base**: hay que
-convertir explícito (`AccountID(x)`). Eso no es fricción, es la feature — el mismo muro
-que impide el bug. Pasar un `ProductID` donde va un `CustomerID` es un error de compilación:
+Named types with the same underlying type **are not interchangeable**; you convert
+explicitly (`AccountID(x)`). That is not friction, it is the feature: the same wall that
+stops the bug.
 
 ```go
-type CustomerID int64
-type ProductID int64
-
-func Lookup(c CustomerID) { /* ... */ }
-
 var p ProductID = 42
-Lookup(p) // no compila
+Lookup(p) // Lookup(c CustomerID): does not compile
+// cannot use p (variable of int64 type ProductID) as CustomerID value in argument to Lookup
 ```
 
-```text
-./badswap.go:10:9: cannot use p (variable of int64 type ProductID)
-    as CustomerID value in argument to Lookup
-```
+| Primitive signature | With named types | What the compiler gains |
+| --- | --- | --- |
+| `Transfer(from, to int64, amt int64)` | `Transfer(from, to AccountID, amt Cents)` | Catches argument swaps and ID↔money mixups |
+| `Charge(cust int64, amt int64)` | `Charge(cust CustomerID, amt Cents)` | Catches customer↔amount swaps |
+| `Send(to string)` | `Send(to Email)`, `Email` a struct VO | Only addresses that passed `NewEmail` reach `Send` |
 
-| Firma primitiva                          | Firma con named types                       | Qué gana el compilador           |
-| ---------------------------------------- | ------------------------------------------- | -------------------------------- |
-| `Transfer(from, to int64, amt int64)`    | `Transfer(from, to AccountID, amt Cents)`   | Caza swap de args y ID↔dinero    |
-| `Charge(cust int64, amt int64)`          | `Charge(cust CustomerID, amt Cents)`        | Caza swap cust↔monto             |
-| `Send(to string)`                        | `Send(to Email)`                            | `Email` no acepta cualquier str  |
+### Named type vs value object
 
-Regla: si un primitivo cruza una frontera de función y representa un concepto del
-dominio (identidad, dinero, unidad, dirección), dale un named type. La conversión
-explícita es el punto exacto donde validas o construyes el valor.
-
----
-
-## 3. Muerte al stringly-typed
-
-**Stringly-typed** es modelar con `string` (o `int` crudo) algo que tiene un conjunto
-cerrado de valores: estados, tipos, monedas, unidades. Las comparaciones se vuelven
-frágiles —literales dispersos por el código, typos que el compilador no ve— y el
-conjunto válido no está en ninguna parte del tipo.
+A defined type names a concept; it does **not** validate it. With `type Email string`:
 
 ```go
-// BAD: status como string. "actve" compila; el set válido no existe en el tipo.
+Send("garbage")    // compiles: an untyped string constant converts implicitly to Email
+Send(Email(input)) // compiles in any package: explicit conversion skips any constructor
+```
+
+That is fine for `UserID` or `Cents`, where every underlying value is acceptable and the goal
+is to stop swaps. When the value has an invariant (a well-formed email, a currency, a
+percentage), make it a struct with an unexported field and a constructor
+`NewEmail(raw string) (Email, error)`; see [illegal-states.md](illegal-states.md) §2.
+
+Rule: if a primitive crosses a function boundary and represents a domain concept (identity,
+money, unit, address), give it a named type, and give it a validating constructor when it has
+rules.
+
+## 3. Kill stringly-typed state
+
+**Stringly-typed** code models with `string` (or a raw `int`) something that has a closed set
+of values: states, kinds, currencies, units. Comparisons become fragile (literals scattered
+around, typos the compiler cannot see) and the valid set lives nowhere in the type.
+
+```go
+// BAD: status as a string. "actve" compiles; the valid set is not in the type.
 type Order struct{ status string }
 
 func (o *Order) IsOpen() bool {
-	return o.status == "pending" || o.status == "paid" // literales frágiles
+	return o.status == "pending" || o.status == "paid"
 }
 ```
 
-La cura es un named type con **enum vía `iota`** (ver también la referencia de estilo
-para el patrón `iota` + `Stringer`):
+The cure is a named type with an **`iota` enum**:
 
 ```go
-// GOOD: Status es un tipo cerrado; el compilador y el reader ven el set completo.
+// Status is the closed set of order states.
 type Status uint8
 
+// Order states; the zero value is deliberately not a real state (see illegal-states.md §3).
 const (
-	StatusPending Status = iota
+	StatusUnknown Status = iota
+	StatusPending
 	StatusPaid
 	StatusShipped
 	StatusCancelled
@@ -132,196 +124,133 @@ func (s Status) String() string {
 }
 ```
 
-Ahora `o.status == StatusPaid` es type-safe, un typo no compila, y `String()` da
-logging legible sin exponer el `uint8` interno. El mismo criterio aplica a `Currency`,
-`Unit`, `Role`: conjunto cerrado ⇒ named type, nunca `string` suelto.
+Now `o.status == StatusPaid` is type-safe, a typo does not compile, and `String()` gives
+readable logs. The same applies to `Currency`, `Unit`, `Role`: closed set ⇒ named type, never
+a loose `string`.
 
----
+## 4. Kill boolean blindness
 
-## 4. Muerte al boolean blindness
-
-**Boolean blindness** es perder la información en el call site: `true`/`false` no dicen
-qué activan, y dos bools contiguos se cruzan sin que el compilador avise —el mismo
-*parameter-swap* del §2, pero peor porque `bool` no admite named-type-mismatch si los
-declaras `bool` a secas.
+**Boolean blindness** loses information at the call site: `true`/`false` do not say what they
+switch on, and two adjacent bools swap silently.
 
 ```go
-// BAD: ¿qué es true? ¿qué es false? ¿y si los inviertes?
+// BAD: what is true? what is false? what if you swap them?
 func Charge(amount Cents, recurring, refundable bool) error { /* ... */ }
 
-Charge(500, true, false) // ilegible, y Charge(500, false, true) compila igual
+Charge(500, true, false) // unreadable, and Charge(500, false, true) compiles too
 ```
 
-Tres salidas idiomáticas, de menor a mayor peso:
+Three idiomatic ways out, from lightest to heaviest:
 
-**a) Named bool types** — legibilidad en el call site y mismatch de tipos:
+**a) Named bool types**: readable call site and type mismatch on swap.
 
 ```go
-type Recurring bool
-type Refundable bool
+type (
+	Recurring  bool
+	Refundable bool
+)
 
 func Charge(amount Cents, recurring Recurring, refundable Refundable) error { /* ... */ }
 
-Charge(500, Recurring(true), Refundable(false)) // el nombre viaja al call site
+Charge(500, Recurring(true), Refundable(false))
 ```
 
-**b) Enum** cuando el flag es en realidad un modo con más de dos valores hoy o mañana
-(`BillingMode` en vez de `recurring bool`) — evita el segundo bool que siempre llega.
+**b) An enum** when the flag is really a mode that has, or will have, more than two values
+(`BillingMode` instead of `recurring bool`); it avoids the second bool that always arrives.
 
-**c) Functional options** cuando hay varios flags opcionales; el default es el zero value
-y cada opción se nombra:
+**c) Functional options** when there are several optional flags; the default is the zero
+value and each option has a name:
 
 ```go
-// GOOD: cada bit de configuración es una opción con nombre; el default no requiere flags.
+// ChargeOption tweaks one charge setting; the zero config is a one-off, non-refundable charge.
 type ChargeOption func(*chargeConfig)
 
-func WithRecurring() ChargeOption  { return func(c *chargeConfig) { c.recurring = true } }
+// WithRecurring bills the amount every period.
+func WithRecurring() ChargeOption { return func(c *chargeConfig) { c.recurring = true } }
+
+// WithRefundable allows a later refund.
 func WithRefundable() ChargeOption { return func(c *chargeConfig) { c.refundable = true } }
 
-ChargeOpts(500, WithRecurring()) // se lee solo; refundable queda en su default
+func Charge(amount Cents, opts ...ChargeOption) error { /* ... */ }
+
+Charge(500, WithRecurring()) // reads on its own; refundable keeps its default
 ```
 
-Regla: un `bool` desnudo en una firma pública es una señal de humo. Nómbralo, vuélvelo
-enum, o hazlo option.
+Rule: a bare `bool` in a public signature is a smell. Name it, make it an enum, or make it an
+option.
 
----
+## 5. Methods named by intent
 
-## 5. Métodos con verbo de intención
-
-El nombre de un método debe revelar la **operación de negocio**, no la mutación mecánica
-de un campo. `SetStatus(StatusCancelled)` describe cómo cambia la memoria; `Cancel()`
-describe qué pasó en el dominio —y encapsula la regla de negocio y los invariantes.
+A method name should reveal the **business operation**, not the mechanical mutation of a
+field. `SetStatus(StatusCancelled)` describes how memory changes; `Cancel()` describes what
+happened in the domain, and owns the rule.
 
 ```go
-// BAD: setters CRUD; el llamador arma la transición a mano y puede violar reglas.
-func (a *Account) SetBalance(c Cents)  { a.balance = c }
-func (a *Account) SetStatus(s Status)  { a.status = s }
+// BAD: CRUD setters; the caller assembles the transition and can break the rules.
+func (a *Account) SetBalance(c Cents) { a.balance = c }
+func (a *Account) SetStatus(s Status) { a.status = s }
 
-a.SetBalance(a.Balance() - amount) // ¿validó saldo? ¿quién garantiza el invariante?
+a.SetBalance(a.Balance() - amount) // who checked the balance? who guards the invariant?
 ```
 
 ```go
-// GOOD: el método nombra la intención y es dueño de la regla.
+// Withdraw fails with ErrInsufficientFunds instead of going negative.
 func (a *Account) Withdraw(amount Cents) error {
 	if amount > a.balance {
-		return errInsufficient
+		return ErrInsufficientFunds
 	}
 	a.balance -= amount
 	return nil
 }
 
+// Cancel moves the account to its terminal state.
 func (a *Account) Cancel() { a.status = StatusCancelled }
 ```
 
-Verbos de intención típicos: `Withdraw`, `Deposit`, `Confirm`, `Cancel`, `Promote`,
-`Approve`, `Ship`. Cada uno es un punto único donde vive la validación; los `Set*`
-la reparten entre todos los call sites. Los getters sí existen (`Balance()`, `Status()`),
-pero los mutadores se nombran por la operación de negocio, no por el campo.
-Esto entronca con la regla de acoplar comportamiento al estado que lo gobierna
-(ver `references/coupling-behavior.md`).
+Typical intent verbs: `Withdraw`, `Deposit`, `Confirm`, `Cancel`, `Promote`, `Approve`,
+`Ship`. Each one is a single place where validation lives; `Set*` spreads it across every
+call site. Getters still exist (`Balance()`, `Status()`), but mutators are named after the
+business operation, not the field. This is Tell-Don't-Ask from the method's side
+([coupling-behavior.md](coupling-behavior.md) §3).
 
----
+## 6. The package name is vocabulary
 
-## 6. El nombre del paquete es vocabulario
+A package's name prefixes every symbol it exports (`order.Status`, `billing.Charge`): it is
+part of the name and therefore part of the domain vocabulary. A package should **name a
+concept**, not a miscellany.
 
-El identificador de un paquete se antepone a cada símbolo que exporta (`order.Status`,
-`billing.Charge`): es parte del nombre y, por tanto, parte del vocabulario del dominio.
-Un paquete debe **nombrar un concepto**, no una miscelánea.
+| BAD | Why | GOOD |
+| --- | --- | --- |
+| `util`, `common` | Name nothing; attract unrelated code | `order`, `billing` |
+| `helpers`, `shared` | A drawer; symbols gain no context | `pricing`, `auth` |
+| `models`, `types` | Group by mechanics, not by concept | `account`, `invoice` |
 
-| BAD                 | Por qué                                        | GOOD                 |
-| ------------------- | ---------------------------------------------- | -------------------- |
-| `util`, `common`    | No nombran nada; atraen basura sin cohesión    | `order`, `billing`   |
-| `helpers`, `shared` | Cajón de sastre; el símbolo no gana contexto   | `pricing`, `auth`    |
-| `models`, `types`   | Agrupan por mecánica, no por concepto          | `account`, `invoice` |
+If a package is called `util`, the right question is not how to rename it but which concept
+each symbol in it belongs to. Package and symbol read together: `order.New`, not
+`models.NewOrderModel`.
 
-Si un paquete se llama `util`, la pregunta correcta no es cómo renombrarlo sino a qué
-concepto pertenece cada símbolo que contiene. El nombre del paquete y el del símbolo
-se leen juntos: `order.New`, no `models.NewOrderModel`.
+## 7. File names
 
----
+How to name files and where use cases go inside a bounded context (one use case per file,
+no `service.go`) is owned by the `ddd-go-idiomatic` skill.
 
-## 7. El nombre del archivo es intención
+## 8. Named types as the foundation of legal states
 
-Dentro de un paquete, el nombre del **archivo** cumple el mismo papel que el del
-paquete: dice qué hay dentro antes de abrirlo. En un bounded context, **cada caso de
-uso vive en su propio archivo, nombrado por lo que hace** (snake_case, verbo + objeto),
-y cada concepto de dominio en el archivo del concepto. Un archivo nunca agrupa dos
-casos de uso.
-
-| BAD (archivo cajón)                                   | Por qué                                         | GOOD                                       |
-| ----------------------------------------------------- | ----------------------------------------------- | ------------------------------------------ |
-| `service.go` con `Login()` y `Signup()`               | Dos intenciones; el nombre no dice ninguna      | `login.go`, `signup.go`                    |
-| `usecase.go` / `usecases.go` / `use_cases.go`         | Nombra la capa, no la acción                    | `search_users.go`, `register_user.go`      |
-| `application.go` / `app.go`                           | Capa técnica disfrazada de archivo              | un archivo por caso de uso                 |
-| `manager.go`, `helpers.go`, `utils.go`, `common.go`   | Miscelánea; atrae código sin cohesión           | el archivo del concepto al que pertenece   |
-| `handler.go` / `handlers.go` con varios endpoints     | Mezcla transporte de varios casos de uso        | `register_user.go` por endpoint + `routes.go` |
-
-Permitidos porque nombran algo concreto: `user.go`, `email.go` (conceptos),
-`errors.go` (errores del dominio), `user_repository.go` (un puerto compartido),
-`routes.go` (montaje del transporte). Fuera de los contextos, un composition root como
-`internal/handlers/handlers.go` es aceptable: su única intención es montar rutas.
-
-El tipo sigue al archivo: un struct por caso de uso con nombre de acción y un único
-método exportado. Prohibidos los tipos cajón `Service`, `UseCase`, `Manager`.
-
-```go
-// BAD: internal/identity/service.go — dos casos de uso en un tipo y un archivo.
-type Service struct{ users Users; tokens Tokens }
-
-func (s *Service) Login(ctx context.Context, in LoginInput) (LoginOutput, error)   { /* ... */ }
-func (s *Service) Signup(ctx context.Context, in SignupInput) (SignupOutput, error) { /* ... */ }
-```
-
-```go
-// GOOD: internal/identity/login.go
-type Login struct {
-	users  userFinder
-	tokens tokenIssuer
-}
-
-func NewLogin(users userFinder, tokens tokenIssuer) *Login {
-	return &Login{users: users, tokens: tokens}
-}
-
-func (uc *Login) Execute(ctx context.Context, in LoginInput) (LoginOutput, error) {
-	/* ... */
-}
-```
-
-`Signup` vive en `signup.go` con su propio struct, sus DTOs (`SignupInput`,
-`SignupOutput`) y los puertos estrechos que usa. El listado del directorio pasa a ser el
-índice de lo que el contexto sabe hacer: `ls internal/identity` responde "¿qué casos de
-uso hay?" sin abrir nada.
-
----
-
-## 8. Named types como fundamento de estados legales
-
-Named types y enums no solo documentan: son la primera herramienta para **volver
-imposibles los estados inválidos**. Un `Status uint8` con `iota` acota el conjunto de
-estados representables; un `Email` construido por una función de validación garantiza
-que todo valor del tipo ya pasó por esa puerta. Llevar esto hasta hacer los estados
-ilegales *no representables* (constructores que validan, tipos suma, campos privados)
-es el tema de `references/illegal-states.md`. El naming semántico es el punto de entrada:
-sin named types no hay dónde colgar el invariante.
-
-El principio se apoya además en `references/dependencies.md` (dónde inyectar la
-construcción validada) y en `references/dry-solid-go.md` (un named type es también el
-lugar natural para no repetir la lógica de validación).
-
----
+Named types and enums do more than document: they are the first tool for **making invalid
+states impossible**. A `Status uint8` with `iota` bounds the representable states; an `Email`
+struct built only by a validating constructor guarantees every value passed that gate. Taking
+this all the way (validating constructors, sum types, unexported fields) is the topic of
+[illegal-states.md](illegal-states.md). Semantic naming is the entry point: without named
+types there is nowhere to hang the invariant.
 
 ## Checklist
 
-- [ ] Identidad, dinero, unidades y direcciones son named types, no `int64`/`string` crudos
-- [ ] Named types se convierten explícito en la frontera donde se validan/construyen
-- [ ] El *parameter-swap* de IDs o de ID↔dinero es error de compilación, no bug de runtime
-- [ ] Estados/tipos/monedas cerrados son enums con `iota` + `String()`, cero strings mágicos
-- [ ] Cero `bool` desnudos en firmas públicas: named bool type, enum o functional option
-- [ ] Mutadores nombran la operación de negocio (`Withdraw`, `Cancel`), no el campo (`SetBalance`)
-- [ ] Cada método de intención es el dueño único de su validación/invariante
-- [ ] Paquetes nombran un concepto (`order`, `billing`); cero `util`/`common`/`helpers`/`models`
-- [ ] Un archivo por caso de uso, nombrado por su intención (`login.go`, `search_users.go`); cero `service.go`/`usecase.go`/`manager.go`/`utils.go`
-- [ ] Ningún archivo ni tipo agrupa dos casos de uso; cero tipos cajón `Service`/`UseCase`/`Manager`
-- [ ] El invariante cuelga del named type; el estado ilegal tiende a no ser representable
-- [ ] Regla #0: si un principio choca con un idiom de Go, gana el idiom
+- [ ] Identity, money, units and addresses are named types, not raw `int64`/`string`.
+- [ ] Values with rules are struct VOs with a constructor; a plain `type X string` only names, it does not validate.
+- [ ] Named types are converted explicitly at the boundary where they are parsed or built.
+- [ ] Swapping IDs or ID↔money is a compile error, not a runtime bug.
+- [ ] Closed sets (states, kinds, currencies) are `iota` enums with `String()`; no magic strings.
+- [ ] No bare `bool` in public signatures: named bool type, enum or functional option.
+- [ ] Mutators name the business operation (`Withdraw`, `Cancel`), not the field (`SetBalance`).
+- [ ] Each intent method is the single owner of its validation.
+- [ ] Packages name a concept (`order`, `billing`); no `util`/`common`/`helpers`/`models`.

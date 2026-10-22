@@ -1,50 +1,76 @@
-# Aggregates — DDD Táctico al Estilo Idiomático de Go
+# Aggregates
 
-> **Regla #0 — ante conflicto DDD ↔ Go idiomático, gana Go.** El aggregate no es una
-> jerarquía de clases con getters/setters ni un `AggregateRoot<T>` abstracto. Es un
-> struct con un límite que **el propio compilador** hace cumplir. Nada de Java-ismos.
+## Contents
 
-Esta referencia trata el **root** y el **límite de consistencia**. La mecánica interna de
-la entidad (identidad, ciclo de vida, igualdad) vive en
-[`entities.md`](entities.md); los VOs en [`value-objects.md`](value-objects.md); la
-transacción y el repositorio en [`application-layer.md`](application-layer.md).
+1. Definition
+2. In Go, package privacy is the boundary (`Order` with `AddLine`, `RemoveLine`, `Total`)
+3. One aggregate per transaction; reference others by ID
+4. Invariants (domain) vs authorization (use case `AddOrderLine`)
+5. Do not expose mutable internals
+6. Avoid premature aggregates
 
-Toolchain: Go 1.26 estándar; suite de verificación fijada a 1.24.7.
+An aggregate is not a class hierarchy with getters/setters or an abstract
+`AggregateRoot<T>`. In Go it is a struct whose boundary **the compiler enforces**. When a DDD
+habit and a Go idiom disagree, the Go idiom wins.
 
----
+This file covers the **root** and the **consistency boundary**. Entity mechanics (identity,
+equality) live in [entities.md](entities.md), VOs in [value-objects.md](value-objects.md),
+transactions and repositories in [application-layer.md](application-layer.md).
 
-## 1. Definición
+## 1. Definition
 
-Un **aggregate** es un clúster de entidades y value objects tratado como una sola unidad a
-efectos de cambios de datos. Tiene dos propiedades que lo definen:
+An **aggregate** is a cluster of entities and value objects treated as one unit for data
+changes. Two properties define it:
 
-- Un **límite de consistencia** (consistency boundary): el conjunto de datos que debe estar
-  consistente **de forma síncrona** tras cada operación.
-- Un **aggregate root**: la entidad que es la **única puerta de entrada válida** al clúster.
-  Toda operación de crear/actualizar/borrar sobre los internos pasa por el root.
+- A **consistency boundary**: the data that must be consistent **synchronously** after every operation.
+- An **aggregate root**: the entity that is the **only valid entry point** to the cluster.
+  Every create/update/delete of the internals goes through it.
 
-Regla operativa: **nunca** referencias, cargas o mutas una entidad interna directamente. Si
-quieres cambiar una línea de un pedido, se lo pides al pedido, no a la línea. El root es
-quien garantiza que ninguna mutación deja el clúster en un estado que viole una invariant.
+You never reference, load or mutate an internal entity directly. To change an order line,
+ask the order, not the line; the root guarantees no mutation leaves the cluster violating an
+invariant.
 
----
+## 2. In Go, package privacy is the boundary
 
-## 2. Realización en Go: la privacidad de paquete ES el límite
+In most OO languages the boundary depends on discipline: nothing stops a service from calling
+`order.getLines().add(...)`. In Go it is **structural**: internals live in **unexported**
+fields of the root, and package visibility stops any outside code from building or mutating
+them. "Please don't touch this" becomes "the compiler won't let you".
 
-En la mayoría de lenguajes OO el límite del aggregate depende de **disciplina**: nada impide
-que un `orderService` haga `order.getLines().add(...)` y se salte las invariants. En Go el
-límite es **estructural**: las sub-entidades y VOs viven en campos **no-exportados** del
-root, y la visibilidad por paquete impide que cualquier código externo los construya o mute.
+`Money` is the value object from [value-objects.md](value-objects.md) (`NewMoney`, `Add`,
+`Times`), plus `Cents()` and `Currency()` accessors.
 
-> Regla → el interior del aggregate va en campos no-exportados; solo métodos exportados del
-> root lo tocan. Por qué → convierte "por convención no toques esto" en "el compilador no te
-> deja". Es una ventaja real, no un truco de estilo.
-
-`orderLine` no se exporta: fuera del paquete no existe como tipo construible. `lines` es privado,
-así que el límite del aggregate es el paquete.
+**internal/order/order.go**
 
 ```go
+// Package order is the ordering bounded context.
 package order
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+)
+
+// Errors returned when an operation would break an Order invariant.
+var (
+	ErrIncompleteOrder = errors.New("order: id, customer and currency are required")
+	ErrDuplicateLine   = errors.New("order: SKU already in the order")
+	ErrLineNotFound    = errors.New("order: SKU not in the order")
+	ErrNonPositive     = errors.New("order: quantity must be > 0")
+)
+
+// OrderID identifies an Order.
+type OrderID string
+
+// CustomerID points at a customer aggregate by identity, never by pointer.
+type CustomerID string
+
+// SKU identifies a product.
+type SKU string
+
+// Quantity counts units of one SKU.
+type Quantity int
 
 type orderLine struct {
 	sku      SKU
@@ -52,189 +78,223 @@ type orderLine struct {
 	unit     Money
 }
 
-// Order es el aggregate root del pedido y sus líneas.
+func (l orderLine) subtotal() Money { return l.unit.Times(int64(l.quantity)) }
+
+// Order is the aggregate root for an order and its lines; every line shares its currency.
 type Order struct {
 	id         OrderID
 	customerID CustomerID
+	currency   string
 	lines      []orderLine
 }
 
-func NewOrder(id OrderID, customer CustomerID) *Order {
-	return &Order{id: id, customerID: customer}
+// NewOrder starts an empty order priced in currency.
+func NewOrder(id OrderID, customer CustomerID, currency string) (*Order, error) {
+	if id == "" || customer == "" || currency == "" {
+		return nil, ErrIncompleteOrder
+	}
+	return &Order{id: id, customerID: customer, currency: currency}, nil
 }
-```
 
-Las mutaciones pasan por métodos del root que mantienen la invariant. Aquí: cantidad
-positiva y **sin SKU duplicado**, con un `Total()` que siempre deriva del estado real.
-
-```go
-var (
-	ErrDuplicateLine = errors.New("order: SKU ya presente en el pedido")
-	ErrLineNotFound  = errors.New("order: SKU no presente en el pedido")
-	ErrNonPositive   = errors.New("order: la cantidad debe ser > 0")
-)
-
+// AddLine rejects non-positive quantities, duplicate SKUs and prices in another currency.
 func (o *Order) AddLine(sku SKU, qty Quantity, unit Money) error {
 	if qty <= 0 {
 		return ErrNonPositive
 	}
-	for _, l := range o.lines {
-		if l.sku == sku {
-			return fmt.Errorf("%w: %s", ErrDuplicateLine, sku)
-		}
+	if unit.Currency() != o.currency {
+		return fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, unit.Currency(), o.currency)
+	}
+	if slices.ContainsFunc(o.lines, func(l orderLine) bool { return l.sku == sku }) {
+		return fmt.Errorf("%w: %s", ErrDuplicateLine, sku)
 	}
 	o.lines = append(o.lines, orderLine{sku: sku, quantity: qty, unit: unit})
 	return nil
 }
 
+// RemoveLine fails with ErrLineNotFound when sku is not in the order.
 func (o *Order) RemoveLine(sku SKU) error {
-	for i, l := range o.lines {
-		if l.sku == sku {
-			o.lines = append(o.lines[:i], o.lines[i+1:]...)
-			return nil
-		}
+	i := slices.IndexFunc(o.lines, func(l orderLine) bool { return l.sku == sku })
+	if i < 0 {
+		return fmt.Errorf("%w: %s", ErrLineNotFound, sku)
 	}
-	return fmt.Errorf("%w: %s", ErrLineNotFound, sku)
+	o.lines = slices.Delete(o.lines, i, i+1)
+	return nil
 }
 
-// Total se deriva de las líneas; nunca se guarda en un campo que pueda desincronizarse.
-func (o *Order) Total() Money {
-	var total Money
-	for _, l := range o.lines {
-		total = total.Add(l.subtotal())
+// Total is derived from the lines on every call, so it can never drift from them.
+func (o *Order) Total() (Money, error) {
+	total, err := NewMoney(0, o.currency)
+	if err != nil {
+		return Money{}, err
 	}
-	return total
+	for _, l := range o.lines {
+		if total, err = total.Add(l.subtotal()); err != nil {
+			return Money{}, err
+		}
+	}
+	return total, nil
 }
 ```
 
-No hay `AggregateRoot` base ni marker interface. `Order` es un struct normal cuya única
-peculiaridad es que **posee sus internos y solo los expone tras aplicar reglas**.
+`orderLine` is unexported, so outside the package it cannot be built; `lines` is
+unexported, so the package is the boundary. There is no `AggregateRoot` base type or
+marker interface: `Order` is an ordinary struct that owns its internals and exposes them
+only through rules.
 
----
+`Total` still returns the error from `Money.Add`. `AddLine` makes a currency mismatch
+unreachable today, but the compiler cannot know that, and returning the error costs less
+than a silent wrong total if a future change breaks the invariant.
 
-## 3. Un aggregate por transacción; referencia a otros por ID
+## 3. One aggregate per transaction; reference others by ID
 
-El límite de consistencia define la **frontera transaccional**: dentro del aggregate,
-consistencia **fuerte** y síncrona; fuera, consistencia **eventual**. De ahí la regla
-operativa: **una transacción modifica exactamente un aggregate**. Si una operación necesita
-cambiar dos aggregates atómicamente, casi siempre el límite está mal trazado o el segundo
-cambio debe ser un evento posterior. El patrón concreto de repositorio y `tx` está en
-[`application-layer.md`](application-layer.md); aquí basta la regla.
+The consistency boundary is the **transactional boundary**: strong, synchronous consistency
+inside; eventual consistency outside. Hence **one transaction modifies exactly one
+aggregate**. If an operation must change two aggregates atomically, the boundary is usually
+drawn wrong, or the second change should be a later event.
 
-Corolario en el modelo: referencia a **otros** aggregates **por ID**, nunca por puntero.
+Corollary: reference **other** aggregates **by ID**, never by pointer.
 
 ```go
-// BAD — puntero al otro aggregate: arrastra su grafo y difumina el límite.
+// BAD: a pointer drags the other aggregate's graph in and blurs the boundary.
 type Order struct {
 	customer *Customer
 }
 
-// GOOD — solo el identificador: el límite de Order queda nítido.
+// GOOD: only the identifier; Order's boundary stays sharp.
 type Order struct {
 	customerID CustomerID
 }
 ```
 
-Por qué importa:
+Why it matters:
 
-- Un puntero invita a `order.customer.Address.Update(...)` → estás mutando el aggregate
-  `Customer` dentro de una transacción de `Order`. Viola "un aggregate por transacción".
-- Cargar `Order` cargaría `Customer`, y `Customer` sus pedidos, y así el grafo entero.
-- El ID hace explícito que `Customer` es **otra** unidad de consistencia: si necesitas sus
-  datos, los cargas por su propio root en su propia operación.
+- A pointer invites `order.customer.ChangeAddress(...)`, mutating `Customer` inside an `Order` transaction.
+- Loading `Order` would load `Customer`, then its orders, then the whole graph.
+- The ID makes it explicit that `Customer` is **another** consistency unit, loaded by its own root in its own operation.
 
-| Dentro del límite | Fuera del límite |
+| Inside the boundary | Outside the boundary |
 |---|---|
-| Consistencia fuerte, síncrona | Consistencia eventual |
-| Referencia directa (campo interno) | Referencia por ID |
-| Una transacción | Coordinación vía eventos / otro use case |
+| Strong, synchronous consistency | Eventual consistency |
+| Direct reference (internal field) | Reference by ID |
+| One transaction | Coordination via events or another use case |
 
----
+## 4. Invariants (domain) vs authorization (use case)
 
-## 4. Invariants (dominio) vs autorización (aplicación)
+The aggregate enforces **business invariants** ("no two lines with the same SKU"). It does
+**not** decide **who** may run the operation. Authorization is an application concern and
+lives in the **use case**: the aggregate knows nothing of sessions, roles or tenants, and
+putting them inside couples it to infrastructure and makes it hard to test in isolation.
 
-Matiz que se equivoca a menudo: el aggregate impone **invariants de negocio** ("un pedido no
-puede tener dos líneas del mismo SKU", "el total nunca es negativo"). **No** decide **quién**
-puede ejecutar la operación. La **autorización** (¿este actor puede hacer esto?) es una
-preocupación de la capa de aplicación y vive en el **use case**, no en el dominio.
+The use case is its own type in `add_order_line.go`. It decides the *who* through a narrow
+port declared in the same file (only this use case needs it), delegates the *what* to the
+root, and saves a single aggregate.
 
-> Regla → el dominio valida el *qué* (estado válido); el use case valida el *quién* (permiso).
-> Por qué → el aggregate no conoce sesiones, roles ni tenants, y meterlos dentro lo acopla a
-> infraestructura y lo hace intestable de forma aislada.
-
-El caso de uso es un tipo propio en `add_order_line.go`. Primero decide el *quién*
-(`actor.CanEditOrder`), después delega el *qué* al root (`o.AddLine`) y guarda un único aggregate.
+**internal/order/add_order_line.go**
 
 ```go
-// internal/order/add_order_line.go
 package order
 
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// ErrForbidden means the actor may not edit the order.
+var ErrForbidden = errors.New("order: forbidden")
+
+// Permissions answers authorization questions; only AddOrderLine needs it.
+type Permissions interface {
+	CanEditOrder(ctx context.Context, actorID string, id OrderID) (bool, error)
+}
+
+// AddOrderLineInput carries raw values from the transport.
 type AddOrderLineInput struct {
-	Actor    Actor
-	OrderID  OrderID
-	SKU      SKU
-	Quantity Quantity
-	Unit     Money
+	ActorID   string
+	OrderID   string
+	SKU       string
+	Quantity  int
+	UnitCents int64
+	Currency  string
 }
 
+// AddOrderLineOutput reports the new total in the smallest currency unit.
 type AddOrderLineOutput struct {
-	Total Money
+	TotalCents int64
+	Currency   string
 }
 
-// AddOrderLine añade una línea a un pedido que el actor puede editar.
+// AddOrderLine adds a line to an order the actor is allowed to edit.
 type AddOrderLine struct {
 	orders OrderRepository
+	perms  Permissions
 }
 
-func NewAddOrderLine(orders OrderRepository) *AddOrderLine {
-	return &AddOrderLine{orders: orders}
+// NewAddOrderLine wires the shared repository and the authorization port.
+func NewAddOrderLine(orders OrderRepository, perms Permissions) *AddOrderLine {
+	return &AddOrderLine{orders: orders, perms: perms}
 }
 
+// Execute fails with ErrForbidden before touching the order when the actor lacks permission.
 func (uc *AddOrderLine) Execute(ctx context.Context, in AddOrderLineInput) (AddOrderLineOutput, error) {
-	if !in.Actor.CanEditOrder(in.OrderID) {
+	id := OrderID(in.OrderID)
+	ok, err := uc.perms.CanEditOrder(ctx, in.ActorID, id)
+	if err != nil {
+		return AddOrderLineOutput{}, fmt.Errorf("add order line: check permission: %w", err)
+	}
+	if !ok {
 		return AddOrderLineOutput{}, ErrForbidden
 	}
-	o, err := uc.orders.Load(ctx, in.OrderID)
+
+	unit, err := NewMoney(in.UnitCents, in.Currency)
 	if err != nil {
 		return AddOrderLineOutput{}, err
 	}
-	if err := o.AddLine(in.SKU, in.Quantity, in.Unit); err != nil {
+	o, err := uc.orders.FindByID(ctx, id)
+	if err != nil {
+		return AddOrderLineOutput{}, err
+	}
+	if err := o.AddLine(SKU(in.SKU), Quantity(in.Quantity), unit); err != nil {
 		return AddOrderLineOutput{}, err
 	}
 	if err := uc.orders.Save(ctx, o); err != nil {
+		return AddOrderLineOutput{}, fmt.Errorf("add order line: save: %w", err)
+	}
+
+	total, err := o.Total()
+	if err != nil {
 		return AddOrderLineOutput{}, err
 	}
-	return AddOrderLineOutput{Total: o.Total()}, nil
+	return AddOrderLineOutput{TotalCents: total.Cents(), Currency: total.Currency()}, nil
 }
 ```
 
-`Order.AddLine` no recibe `actor` ni consulta permisos. Si algún día te ves pasando un
-`userID` a un método del dominio para decidir permisos, la lógica está en la capa equivocada.
+`Order.AddLine` takes no actor and checks no permission. If you find yourself passing a
+user ID into a domain method to decide permissions, the logic is in the wrong layer.
 
----
+## 5. Do not expose mutable internals
 
-## 5. No exponer el interior mutable
-
-Devolver el slice interno directamente es un footgun: el caller obtiene un alias del backing
-array y puede mutar el aggregate **saltándose** las invariants del root. Devuelve siempre una
-**copia** o una **vista de solo lectura**.
+Returning the internal slice lets the caller alias the backing array and mutate the
+aggregate **around** the root's invariants:
 
 ```go
-// BAD — el caller recibe el slice interno y puede mutar sin pasar por AddLine.
+// BAD: the caller gets the internal slice and can mutate it without AddLine.
 func (o *Order) Lines() []orderLine { return o.lines }
 ```
 
-Con eso basta un `o.Lines()[0].quantity = -5` para corromper el total y romper la invariant sin
-un solo error.
+`o.Lines()[0].quantity = -5` would then corrupt the total without a single error (inside the
+package; outside it, an exported method returning an unexported type is useless anyway and
+linters flag it). Return a **copy** or a **read-only view**:
 
 ```go
-// GOOD — proyección inmutable; mutar el resultado no afecta al aggregate.
+// LineView is a read-only projection of one order line.
 type LineView struct {
 	SKU      SKU
 	Quantity Quantity
 	Unit     Money
 }
 
+// Lines returns copies; changing them does not affect the order.
 func (o *Order) Lines() []LineView {
 	out := make([]LineView, len(o.lines))
 	for i, l := range o.lines {
@@ -244,48 +304,33 @@ func (o *Order) Lines() []LineView {
 }
 ```
 
-Notas idiomáticas:
+Copying a small slice of VOs is cheap; do not hand out the interior to save it. For
+sequential read-only use, an `iter.Seq[LineView]` (Go 1.23+) is an idiomatic alternative that
+also keeps the backing array private.
 
-- Devolver `[]orderLine` (tipo no-exportado) desde un método exportado ni siquiera es útil
-  fuera del paquete y `revive`/`golint` lo marcan. La `LineView` exportada es la salida.
-- Copiar un slice pequeño de VOs es barato. No optimices prematuramente cediendo el interior.
-- Si el consumo es solo lectura secuencial (Go 1.23+), un `iter.Seq[LineView]` es una
-  alternativa idiomática que tampoco expone el backing array.
+## 6. Avoid premature aggregates
 
----
+In small services most "aggregates" are **a single entity** with no sub-entities: there is no
+cluster to protect, so no root to invent. A ceremonial root adds indirection (`AddX`/`RemoveX`,
+views, copies) without protecting anything.
 
-## 6. Evita el aggregate prematuro
+You **do** need an aggregate with a root when:
 
-DDD trae la tentación de sembrar "roots" por todas partes. En servicios pequeños, la mayoría
-de los "aggregates" son **una sola entidad** sin sub-entidades: no hay clúster que proteger,
-así que no hay root que inventar. Un struct con sus métodos y su constructor validador ya es
-suficiente.
+- A rule must hold across **several** entities at once ("lines total ≤ credit limit", "no duplicate SKU").
+- Those entities **only** make sense inside the parent and are created/deleted with it.
+- You want to load and save them as **one** transactional unit.
 
-> Regla → el límite del aggregate lo define una **invariant transaccional real** que abarca
-> varias entidades. Sin esa invariant, no hay aggregate: hay una entidad. Por qué → un root
-> ceremonial añade indirección (`AddX`/`RemoveX`, vistas, copias) sin proteger nada.
-
-Señales de que **sí** necesitas un aggregate con root:
-
-- Existe una regla que debe cumplirse mirando **varias** entidades a la vez ("el total de las
-  líneas ≤ límite de crédito", "no dos líneas con el mismo SKU").
-- Esas entidades **solo** tienen sentido dentro del padre y se crean/borran con él.
-- Quieres cargarlas y guardarlas como **una** unidad transaccional.
-
-Si nada de esto aplica, modela una entidad plana. Puedes promoverla a aggregate más tarde: en
-Go el refactor es mecánico (haz privados los campos, mueve las mutaciones a métodos). Los
-antipatrones asociados (root anémico, aggregate-gigante, invariants filtradas al use case)
-están catalogados en [`antipatterns.md`](antipatterns.md).
-
----
+Otherwise model a flat entity. Promoting it later is mechanical in Go (make the fields
+unexported, move mutations into methods). Related anti-patterns are in
+[antipatterns.md](antipatterns.md).
 
 ## Checklist
 
-- [ ] El root es la **única** puerta de entrada: las sub-entidades viven en campos no-exportados.
-- [ ] Toda mutación del interior pasa por un método del root que mantiene la invariant.
-- [ ] Las invariants derivadas (p. ej. `Total()`) se **calculan**, no se guardan en un campo mutable.
-- [ ] Otros aggregates se referencian **por ID** (`customerID CustomerID`), nunca por puntero.
-- [ ] Una transacción modifica **un** aggregate; lo demás es consistencia eventual.
-- [ ] La **autorización** vive en el caso de uso (`add_order_line.go` → `AddOrderLine`); el dominio solo impone invariants de negocio.
-- [ ] Los métodos de lectura devuelven **copia o vista**, nunca el slice/map interno.
-- [ ] No inventaste un root sin una invariant transaccional real que lo justifique.
+- [ ] The root is the **only** entry point: sub-entities live in unexported fields.
+- [ ] Every mutation of the interior goes through a root method that keeps the invariant.
+- [ ] Derived values (`Total()`) are **computed**, not stored in a mutable field.
+- [ ] Other aggregates are referenced **by ID** (`customerID CustomerID`), never by pointer.
+- [ ] One transaction modifies **one** aggregate; the rest is eventual consistency.
+- [ ] **Authorization** lives in the use case (`add_order_line.go` → `AddOrderLine`); the domain enforces business invariants only.
+- [ ] Read methods return a **copy or view**, never the internal slice/map.
+- [ ] No root without a real transactional invariant to justify it.

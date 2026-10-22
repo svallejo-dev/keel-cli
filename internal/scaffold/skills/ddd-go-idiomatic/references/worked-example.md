@@ -1,60 +1,68 @@
-# Worked Example — Un Bounded Context Completo (`identity`)
+# Worked Example — A Complete Bounded Context (`identity`)
 
-> **Regla #0:** ante conflicto entre DDD y go-idiomatic, gana go-idiomatic. Este ejemplo aplica los building blocks tácticos SIN Java-ismos: cero carpetas por capa, cero `mapper/`, cero interfaz-por-clase, cero `service.go`.
+## Contents
 
-Un contexto `identity` de punta a punta: value objects → entity/aggregate → puertos → casos de uso → infraestructura → transporte → wiring. **Todo el código de esta página compila, pasa `go vet` y tiene tests que pasan** (`go build ./... && go vet ./... && go test ./...`), y el paquete de dominio pasa el *test de pureza*: `go list -deps ./internal/identity` no importa `database/sql` ni `net/http`.
+- Layout and dependency direction
+- 1. Value objects — `errors.go`, `email.go`, `name.go`
+- 2. Entity / aggregate root — `user.go`
+- 3. Shared port — `user_repository.go`
+- 4. Use cases — `register_user.go`, `change_email.go`
+- 5. Infrastructure — `memstore/memstore.go`
+- 6. Transport — `identityhttp/`
+- 7. Wiring — `cmd/identityd/main.go`
+- 8. Tests — `register_user_test.go`, `change_email_test.go`
+- What it leaves out on purpose, and how to run it
 
-Casos de uso: **registrar un usuario** y **cambiar su email**. Son dos casos de uso, así que son dos tipos en dos archivos: `register_user.go` y `change_email.go`.
+The `identity` context end to end: value objects → entity → port → use cases →
+infrastructure → transport → wiring → tests. Two use cases, **register a user** and
+**change their email**, so two types in two files. Every Go block below is extracted by
+`scripts/check-worked-example.sh` (repo root) into a module and must pass `gofmt -l`,
+`go vet` and `go test -race`; the bold line above each block is the file path.
 
-## Layout de archivos
-
-El contexto es UN paquete (`internal/identity`). Cada archivo dice qué contiene: un concepto del dominio o un caso de uso. Infraestructura y transporte son sub-paquetes que dependen hacia adentro.
+## Layout and dependency direction
 
 ```
-identityexample/
-├── cmd/identityd/main.go              # wiring (único que conoce todo)
-└── internal/
-    └── identity/                      # el bounded context: dominio + casos de uso
-        ├── errors.go                  # errores de dominio (sentinela)
-        ├── email.go / name.go         # value objects
-        ├── user.go                    # entity / aggregate root
-        ├── user_repository.go         # puerto compartido por los dos casos de uso
-        ├── register_user.go           # caso de uso + IDGenerator + DTOs
-        ├── change_email.go            # caso de uso + DTOs
-        ├── register_user_test.go
-        ├── change_email_test.go
-        ├── fake_user_repository_test.go
-        ├── memstore/memstore.go       # infra: impl en memoria de los puertos
-        └── identityhttp/              # transporte: un archivo por endpoint
-            ├── routes.go
-            ├── register_user.go
-            ├── change_email.go
-            └── responses.go           # JSON y error de dominio → status
+shop/                                  # module example.com/shop
+├── cmd/identityd/main.go              # wiring: the only place that knows every package
+└── internal/identity/                 # the bounded context: domain + use cases
+    ├── errors.go                      # sentinel errors
+    ├── email.go, name.go              # value objects
+    ├── user.go                        # entity / aggregate root + package doc
+    ├── user_repository.go             # port shared by both use cases
+    ├── register_user.go               # use case + IDGenerator + DTOs
+    ├── change_email.go                # use case + DTOs
+    ├── register_user_test.go
+    ├── change_email_test.go
+    ├── memstore/memstore.go           # infrastructure: in-memory port implementation
+    └── identityhttp/                  # transport: one file per endpoint
+        ├── routes.go
+        ├── register_user.go
+        ├── change_email.go
+        └── responses.go               # JSON + domain error → status
 ```
-
-Lo que **no** aparece: `service.go`, `usecase.go`, `handler.go`. Abrir el árbol ya cuenta qué hace el contexto.
-
-## Dirección de dependencias (todo apunta hacia adentro)
 
 ```
 cmd/identityd ─▶ identityhttp ─▶ identity ◀─ memstore
-                                    ▲  (define UserRepository, IDGenerator)
-                                    └─ el dominio no importa a nadie de afuera
+                                    (defines UserRepository, IDGenerator; imports nothing outward)
 ```
 
-`identity` (dominio + casos de uso) no conoce a `memstore` (infra) ni a `identityhttp` (transporte): ellos lo consumen/implementan a él. Esa es la inversión de dependencias de Clean Architecture, expresada con interfaces *consumer-defined* de Go.
+`identity` does not know `memstore` or `identityhttp`; they consume or implement it. That
+is Clean Architecture's dependency inversion expressed with consumer-defined interfaces.
 
-## 1. Value Objects — `errors.go`, `email.go`, `name.go`
+## 1. Value objects — `errors.go`, `email.go`, `name.go`
 
-Cada VO es inmutable (campo no-exportado), se valida en su constructor `NewX() (X, error)` y expone su valor con `String()`. Los errores de validación son sentinela, para que la frontera los mapee a `400`; salen del contexto como identidad de error, nunca como error del driver.
+Each value object is a struct with an unexported field, validated once in `NewX`, so holding
+an `Email` proves it is valid. Validation errors are sentinels so the transport can map them
+to `400` without parsing strings.
+
+**internal/identity/errors.go**
 
 ```go
-// internal/identity/errors.go
-// Package identity es el bounded context de usuarios: dominio y casos de uso.
 package identity
 
 import "errors"
 
+// Sentinel errors of the identity context; identityhttp maps each one to a status code.
 var (
 	ErrInvalidEmail = errors.New("identity: invalid email")
 	ErrInvalidName  = errors.New("identity: invalid name")
@@ -63,8 +71,9 @@ var (
 )
 ```
 
+**internal/identity/email.go**
+
 ```go
-// internal/identity/email.go
 package identity
 
 import (
@@ -73,10 +82,10 @@ import (
 	"strings"
 )
 
-// Email es una dirección normalizada a minúsculas y válida por construcción.
+// Email is a lower-cased address that is valid by construction.
 type Email struct{ v string }
 
-// NewEmail normaliza raw y falla con ErrInvalidEmail si no es una dirección.
+// NewEmail trims and lower-cases raw and fails with ErrInvalidEmail if it is not an address.
 func NewEmail(raw string) (Email, error) {
 	addr := strings.ToLower(strings.TrimSpace(raw))
 	if addr == "" {
@@ -88,11 +97,13 @@ func NewEmail(raw string) (Email, error) {
 	return Email{v: addr}, nil
 }
 
+// String returns the normalized address.
 func (e Email) String() string { return e.v }
 ```
 
+**internal/identity/name.go**
+
 ```go
-// internal/identity/name.go
 package identity
 
 import (
@@ -101,10 +112,10 @@ import (
 	"unicode/utf8"
 )
 
-// Name es el nombre visible de una persona, entre 2 y 60 caracteres.
+// Name is a person's display name, 2 to 60 characters after trimming.
 type Name struct{ v string }
 
-// NewName recorta raw y falla con ErrInvalidName si queda fuera de rango.
+// NewName trims raw and fails with ErrInvalidName when the length is out of range.
 func NewName(raw string) (Name, error) {
 	n := strings.TrimSpace(raw)
 	if c := utf8.RuneCountInString(n); c < 2 || c > 60 {
@@ -113,15 +124,22 @@ func NewName(raw string) (Name, error) {
 	return Name{v: n}, nil
 }
 
+// String returns the trimmed name.
 func (n Name) String() string { return n.v }
 ```
 
-## 2. Entity / Aggregate Root — `user.go`
+## 2. Entity / aggregate root — `user.go`
 
-`User` tiene identidad (`UserID`), se compone de VOs y solo se muta por métodos con intención (`ChangeEmail`), nunca por setters. `NewUser` impone las invariantes de **integración** del aggregate, no la validación propia de cada VO. Aquí `User` **es** el aggregate root del contexto (no hay sub-entidades): no inventamos un root de más. Igualdad por ID (`SameAs`), nunca por valor.
+`User` has identity, is composed of value objects and changes only through intent-revealing
+methods. `NewUser` checks what no single value object can (here, only that an ID exists);
+time comes in as a parameter so the domain never reads the clock. `User` is the root because
+it has no sub-entities; inventing a separate root would be ceremony. This file carries the
+package doc, once for the whole package.
+
+**internal/identity/user.go**
 
 ```go
-// internal/identity/user.go
+// Package identity is the bounded context for user accounts: domain model and use cases.
 package identity
 
 import (
@@ -129,10 +147,10 @@ import (
 	"time"
 )
 
-// UserID es la identidad de un User; "" significa sin asignar.
+// UserID identifies a User; the empty string means "not assigned".
 type UserID string
 
-// User es el aggregate root del contexto.
+// User is the aggregate root of the identity context.
 type User struct {
 	id        UserID
 	email     Email
@@ -140,7 +158,7 @@ type User struct {
 	createdAt time.Time
 }
 
-// NewUser integra value objects ya válidos; solo exige que haya identidad.
+// NewUser assembles already-valid value objects; it is also how stores rebuild a User.
 func NewUser(id UserID, email Email, name Name, now time.Time) (*User, error) {
 	if id == "" {
 		return nil, errors.New("identity: user requires an id")
@@ -148,32 +166,35 @@ func NewUser(id UserID, email Email, name Name, now time.Time) (*User, error) {
 	return &User{id: id, email: email, name: name, createdAt: now}, nil
 }
 
-func (u *User) ID() UserID   { return u.id }
+// ID never changes during the life of the user.
+func (u *User) ID() UserID { return u.id }
+
+// Email is the current normalized address.
 func (u *User) Email() Email { return u.email }
-func (u *User) Name() Name   { return u.name }
 
-// ChangeEmail es la única forma de cambiar el email de un User.
-func (u *User) ChangeEmail(newEmail Email) {
-	u.email = newEmail
-}
+// Name is the display name given at registration.
+func (u *User) Name() Name { return u.name }
 
-// SameAs compara por identidad, nunca por valor.
-func (u *User) SameAs(other *User) bool {
-	return u != nil && other != nil && u.id == other.id
-}
+// CreatedAt is the registration time taken from the use case's clock.
+func (u *User) CreatedAt() time.Time { return u.createdAt }
+
+// ChangeEmail replaces the address; uniqueness is enforced by the use case and the repository.
+func (u *User) ChangeEmail(newEmail Email) { u.email = newEmail }
 ```
 
-## 3. Puerto compartido — `user_repository.go`
+## 3. Shared port — `user_repository.go`
 
-Las interfaces las define el **consumidor**, no la infraestructura. `UserRepository` vive en su propio archivo porque lo usan **los dos** casos de uso. `IDGenerator` solo lo necesita `RegisterUser`, así que se declara en `register_user.go`, junto a quien lo consume.
+The consumer defines the interface. `UserRepository` gets its own file because both use
+cases need it; `IDGenerator` is used only by `RegisterUser`, so it lives in that file.
+
+**internal/identity/user_repository.go**
 
 ```go
-// internal/identity/user_repository.go
 package identity
 
 import "context"
 
-// UserRepository es el puerto de persistencia que comparten RegisterUser y ChangeEmail.
+// UserRepository is shared by RegisterUser and ChangeEmail; Save reports ErrEmailTaken like a unique index.
 type UserRepository interface {
 	FindByID(ctx context.Context, id UserID) (*User, error)
 	ExistsByEmail(ctx context.Context, email Email) (bool, error)
@@ -181,12 +202,15 @@ type UserRepository interface {
 }
 ```
 
-## 4. Casos de uso — `register_user.go`, `change_email.go`
+## 4. Use cases — `register_user.go`, `change_email.go`
 
-Un caso de uso = un tipo con el nombre de la acción + un archivo con ese nombre. Cada uno tiene constructor `NewX`, un único método `Execute(ctx, XInput) (XOutput, error)` y sus DTO al lado (la columna de **transformación**, sin capa `mapper/`). `Execute` es la columna de **integración**: orquesta VOs, entity y repositorio. Los DTO hablan primitivos amigables al transporte, no value objects.
+One type named after the action, in a file with the same name: constructor `NewX`, a single
+`Execute(ctx, XInput) (XOutput, error)`, DTOs next to it. DTOs carry transport-friendly
+primitives, not value objects, so transports never depend on domain types.
+
+**internal/identity/register_user.go**
 
 ```go
-// internal/identity/register_user.go
 package identity
 
 import (
@@ -195,29 +219,31 @@ import (
 	"time"
 )
 
-// IDGenerator produce identidades nuevas; solo RegisterUser lo necesita.
+// IDGenerator is declared here because only RegisterUser needs it.
 type IDGenerator interface {
 	NewUserID() UserID
 }
 
+// RegisterUserInput carries raw transport values; Execute parses them into value objects.
 type RegisterUserInput struct {
 	Email string
 	Name  string
 }
 
+// RegisterUserOutput uses primitives so transports never depend on value objects.
 type RegisterUserOutput struct {
 	ID    string
 	Email string
 }
 
-// RegisterUser da de alta un usuario con un email que nadie más use.
+// RegisterUser signs up a user whose email nobody else owns.
 type RegisterUser struct {
 	users UserRepository
 	ids   IDGenerator
 	now   func() time.Time
 }
 
-// NewRegisterUser usa time.Now si now es nil.
+// NewRegisterUser takes the clock as a dependency so tests can freeze time; nil means time.Now.
 func NewRegisterUser(users UserRepository, ids IDGenerator, now func() time.Time) *RegisterUser {
 	if now == nil {
 		now = time.Now
@@ -225,6 +251,7 @@ func NewRegisterUser(users UserRepository, ids IDGenerator, now func() time.Time
 	return &RegisterUser{users: users, ids: ids, now: now}
 }
 
+// Execute fails with ErrInvalidEmail, ErrInvalidName or ErrEmailTaken when the input is rejected.
 func (uc *RegisterUser) Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error) {
 	email, err := NewEmail(in.Email)
 	if err != nil {
@@ -254,8 +281,9 @@ func (uc *RegisterUser) Execute(ctx context.Context, in RegisterUserInput) (Regi
 }
 ```
 
+**internal/identity/change_email.go**
+
 ```go
-// internal/identity/change_email.go
 package identity
 
 import (
@@ -263,25 +291,29 @@ import (
 	"fmt"
 )
 
+// ChangeEmailInput carries the target user and the raw new address.
 type ChangeEmailInput struct {
 	UserID string
 	Email  string
 }
 
+// ChangeEmailOutput echoes the stored, normalized address.
 type ChangeEmailOutput struct {
 	ID    string
 	Email string
 }
 
-// ChangeEmail cambia el email de un usuario existente si nadie más lo usa.
+// ChangeEmail moves an existing user to an address nobody else owns.
 type ChangeEmail struct {
 	users UserRepository
 }
 
+// NewChangeEmail needs only the shared repository.
 func NewChangeEmail(users UserRepository) *ChangeEmail {
 	return &ChangeEmail{users: users}
 }
 
+// Execute fails with ErrUserNotFound for an unknown id and ErrEmailTaken if another user owns the address.
 func (uc *ChangeEmail) Execute(ctx context.Context, in ChangeEmailInput) (ChangeEmailOutput, error) {
 	email, err := NewEmail(in.Email)
 	if err != nil {
@@ -312,37 +344,53 @@ func (uc *ChangeEmail) Execute(ctx context.Context, in ChangeEmailInput) (Change
 }
 ```
 
-`Execute` no lleva doc comment: el tipo ya dice qué hace y el método es el único que tiene. Si mañana aparece "desactivar usuario", es un archivo nuevo (`deactivate_user.go`) con su tipo `DeactivateUser`; no un método más en un struct compartido.
+A new action such as "deactivate user" is a new file (`deactivate_user.go`) with its own
+`DeactivateUser` type, never one more method on a shared struct.
 
-## 5. Infraestructura — `memstore/memstore.go`
+## 5. Infrastructure — `memstore/memstore.go`
 
-Implementación en memoria de ambos puertos. Los `var _ identity.UserRepository = (*Store)(nil)` son chequeos en compilación: si `Store` deja de satisfacer el puerto, no compila. En producción aquí iría un `pgstore` traduciendo errores del driver a errores de dominio en la frontera.
+An in-memory implementation of both ports, used by the tests and for local runs. It stores
+rows and rebuilds a fresh `*User` on every read: handing out the stored pointer would let
+`ChangeEmail` mutate shared state outside the lock (a data race), and copying is what a real
+database does anyway. `Save` enforces email uniqueness like a unique index, which closes the
+gap between `ExistsByEmail` and `Save` when two requests race. A `pgstore` would sit next to
+it and translate driver errors (`23505`, `pgx.ErrNoRows`) into the same sentinels.
+
+**internal/identity/memstore/memstore.go**
 
 ```go
-// internal/identity/memstore/memstore.go
-// Package memstore implementa en memoria los puertos de identity.
+// Package memstore keeps identity users in memory, for tests and local runs.
 package memstore
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
 )
 
-// Store es seguro para uso concurrente.
+type row struct {
+	email     string
+	name      string
+	createdAt time.Time
+}
+
+// Store is safe for concurrent use; it never shares a *identity.User with callers.
 type Store struct {
 	mu     sync.Mutex
-	byID   map[identity.UserID]*identity.User
-	emails map[string]identity.UserID
+	rows   map[identity.UserID]row
+	owners map[string]identity.UserID
 	seq    int64
 }
 
+// New returns an empty Store.
 func New() *Store {
 	return &Store{
-		byID:   make(map[identity.UserID]*identity.User),
-		emails: make(map[string]identity.UserID),
+		rows:   make(map[identity.UserID]row),
+		owners: make(map[string]identity.UserID),
 	}
 }
 
@@ -351,6 +399,7 @@ var (
 	_ identity.IDGenerator    = (*Store)(nil)
 )
 
+// NewUserID hands out sequential ids: u1, u2, ...
 func (s *Store) NewUserID() identity.UserID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,72 +407,92 @@ func (s *Store) NewUserID() identity.UserID {
 	return identity.UserID("u" + strconv.FormatInt(s.seq, 10))
 }
 
+// FindByID returns a new *User rebuilt from the stored row, or identity.ErrUserNotFound.
 func (s *Store) FindByID(_ context.Context, id identity.UserID) (*identity.User, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.byID[id]
+	r, ok := s.rows[id]
+	s.mu.Unlock()
 	if !ok {
 		return nil, identity.ErrUserNotFound
 	}
-	return u, nil
+	email, err := identity.NewEmail(r.email)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: corrupt row %s: %w", id, err)
+	}
+	name, err := identity.NewName(r.name)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: corrupt row %s: %w", id, err)
+	}
+	return identity.NewUser(id, email, name, r.createdAt)
 }
 
+// ExistsByEmail reports whether any user owns email.
 func (s *Store) ExistsByEmail(_ context.Context, email identity.Email) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.emails[email.String()]
+	_, ok := s.owners[email.String()]
 	return ok, nil
 }
 
+// Save copies u's state and fails with identity.ErrEmailTaken if another user owns the email.
 func (s *Store) Save(_ context.Context, u *identity.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for email, id := range s.emails {
-		if id == u.ID() {
-			delete(s.emails, email)
-		}
+	email := u.Email().String()
+	if owner, ok := s.owners[email]; ok && owner != u.ID() {
+		return identity.ErrEmailTaken
 	}
-	s.byID[u.ID()] = u
-	s.emails[u.Email().String()] = u.ID()
+	if old, ok := s.rows[u.ID()]; ok {
+		delete(s.owners, old.email)
+	}
+	s.rows[u.ID()] = row{email: email, name: u.Name().String(), createdAt: u.CreatedAt()}
+	s.owners[email] = u.ID()
 	return nil
 }
 ```
 
-## 6. Transporte — `identityhttp/`
+## 6. Transport — `identityhttp/`
 
-Un archivo por endpoint, con el nombre del caso de uso que expone. Cada uno traduce HTTP ↔ `Input`/`Output` con structs request/response propios; no hay `mapper/`. `routes.go` monta los endpoints y `responses.go` concentra el mapeo error de dominio → status.
+One file per endpoint, named after the use case it exposes. Each one translates HTTP ↔
+`Input`/`Output` with its own request/response structs; there is no `mapper/`. `routes.go`
+mounts them with `net/http` method patterns (Go 1.22+), and `responses.go` holds the single
+domain error → status mapping.
+
+**internal/identity/identityhttp/routes.go**
 
 ```go
-// internal/identity/identityhttp/routes.go
-// Package identityhttp expone los casos de uso de identity por HTTP.
+// Package identityhttp exposes the identity use cases over HTTP.
 package identityhttp
 
 import (
 	"net/http"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
 )
 
+// UseCases lists what this transport exposes; main builds each one with its own dependencies.
 type UseCases struct {
 	RegisterUser *identity.RegisterUser
 	ChangeEmail  *identity.ChangeEmail
 }
 
+// Mount registers one route per use case; ServeMux answers 405 for other methods.
 func Mount(mux *http.ServeMux, uc UseCases) {
-	mux.HandleFunc("POST /users", registerUser(uc.RegisterUser))
-	mux.HandleFunc("PUT /users/{id}/email", changeEmail(uc.ChangeEmail))
+	mux.Handle("POST /users", registerUser(uc.RegisterUser))
+	mux.Handle("PUT /users/{id}/email", changeEmail(uc.ChangeEmail))
 }
 ```
 
+**internal/identity/identityhttp/register_user.go**
+
 ```go
-// internal/identity/identityhttp/register_user.go
 package identityhttp
 
 import (
 	"encoding/json"
 	"net/http"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
 )
 
 type registerUserRequest struct {
@@ -436,8 +505,8 @@ type registerUserResponse struct {
 	Email string `json:"email"`
 }
 
-func registerUser(uc *identity.RegisterUser) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func registerUser(uc *identity.RegisterUser) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req registerUserRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -449,19 +518,20 @@ func registerUser(uc *identity.RegisterUser) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusCreated, registerUserResponse{ID: out.ID, Email: out.Email})
-	}
+	})
 }
 ```
 
+**internal/identity/identityhttp/change_email.go**
+
 ```go
-// internal/identity/identityhttp/change_email.go
 package identityhttp
 
 import (
 	"encoding/json"
 	"net/http"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
 )
 
 type changeEmailRequest struct {
@@ -473,25 +543,27 @@ type changeEmailResponse struct {
 	Email string `json:"email"`
 }
 
-func changeEmail(uc *identity.ChangeEmail) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func changeEmail(uc *identity.ChangeEmail) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req changeEmailRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
-		out, err := uc.Execute(r.Context(), identity.ChangeEmailInput{UserID: r.PathValue("id"), Email: req.Email})
+		in := identity.ChangeEmailInput{UserID: r.PathValue("id"), Email: req.Email}
+		out, err := uc.Execute(r.Context(), in)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, changeEmailResponse{ID: out.ID, Email: out.Email})
-	}
+	})
 }
 ```
 
+**internal/identity/identityhttp/responses.go**
+
 ```go
-// internal/identity/identityhttp/responses.go
 package identityhttp
 
 import (
@@ -499,7 +571,7 @@ import (
 	"errors"
 	"net/http"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
 )
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -508,7 +580,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// writeError nunca devuelve el texto de un error desconocido: podría filtrar internals.
+// writeError never echoes an unknown error: it could leak SQL, hosts or stack details.
 func writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, identity.ErrInvalidEmail), errors.Is(err, identity.ErrInvalidName):
@@ -525,19 +597,23 @@ func writeError(w http.ResponseWriter, err error) {
 
 ## 7. Wiring — `cmd/identityd/main.go`
 
-Único lugar que conoce todos los paquetes a la vez: construye la infra, la inyecta en cada caso de uso y monta el transporte.
+The only place that knows every package: it builds the infrastructure, injects it into each
+use case separately and mounts the transport.
+
+**cmd/identityd/main.go**
 
 ```go
-// cmd/identityd/main.go
+// Command identityd serves the identity context over HTTP backed by the in-memory store.
 package main
 
 import (
 	"log"
 	"net/http"
+	"time"
 
-	"identityexample/internal/identity"
-	"identityexample/internal/identity/identityhttp"
-	"identityexample/internal/identity/memstore"
+	"example.com/shop/internal/identity"
+	"example.com/shop/internal/identity/identityhttp"
+	"example.com/shop/internal/identity/memstore"
 )
 
 func main() {
@@ -549,202 +625,214 @@ func main() {
 		ChangeEmail:  identity.NewChangeEmail(store),
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	log.Fatal(srv.ListenAndServe())
 }
 ```
 
-## 8. Tests sin frameworks
+## 8. Tests — `register_user_test.go`, `change_email_test.go`
 
-Los tests siguen el mismo criterio de nombres: `register_user_test.go` prueba `RegisterUser`, `change_email_test.go` prueba `ChangeEmail`. El fake del puerto compartido vive en `fake_user_repository_test.go` y se escribe a mano —sin mocks generados— porque la interfaz es pequeña y la define el consumidor.
+Test files follow the same naming: `register_user_test.go` tests `RegisterUser`. They use
+`memstore` as the fake, since it is small, already satisfies the consumer-defined ports and
+needs no mocking library. The concurrent tests are there for `go test -race`: they fail if the
+store ever shares a `*User` or checks uniqueness outside its lock.
 
-```go
-// internal/identity/fake_user_repository_test.go
-package identity_test
-
-import (
-	"context"
-
-	"identityexample/internal/identity"
-)
-
-type fakeUserRepository struct {
-	byID  map[identity.UserID]*identity.User
-	taken map[string]bool
-	saved *identity.User
-}
-
-func newFakeUserRepository(users ...*identity.User) *fakeUserRepository {
-	f := &fakeUserRepository{byID: map[identity.UserID]*identity.User{}, taken: map[string]bool{}}
-	for _, u := range users {
-		f.byID[u.ID()] = u
-		f.taken[u.Email().String()] = true
-	}
-	return f
-}
-
-func (f *fakeUserRepository) FindByID(_ context.Context, id identity.UserID) (*identity.User, error) {
-	u, ok := f.byID[id]
-	if !ok {
-		return nil, identity.ErrUserNotFound
-	}
-	return u, nil
-}
-
-func (f *fakeUserRepository) ExistsByEmail(_ context.Context, e identity.Email) (bool, error) {
-	return f.taken[e.String()], nil
-}
-
-func (f *fakeUserRepository) Save(_ context.Context, u *identity.User) error {
-	f.saved = u
-	return nil
-}
-```
+**internal/identity/register_user_test.go**
 
 ```go
-// internal/identity/register_user_test.go
 package identity_test
 
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
+	"example.com/shop/internal/identity/memstore"
 )
-
-type fixedID struct{}
-
-func (fixedID) NewUserID() identity.UserID { return "u1" }
 
 func TestRegisterUser(t *testing.T) {
-	repo := newFakeUserRepository()
-	uc := identity.NewRegisterUser(repo, fixedID{}, func() time.Time { return time.Unix(0, 0) })
+	store := memstore.New()
+	frozen := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	uc := identity.NewRegisterUser(store, store, func() time.Time { return frozen })
 
-	out, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: "Ada@Example.com", Name: "Ada Lovelace"})
+	out, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: " Ada@Example.com ", Name: "Ada Lovelace"})
 	if err != nil {
-		t.Fatalf("register: %v", err)
+		t.Fatalf("Execute: %v", err)
 	}
 	if out.Email != "ada@example.com" {
-		t.Errorf("email should be normalized, got %q", out.Email)
+		t.Errorf("Email = %q, want normalized ada@example.com", out.Email)
 	}
-	if repo.saved == nil || repo.saved.ID() != "u1" {
-		t.Errorf("user not saved with expected id")
+	u, err := store.FindByID(context.Background(), identity.UserID(out.ID))
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
 	}
-}
-
-func TestRegisterUser_InvalidEmail(t *testing.T) {
-	uc := identity.NewRegisterUser(newFakeUserRepository(), fixedID{}, nil)
-	_, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: "nope", Name: "Ada"})
-	if !errors.Is(err, identity.ErrInvalidEmail) {
-		t.Fatalf("want ErrInvalidEmail, got %v", err)
+	if !u.CreatedAt().Equal(frozen) {
+		t.Errorf("CreatedAt = %v, want %v", u.CreatedAt(), frozen)
 	}
 }
 
-func TestRegisterUser_EmailTaken(t *testing.T) {
-	repo := newFakeUserRepository()
-	repo.taken["ada@example.com"] = true
-	uc := identity.NewRegisterUser(repo, fixedID{}, nil)
-	_, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: "ada@example.com", Name: "Ada"})
-	if !errors.Is(err, identity.ErrEmailTaken) {
-		t.Fatalf("want ErrEmailTaken, got %v", err)
+func TestRegisterUser_Rejects(t *testing.T) {
+	tests := []struct {
+		name string
+		in   identity.RegisterUserInput
+		want error
+	}{
+		{"invalid email", identity.RegisterUserInput{Email: "nope", Name: "Ada"}, identity.ErrInvalidEmail},
+		{"short name", identity.RegisterUserInput{Email: "ada@example.com", Name: "A"}, identity.ErrInvalidName},
+		{"email taken", identity.RegisterUserInput{Email: "taken@example.com", Name: "Ada"}, identity.ErrEmailTaken},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := memstore.New()
+			uc := identity.NewRegisterUser(store, store, nil)
+			if _, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: "taken@example.com", Name: "Grace"}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if _, err := uc.Execute(context.Background(), tt.in); !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestRegisterUser_ConcurrentSameEmail(t *testing.T) {
+	store := memstore.New()
+	uc := identity.NewRegisterUser(store, store, nil)
+
+	const n = 20
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			_, err := uc.Execute(context.Background(), identity.RegisterUserInput{Email: "ada@example.com", Name: "Ada"})
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+
+	wins := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			wins++
+		case !errors.Is(err, identity.ErrEmailTaken):
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("%d registrations succeeded, want exactly 1", wins)
 	}
 }
 ```
 
+**internal/identity/change_email_test.go**
+
 ```go
-// internal/identity/change_email_test.go
 package identity_test
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
-	"time"
 
-	"identityexample/internal/identity"
+	"example.com/shop/internal/identity"
+	"example.com/shop/internal/identity/memstore"
 )
 
-func existingUser(t *testing.T, id identity.UserID, email string) *identity.User {
+func register(t *testing.T, store *memstore.Store, email string) string {
 	t.Helper()
-	e, err := identity.NewEmail(email)
+	out, err := identity.NewRegisterUser(store, store, nil).Execute(context.Background(), identity.RegisterUserInput{Email: email, Name: "Ada Lovelace"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("register %s: %v", email, err)
 	}
-	n, err := identity.NewName("Ada Lovelace")
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, err := identity.NewUser(id, e, n, time.Unix(0, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return u
+	return out.ID
 }
 
 func TestChangeEmail(t *testing.T) {
-	repo := newFakeUserRepository(existingUser(t, "u1", "ada@example.com"))
-	uc := identity.NewChangeEmail(repo)
+	store := memstore.New()
+	id := register(t, store, "ada@example.com")
 
-	out, err := uc.Execute(context.Background(), identity.ChangeEmailInput{UserID: "u1", Email: "ADA@new.com"})
+	out, err := identity.NewChangeEmail(store).Execute(context.Background(), identity.ChangeEmailInput{UserID: id, Email: "ADA@new.com"})
 	if err != nil {
-		t.Fatalf("change email: %v", err)
+		t.Fatalf("Execute: %v", err)
 	}
-	if out.Email != "ada@new.com" || repo.saved == nil || repo.saved.Email().String() != "ada@new.com" {
-		t.Errorf("email not changed: out=%+v saved=%v", out, repo.saved)
+	if out.Email != "ada@new.com" {
+		t.Errorf("Email = %q, want ada@new.com", out.Email)
 	}
-}
-
-func TestChangeEmail_Taken(t *testing.T) {
-	repo := newFakeUserRepository(
-		existingUser(t, "u1", "ada@example.com"),
-		existingUser(t, "u2", "grace@example.com"),
-	)
-	_, err := identity.NewChangeEmail(repo).Execute(context.Background(), identity.ChangeEmailInput{UserID: "u1", Email: "grace@example.com"})
-	if !errors.Is(err, identity.ErrEmailTaken) {
-		t.Fatalf("want ErrEmailTaken, got %v", err)
+	old, _ := identity.NewEmail("ada@example.com")
+	if taken, _ := store.ExistsByEmail(context.Background(), old); taken {
+		t.Error("old address is still reserved")
 	}
 }
 
-func TestChangeEmail_UserNotFound(t *testing.T) {
-	_, err := identity.NewChangeEmail(newFakeUserRepository()).Execute(context.Background(), identity.ChangeEmailInput{UserID: "nope", Email: "a@b.com"})
-	if !errors.Is(err, identity.ErrUserNotFound) {
-		t.Fatalf("want ErrUserNotFound, got %v", err)
+func TestChangeEmail_Rejects(t *testing.T) {
+	store := memstore.New()
+	id := register(t, store, "ada@example.com")
+	register(t, store, "grace@example.com")
+	uc := identity.NewChangeEmail(store)
+
+	if _, err := uc.Execute(context.Background(), identity.ChangeEmailInput{UserID: id, Email: "grace@example.com"}); !errors.Is(err, identity.ErrEmailTaken) {
+		t.Errorf("taken: err = %v, want ErrEmailTaken", err)
+	}
+	if _, err := uc.Execute(context.Background(), identity.ChangeEmailInput{UserID: "nope", Email: "a@b.com"}); !errors.Is(err, identity.ErrUserNotFound) {
+		t.Errorf("unknown user: err = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestChangeEmail_Concurrent(t *testing.T) {
+	store := memstore.New()
+	id := register(t, store, "ada@example.com")
+	uc := identity.NewChangeEmail(store)
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			in := identity.ChangeEmailInput{UserID: id, Email: fmt.Sprintf("ada+%d@example.com", i)}
+			if _, err := uc.Execute(context.Background(), in); err != nil {
+				t.Errorf("Execute: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	u, err := store.FindByID(context.Background(), identity.UserID(id))
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	for i := range n {
+		e, _ := identity.NewEmail(fmt.Sprintf("ada+%d@example.com", i))
+		taken, _ := store.ExistsByEmail(context.Background(), e)
+		if taken != (e == u.Email()) {
+			t.Errorf("%s reserved = %v, but the user's email is %s", e, taken, u.Email())
+		}
 	}
 }
 ```
 
-## Qué NO tiene, a propósito
+## What it leaves out on purpose
 
-- **Sin `service.go` ni `usecase.go`**: cada caso de uso es su propio tipo en su propio archivo.
-- **Sin `handler.go` con todos los endpoints**: un archivo por endpoint + `routes.go`.
-- **Sin carpetas `domain/`, `application/`, `infrastructure/`**: un paquete por contexto.
-- **Sin capa `mapper/`**: los DTO viven junto al caso de uso; la traducción está en cada endpoint.
-- **Sin interfaz-por-clase**: solo `UserRepository` e `IDGenerator`, definidas donde se consumen.
-- **Sin aggregate de más**: `User` es a la vez entity y root; un aggregate se justifica por una invariante transaccional real, no por ceremonia.
-- **Sin getters/setters ni comentarios que narran**: métodos con intención y doc comments de una línea solo donde el nombre no basta.
+- No `service.go` or `usecase.go`: each use case is its own type in its own file.
+- No `handler.go` with every endpoint: one file per endpoint plus `routes.go`.
+- No `domain/`, `application/`, `infrastructure/` folders: one package per context.
+- No `mapper/`: DTOs live next to the use case; each endpoint translates by hand.
+- No interface per struct: only `UserRepository` and `IDGenerator`, declared by their consumer.
+- No extra aggregate: `User` is entity and root at once; a root needs a real transactional invariant.
 
-## Cómo correrlo
+## How to run it
 
 ```bash
-go test ./...            # los tests de los casos de uso pasan sin infraestructura
-go build ./...           # compila el binario
-go vet ./...             # sin observaciones
-go run ./cmd/identityd   # levanta el servidor en :8080
-# curl -X POST localhost:8080/users -d '{"email":"ada@example.com","name":"Ada Lovelace"}'
-# curl -X PUT localhost:8080/users/u1/email -d '{"email":"ada@new.com"}'
+sh scripts/check-worked-example.sh   # extracts this page, then gofmt -l, go vet, go test -race
+go run ./cmd/identityd               # inside the extracted module; serves :8080
+curl -X POST localhost:8080/users -d '{"email":"ada@example.com","name":"Ada Lovelace"}'
+curl -X PUT localhost:8080/users/u1/email -d '{"email":"ada@new.com"}'
 ```
 
-## Checklist
-
-- [ ] El paquete de dominio no importa `database/sql`, `net/http` ni libs externas (test de pureza)
-- [ ] Cada VO se valida en su constructor y es inmutable
-- [ ] La entity valida la INTEGRACIÓN de VOs; no re-valida lo que cada VO ya valida
-- [ ] El aggregate root muta su interior solo por métodos propios (campos no-exportados)
-- [ ] Cada caso de uso es un tipo propio en un archivo con su nombre (`register_user.go` → `RegisterUser`)
-- [ ] Ningún archivo contiene dos casos de uso; no existen `service.go`, `usecase.go` ni `handler.go`
-- [ ] Los puertos se definen en el consumidor: en el archivo del caso de uso, o en su propio archivo si son compartidos
-- [ ] La infra traduce errores del driver a errores de dominio en la frontera
-- [ ] Los DTO `XInput`/`XOutput` viven junto al caso de uso; no hay capa `mapper/`
-- [ ] Los errores de dominio se mapean a status HTTP solo en el transporte
-- [ ] El wiring vive en `cmd/`; el resto no conoce `main`
+The domain purity test also runs in the script: `go list -deps ./internal/identity` must not
+list `database/sql` or `net/http`.

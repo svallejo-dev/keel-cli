@@ -1,117 +1,113 @@
 ---
 name: ddd-go-idiomatic
 description: >
-  Domain-Driven Design (tactical) applied the idiomatic Go way — not copied from
-  Java/C#. Use this skill when designing or reviewing a Go domain model: value
-  objects, entities, aggregates, bounded contexts, repositories, use cases /
-  application services, or the domain-vs-application split. Trigger on "value
-  object", "entity", "aggregate", "aggregate root", "bounded context", "use case",
-  "repository pattern", "domain layer in Go", "DDD in Go", "hexagonal / clean
-  architecture in Go", "where should this logic live", "is this an entity or a
-  value object", or when translating DDD/Java layering into idiomatic Go. Also
-  trigger when creating, naming or reviewing files and types inside a bounded
-  context (service.go, usecase.go, handler.go, "where does this use case go",
-  "how do I name this file"), and when generated Go code is over-commented.
-  Rule #0: when DDD and Go idioms conflict, Go idioms win.
+  Tactical Domain-Driven Design written as idiomatic Go, not translated Java: value
+  objects, entities, aggregates, bounded contexts, repositories/ports, use cases and the
+  file layout of a context. Use when designing, generating or reviewing Go domain code or
+  deciding where logic, a use case or a file goes. Triggers: "value object", "entity",
+  "aggregate", "bounded context", "use case", "repository pattern", "DDD in Go",
+  "hexagonal/clean architecture in Go", "where should this logic live", service.go,
+  usecase.go, handler.go, "file naming", "how do I name this file", "one use case per
+  file", "caso de uso", "objeto de valor", "agregado", "contexto acotado", "dónde va
+  esta lógica", "cómo nombro este archivo".
 ---
 
-# DDD Go-Idiomatic Skill
+# DDD, the Go Way
 
-Diseñas y revisas modelos de dominio en Go con las heurísticas de DDD, pero **traducidas al idioma de Go**, no copiadas de Java/C#.
+DDD is a set of heuristics about **where behaviour lives**, not a folder structure or a
+framework. This skill applies them with Go's own tools: packages, unexported fields,
+consumer-defined interfaces and plain constructors.
 
-## Regla #0 — go-idiomatic manda
+**Rule #0: when DDD and Go idioms conflict, Go idioms win.** Non-idiomatic Go does not
+only cause functional bugs; it causes architectural ones (import cycles, interface
+pollution, needless indirection and allocations) that stop the codebase from scaling. If a
+DDD rule pushes towards a Java-ism, the rule gives way.
 
-Ante cualquier conflicto entre un principio de DDD y una convención idiomática de Go, **gana go-idiomatic**. DDD es un conjunto de heurísticas sobre *dónde vive el comportamiento*, no una estructura de carpetas ni un framework. Escribir Go no idiomático no genera solo bugs funcionales: genera **bugs arquitectónicos** —ciclos de import, interface pollution, indirección y allocaciones innecesarias— que impiden que la app escale. Si una regla de DDD te empuja a un Java-ismo, es la regla la que cede.
+Related skills: `go-design-rules` owns the general design principles (Law of Demeter,
+Tell-Don't-Ask, CQS, named types, illegal states, explicit dependencies, DRY/SOLID);
+`senior-go-idiomatic` owns comment policy, error handling, concurrency, testing and project
+layout outside a bounded context.
 
-> Companion opcional: la skill `senior-go-idiomatic` cubre el detalle del idioma (receivers, interfaces, project layout, errores). Esta skill es **autocontenida** y no depende de ella.
+## Building blocks and their Go shape
 
-## Los building blocks (y su forma en Go)
-
-| Bloque | Qué es | Forma idiomática en Go | Receiver |
+| Block | What it is | Idiomatic Go | Receiver |
 |---|---|---|---|
-| Value Object | Valor sin identidad, inmutable; valida su unidad | `struct{ v ... }` con campo no-exportado + `NewX() (X, error)` | value |
-| Entity | Identidad (ID), mutable; compone VOs | struct con campos privados + ID + métodos con intención | pointer |
-| Aggregate Root | Puerta única a un límite de consistencia | entity cuyo interior no-exportado impone el límite | pointer |
-| Bounded Context | Frontera de lenguaje | un paquete dentro de `internal/` | — |
+| Value object | Value without identity, immutable, validates its unit | struct with unexported field + `NewX(raw) (X, error)` | value |
+| Entity | Identity (ID), mutable, composed of VOs | struct with unexported fields + ID type + intent-revealing methods | pointer |
+| Aggregate root | Single entry to a consistency boundary | entity whose unexported interior enforces the boundary | pointer |
+| Bounded context | Language boundary | one package under `internal/` | — |
 
-Reglas duras:
+- **Value object**: immutable, "never update, create a new one"; equality with `==` (an `Equal` method if it holds a slice). A defined type like `type Email string` is not a safe VO, because untyped constants and conversions from any package bypass validation. → [value-objects.md](references/value-objects.md)
+- **Entity**: equality by ID (`SameAs`), never `==`; no getters/setters; `NewUser(id, email, name, now) (*User, error)` checks how the VOs fit together, not what each VO already checks, and receives time instead of calling `time.Now()`. → [entities.md](references/entities.md)
+- **Aggregate**: unexported fields make package privacy the boundary; one aggregate per transaction; other aggregates referenced **by ID, not pointer**. → [aggregates.md](references/aggregates.md)
+- **Bounded context**: context = package; **folder per context, not per layer**. → [bounded-contexts.md](references/bounded-contexts.md)
 
-- **Value Object**: value receiver, inmutable, "nunca actualiza, crea uno nuevo". Igualdad por valor (`==`; `Equal` si lleva slice). → `references/value-objects.md`
-- **Entity**: pointer receiver, igualdad por **ID** (nunca `==`), sin getters/setters, comportamiento con intención. El constructor valida la **integración** de VOs, no lo que cada VO ya valida. → `references/entities.md`
-- **Aggregate**: campos no-exportados ⇒ la privacidad de paquete impone el límite; 1 aggregate por transacción; referencia a otros aggregates **por ID, no por puntero**. → `references/aggregates.md`
-- **Bounded Context**: contexto = paquete; **carpeta por contexto, NO por capa**. → `references/bounded-contexts.md`
+## Business vs application
 
-## Negocio vs Aplicación
+- **Business logic** lives in entities and VOs and is **pure**: the domain package imports no `database/sql`, `pgx`, `net/http` or `encoding/json`. Its import block is your architecture test (`go list -deps`).
+- **Application logic** (use cases) orchestrates domain + ports: `Input → parse VOs → call ports / entities → Output`. The use case knows the repository; the domain does not.
+- **Ports are declared by the consumer** (the context package) and implemented by infrastructure subpackages (`identity/pgstore`, `identity/memstore`), which translate driver errors into domain errors at the border.
+- **Domain errors become HTTP status at the edge** (`identity/identityhttp`), never inside the domain or the use case.
 
-- **Lógica de negocio**: vive en entidades y value objects. **Pura** — sin imports de `database/sql`, `net/http` ni libs externas. El bloque `import` del paquete de dominio es tu test de arquitectura.
-- **Lógica de aplicación** (use cases): orquesta dominio + repositorios. Dos columnas:
-  - **Integración** (use case): `Input → orquesta repos/entidades → Output`. Conoce el repo; el dominio no.
-  - **Transformación** (DTO): los structs `Input`/`Output` del use case; sin capa `mapper/`.
-- La **interfaz de repositorio la define el consumidor** (aplicación); la implementa la infra, que traduce errores del driver a errores de dominio en la frontera. → `references/application-layer.md`
+→ [application-layer.md](references/application-layer.md)
 
-Flujo: `Input → Use Case (orquesta repositories + entities/aggregates) → Output`.
+## Files and use cases: one file = one intent
 
-## Archivos y casos de uso: un archivo = una intención
+Inside a bounded context, each file name says what the file does, so the package listing
+is the index of what the context can do. These rules are owned here; other skills only
+link to them.
 
-Dentro de un bounded context, el nombre de cada archivo dice qué hace. Abrir el árbol del paquete debe bastar para saber qué sabe hacer el contexto.
+- **One use case = one type + one file**, named after the action in snake_case: `register_user.go` → `RegisterUser`, `sign_up.go` → `SignUp`, `log_in.go` → `LogIn`, `change_email.go` → `ChangeEmail`. A file never holds two use cases, however short: each one has its own dependencies and its own reason to change.
+- **Fixed shape**: `NewRegisterUser(deps...) *RegisterUser` and a single exported `Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error)`. Input is always a struct, even for a single ID, so adding a field never breaks callers. DTOs and ports used only by that use case live in the same file. No `Command`/`Handler`/`UseCase[I, O]` ceremony.
+- **Domain concepts** by name: `user.go`, `email.go`, `order.go`; `errors.go` for the context's sentinels.
+- **Shared ports** in their own file: `user_repository.go` → `type UserRepository interface { FindByID; ExistsByEmail; Save }`, small, defined in the context package.
+- **Infrastructure** in a subpackage of the context (`identity/memstore`, `identity/pgstore`), never in the domain package.
+- **Transport** in `identity/identityhttp/`: one file per endpoint named after its use case plus `routes.go`, using `net/http` method patterns (`mux.Handle("POST /users", ...)`, Go 1.22+).
+- **Forbidden inside a context**, because they name a layer or a drawer instead of an intent: `service.go`, `services.go`, `usecase.go`, `usecases.go`, `use_cases.go`, `application.go`, `app.go`, `manager.go`, `helpers.go`, `utils.go`, `common.go`, a `handler.go`/`handlers.go` with several endpoints, and grouping types `Service`, `UseCase`, `Manager`. The composition root (`internal/handlers/handlers.go`, `cmd/<app>/main.go`) is the exception: wiring is its single intent.
 
-- **Un caso de uso = un tipo + un archivo**, con el nombre de la acción en snake_case: `register_user.go` → `RegisterUser`, `login.go` → `Login`, `search_users.go` → `SearchUsers`. Un archivo **nunca** contiene dos casos de uso (`Login()` y `SignUp()` juntos es una violación, aunque sean cortos).
-- **Forma fija**: `NewRegisterUser(deps...) *RegisterUser` + un único método exportado `Execute(ctx context.Context, in RegisterUserInput) (RegisterUserOutput, error)`, con `RegisterUserInput`/`RegisterUserOutput` en el mismo archivo. Sin `Command`/`Handler`/`UseCase[I, O]`.
-- **Conceptos del dominio** por su nombre: `user.go`, `email.go`, `order.go`; `errors.go` para los sentinela del contexto.
-- **Puertos** en el consumidor: en el archivo del caso de uso si solo él lo usa; si varios lo comparten, en su propio archivo (`user_repository.go` → `UserRepository`).
-- **Transporte** (`<ctx>http/`): un archivo por endpoint con el nombre del caso de uso (`register_user.go`) + `routes.go` que los monta.
-- **Prohibidos** dentro de un contexto: `service.go`, `services.go`, `usecase.go`, `usecases.go`, `use_cases.go`, `application.go`, `app.go`, `manager.go`, `helpers.go`, `utils.go`, `common.go`, y `handler.go`/`handlers.go` con varios endpoints. Tampoco tipos `Service`, `UseCase` o `Manager` que agrupen operaciones.
+Comments in generated code follow the `senior-go-idiomatic` comment policy (one-line package
+doc in one file per package, one-line doc comments that add information, no narration).
 
-→ forma completa en `references/application-layer.md`; ejemplo compilable en `references/worked-example.md`.
+→ full rules and forbidden-name table in [application-layer.md](references/application-layer.md) §2; compiled example in [worked-example.md](references/worked-example.md).
 
-## Comentarios: el código no se narra
+## Anti-patterns (Java-ism → idiomatic Go)
 
-- Package doc de **una línea**, en un solo archivo del paquete.
-- Exportados: doc comment de **una línea**, y solo si dice algo que el nombre no dice (`// NewUser exige nombre y apellido cuando el email es corporativo.`). `// RegisterUser registra un usuario.` sobra.
-- No exportados: sin comentario, salvo un **por qué** no obvio.
-- Prohibido: comentarios que narran el código (`// guardamos el usuario`), banners `// ----`, comentarios que repiten el nombre, bloques que explican la arquitectura. Eso va en el README o en el ADR, no en el `.go`.
-- Si un bloque generado tiene más líneas de comentario que de código, está mal: recórtalo antes de entregarlo.
-
-## Anti-patrones (Java-ismo → Go idiomático)
-
-| Java-ismo | Go idiomático |
+| Java-ism | Idiomatic Go |
 |---|---|
-| Carpetas por capa (`domain/`, `application/`, `infrastructure/`) | Paquete por contexto, archivo por rol |
-| Interfaz por clase | Interfaz en el consumidor, solo con 2ª impl o seam de test |
-| Getters/Setters (`GetX`/`SetX`) | Métodos con intención; sin `Get` |
-| Modelo anémico (datos + service gordo) | Rich model: la lógica vive con los datos |
-| Capa `mapper/` + auto-mapper (reflection) | DTO junto al use case; traducción a mano |
-| Referencia entre aggregates por puntero | Por ID |
-| Repo que filtra `pgconn.PgError` / `sql.ErrNoRows` | Traduce a error de dominio en la frontera |
-| Value object mutable / con setters | Inmutable; crea uno nuevo |
-| `service.go`/`usecase.go` con `type Service` y varios casos de uso | Un archivo y un tipo por caso de uso (`login.go` → `Login`) |
+| Folders per layer (`domain/`, `application/`, `infrastructure/`) | Package per context, file per concept or use case |
+| Interface per class | Interface at the consumer, only with a 2nd implementation or a test seam |
+| `GetX`/`SetX` | Intent-revealing methods; no `Get` prefix |
+| Anemic model + fat service | Rich model: logic lives with the data |
+| `mapper/` layer + reflection auto-mapper | DTOs next to the use case; hand translation |
+| Pointer between aggregates | Reference by ID |
+| Repository leaking `pgconn.PgError` / `sql.ErrNoRows` | Translated to a domain error at the border |
+| Mutable VO with setters | Immutable; create a new one |
+| `service.go` with `type Service` and several use cases | One file and one type per use case (`log_in.go` → `LogIn`) |
 
-→ catálogo completo (13) en `references/antipatterns.md`.
+→ full catalogue (13, with BAD/GOOD) in [antipatterns.md](references/antipatterns.md).
 
-## Checklist de decisión
+## Decision checklist
 
-Antes de escribir un tipo de dominio:
+Before writing a domain type or a use case:
 
-- [ ] ¿Tiene identidad que persiste en el tiempo? → **Entity**. ¿Se define solo por sus atributos? → **Value Object**.
-- [ ] Si es VO: ¿campo no-exportado + `NewX() (X, error)` + value receiver + inmutable?
-- [ ] Si es Entity: ¿pointer receiver + igualdad por ID + métodos con intención (sin `Set`)?
-- [ ] ¿Hay una invariante transaccional que abarque varias entidades? → **Aggregate root**. Si no, no inventes uno.
-- [ ] ¿Esta lógica toca repos/http/libs? → va en el **use case**, no en el dominio.
-- [ ] ¿El paquete de dominio importa `database/sql` o `net/http`? → se filtró la infraestructura.
-- [ ] ¿Estoy creando `domain/`, `application/`, `infrastructure/`, `models/`, `dto/`, `util/`? → reorganiza por contexto.
-- [ ] ¿El archivo se llama `service.go`, `usecase.go`, `app.go`, `manager.go`, `helpers.go` o `handler.go`? → renómbralo por lo que hace o pártelo.
-- [ ] ¿Este archivo contiene más de un caso de uso? → un archivo y un tipo por caso de uso (`RegisterUser` en `register_user.go`).
-- [ ] ¿Cada caso de uso tiene `NewX`, un único `Execute(ctx, XInput) (XOutput, error)` y sus DTO al lado?
-- [ ] ¿Hay comentarios que narran el código o repiten el nombre? → bórralos; deja solo el *por qué* no obvio.
+- [ ] Does it have an identity that persists over time? → **Entity**. Defined only by its attributes? → **Value object**.
+- [ ] VO: unexported field + `NewX(...) (X, error)` + value receiver + immutable?
+- [ ] Entity: pointer receiver + equality by ID + intent-revealing methods (no `Set`) + `now` passed in?
+- [ ] Is there a transactional invariant spanning several entities? → **Aggregate root**. If not, do not invent one.
+- [ ] Does this logic touch repositories, HTTP or libraries? → it belongs in the **use case**, not the domain.
+- [ ] Does the domain package import `database/sql`, `net/http` or `encoding/json`? → infrastructure leaked.
+- [ ] Am I creating `domain/`, `application/`, `infrastructure/`, `models/`, `dto/`, `util/`? → reorganize by context.
+- [ ] Is the file called `service.go`, `usecase.go`, `app.go`, `manager.go`, `helpers.go` or `handler.go`? → rename it after what it does, or split it.
+- [ ] Does each use case have `NewX`, one `Execute(ctx, XInput) (XOutput, error)` and its DTOs next to it, in its own file?
 
-## Reference Files
+## Reference files
 
-Lee el archivo relevante cuando la pregunta sea de ese tema. No cargues todos a la vez.
+Read the one that matches the question; do not load them all.
 
-- `references/bounded-contexts.md` — contexto = paquete en `internal/`, ubiquitous language, carpeta por contexto no por capa, integración por interfaz publicada / eventos / ACL
-- `references/value-objects.md` — inmutabilidad por convención, alias vs struct, constructor validador, igualdad `==`/`Equal`, errores tipados
-- `references/entities.md` — identidad + pointer receivers, igualdad por ID, constructor que integra VOs, sin getters/setters, rich vs anémico
-- `references/aggregates.md` — root, límite de consistencia, la privacidad de paquete como frontera, 1 aggregate/tx, referencia por ID
-- `references/application-layer.md` — un caso de uso = un tipo + un archivo, nombres prohibidos, repositorio consumer-defined, DTO sin `mapper/`, mapeo error→status, test de pureza del import
-- `references/antipatterns.md` — catálogo Java-ismo → Go idiomático (13 anti-patrones, con BAD/GOOD)
-- `references/worked-example.md` — contexto `identity` completo y **compilable**: VO → entity → puertos → dos casos de uso en dos archivos → infra → un endpoint por archivo → wiring → tests
+- [bounded-contexts.md](references/bounded-contexts.md): drawing context boundaries, package vs folder layout, integration via consumer-defined interfaces, events and an ACL, when to split into a service.
+- [value-objects.md](references/value-objects.md): designing a VO, struct vs defined type, validating constructors, equality, typed/sentinel errors, reconstitution from storage.
+- [entities.md](references/entities.md): identity, pointer receivers, equality by ID, constructors that take `now`, accessors vs setters, rich vs anemic.
+- [aggregates.md](references/aggregates.md): choosing a root, consistency boundary, one aggregate per transaction, references by ID, authorization in the use case, not exposing internals.
+- [application-layer.md](references/application-layer.md): use-case shape and file rules, forbidden names, port placement, infrastructure error translation, DTOs, error → status mapping, wiring.
+- [antipatterns.md](references/antipatterns.md): reviewing code that looks like Java/C# DDD; 13 BAD/GOOD pairs.
+- [worked-example.md](references/worked-example.md): when you need a complete, compiled context (`identity`) to copy from: VOs → entity → port → two use cases → memstore → HTTP → wiring → race-tested tests.

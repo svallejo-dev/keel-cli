@@ -1,112 +1,118 @@
-# Illegal States — Modelar con Tipos para que lo Inválido no Compile
+# Illegal States: Model With Types So Invalid Values Do Not Compile
 
-Técnicas para que el conjunto de valores que un tipo admite coincida con el que el dominio
-permite, moviendo errores de runtime a compile time. Estándar hoy Go 1.26; snippets
-verificados contra el toolchain 1.24.7.
+## Contents
 
-> **Regla #0.** Ante conflicto entre un principio de diseño y el Go idiomático, gana Go. Un
-> tipo-fortaleza que pelea con `gofmt`, con la semántica de valor o con el zero value útil no
-> es más seguro: es fricción. Las skills compañeras `senior-go-idiomatic` (lenguaje) y
-> `ddd-go-idiomatic` (dominio) son opcionales; esta referencia es autocontenida.
+1. Make illegal states unrepresentable + parse, don't validate
+2. Constructors that return `(T, error)`
+3. `iota` enums and the invalid zero value
+4. Distinct types for units
+5. Functional options instead of bool flags and contradictory config
+6. Mutually exclusive states: sum types in Go
+7. Goal: push every invariant as early as possible
+
+Techniques to make the set of values a type admits match the set the domain allows, moving
+errors from runtime to compile time. A fortress type that fights `gofmt`, value semantics or
+a useful zero value is not safer, it is friction; when they clash, the Go idiom wins.
 
 ## 1. Make illegal states unrepresentable + parse, don't validate
 
-**Regla.** Modela el dominio con tipos tales que un valor inválido no se pueda construir.
-**Por qué.** Cada `string`/`int` crudo en circulación es una re-validación pendiente: nadie
-sabe si ya fue validada. **Parse, don't validate**: en la frontera (HTTP, CLI, DB) parsea el
-input crudo a un tipo de dominio de una vez; `validate(raw) error` deja el `raw` vivo, `parse(raw) (T, error)`
-devuelve un valor cuya existencia *es* la prueba de validez.
+**Rule.** Model the domain with types such that an invalid value cannot be built.
+**Why.** Every raw `string`/`int` in circulation is a pending re-validation: nobody knows
+whether it was checked. **Parse, don't validate**: at the boundary (HTTP, CLI, DB) parse the
+raw input into a domain type once. `validate(raw) error` leaves `raw` alive;
+`parse(raw) (T, error)` returns a value whose existence *is* the proof of validity, and
+unexported fields keep it that way.
 
 ```go
-type User struct {
+// RegistrationRequest is raw transport input; nothing about it is trusted.
+type RegistrationRequest struct {
 	Email string
 	Age   int
 }
 
-type signupRequest struct {
-	Email string
-	Age   int
+// Registration is a parsed request: a well-formed address and an adult age.
+type Registration struct {
+	email string
+	age   int
 }
 
-// ParseSignup es el único punto que valida; el resto confía en User.
-func ParseSignup(req signupRequest) (User, error) {
+// ParseRegistration is the only way to get a Registration, so holding one proves it is valid.
+func ParseRegistration(req RegistrationRequest) (Registration, error) {
 	addr, err := mail.ParseAddress(req.Email)
 	if err != nil {
-		return User{}, fmt.Errorf("parse signup: email: %w", err)
+		return Registration{}, fmt.Errorf("parse registration: email: %w", err)
 	}
 	if req.Age < 18 {
-		return User{}, fmt.Errorf("parse signup: age %d below minimum", req.Age)
+		return Registration{}, fmt.Errorf("parse registration: age %d below minimum", req.Age)
 	}
-	return User{Email: addr.Address, Age: req.Age}, nil
+	return Registration{email: addr.Address, age: req.Age}, nil
 }
+
+// Email is the parsed address, without display name.
+func (r Registration) Email() string { return r.email }
 ```
 
-Dónde vive cada validación respecto a las capas es competencia de `references/dependencies.md`.
+Had `Registration` exported its fields, any package could write
+`Registration{Email: "x", Age: 3}` and the parse would prove nothing. Where the boundary sits
+inside a bounded context (the use case parses its `XInput` into value objects) is described
+by the `ddd-go-idiomatic` skill.
 
-## 2. Constructores que devuelven `(T, error)`
+## 2. Constructors that return `(T, error)`
 
-**Regla.** La validación de un tipo vive UNA vez, en su constructor. **Por qué.** Si el único
-camino a un `Percentage` pasa por `NewPercentage`, tenerlo en la mano ya implica rango válido;
-ningún consumidor re-chequea `0..100`.
+**Rule.** A type's validation lives ONCE, in its constructor. **Why.** If the only path to a
+`Percentage` goes through `NewPercentage`, holding one already implies a valid range; no
+consumer re-checks `0..100`.
 
 ```go
+// Percentage is a value in [0, 100].
 type Percentage struct {
 	v float64
 }
 
+// NewPercentage rejects values outside [0, 100].
 func NewPercentage(v float64) (Percentage, error) {
 	if v < 0 || v > 100 {
-		return Percentage{}, fmt.Errorf("percentage: out of range 0..100: %v", v)
+		return Percentage{}, fmt.Errorf("percentage: %v out of range 0..100", v)
 	}
 	return Percentage{v: v}, nil
 }
 
-func (p Percentage) Value() float64 { return p.v }
-
+// Apply returns the percentage of amount.
 func (p Percentage) Apply(amount float64) float64 {
 	return amount * p.v / 100
 }
 ```
 
-El campo `v` no-exportado hace imposible fabricar `Percentage{v: 500}` fuera del paquete. El
-único estado inválido posible es el zero value (`Percentage{}` ≡ 0%), y ahí 0 sí es legal;
-cuando NO lo sea, ese es el problema de la sección 3. Si el zero value ya es válido y no hay
-invariante que proteger, un constructor `return T{}` es ruido: déjalo fuera.
+The unexported `v` makes `Percentage{v: 500}` impossible outside the package. The only value
+nobody validated is the zero value (`Percentage{}` ≡ 0%), and here 0 is legal; when it is
+not, see §3. Note that a defined type (`type Percentage float64`) would **not** give this
+guarantee: `Percentage(500)` compiles in any package, and so does passing the untyped
+constant `500` where a `Percentage` is expected. If the zero value is valid and there is no
+invariant to protect, a constructor that just returns `T{}` is noise: leave it out.
 
-## 3. Enums con iota y el problema del "invalid zero"
+## 3. `iota` enums and the invalid zero value
 
-**Regla.** El zero value de un enum con `iota` es su primera constante; diséñala a propósito.
-**Por qué.** Un `Status` sin inicializar vale `0`; si `0` es `StatusPending`, un struct a
-medio construir "parece" pending y el bug es silencioso. Dos patrones combinables: **(a)** el
-cero es `Unknown`/`Invalid` explícito, un centinela que ningún flujo produce; **(b)** validar
-en la frontera con un `Parse*`, único puente desde strings.
+**Rule.** The zero value of an `iota` enum is its first constant; design it on purpose.
+**Why.** An uninitialized `Status` is `0`; if `0` is `StatusPending`, a half-built struct
+"looks" pending and the bug is silent. Two combinable patterns: **(a)** zero is an explicit
+`Unknown`/`Invalid` sentinel no flow produces; **(b)** a `Parse*` function at the boundary is
+the only bridge from strings.
 
 ```go
+// Status is the shipping state of an order.
 type Status int
 
 //go:generate stringer -type=Status
 
+// Shipping states; zero is deliberately invalid so a forgotten field is detectable.
 const (
-	StatusUnknown   Status = iota // 0: zero value = inválido explícito
-	StatusPending                 // 1
-	StatusShipped                 // 2
-	StatusDelivered               // 3
+	StatusUnknown Status = iota
+	StatusPending
+	StatusShipped
+	StatusDelivered
 )
 
-// A mano para que compile sin `stringer`.
-func (s Status) String() string {
-	switch s {
-	case StatusPending:
-		return "pending"
-	case StatusShipped:
-		return "shipped"
-	case StatusDelivered:
-		return "delivered"
-	default:
-		return "unknown"
-	}
-}
-
+// ParseStatus is the only conversion from external strings.
 func ParseStatus(raw string) (Status, error) {
 	switch raw {
 	case "pending":
@@ -116,20 +122,19 @@ func ParseStatus(raw string) (Status, error) {
 	case "delivered":
 		return StatusDelivered, nil
 	default:
-		return StatusUnknown, fmt.Errorf("enums: invalid status %q", raw)
+		return StatusUnknown, fmt.Errorf("invalid status %q", raw)
 	}
 }
 ```
 
-`//go:generate stringer -type=Status` genera el `String()` con `go generate` (a mano aquí para
-que compile). Nunca uses strings mágicos (`"shipped"`) como estado interno: no son type-safe
-y el compilador no detecta un typo.
+`go generate` with `stringer` produces `String()`. Never use magic strings (`"shipped"`) as
+internal state: they are not type-safe and the compiler cannot catch a typo.
 
-## 4. Tipos distintos para unidades
+## 4. Distinct types for units
 
-**Regla.** Da a cada unidad su propio tipo con nombre; no compartas `float64`/`int`. **Por qué.**
-`Meters` y `Feet` son ambos `float64`, pero sumarlos es un bug; con tipos distintos el
-compilador te detiene. Igual con `Cents` vs un `float` de dólares, donde además pierdes precisión.
+**Rule.** Give each unit its own named type; do not share `float64`/`int`. **Why.** `Meters`
+and `Feet` are both `float64`, but adding them is a bug; with distinct types the compiler
+stops you. Same for `Cents` vs a `float64` of dollars, where you also lose precision.
 
 ```go
 type (
@@ -137,31 +142,26 @@ type (
 	Feet   float64
 )
 
+// ToFeet is the only bridge between the two units.
 func (m Meters) ToFeet() Feet { return Feet(m * 3.28084) }
 
-type Cents int64
-
-func (c Cents) Add(other Cents) Cents { return c + other }
-
-func demo() {
-	var d Meters = 10
-	var runway Feet = 100
-	// BAD: no compila — invalid operation: mismatched types Meters and Feet.
-	// _ = d + runway
-	_ = d.ToFeet() + runway // GOOD: la conversión es el único puente entre unidades.
+func runwayMargin(length Meters, needed Feet) Feet {
+	// return length - needed  // does not compile: mismatched types Meters and Feet
+	return length.ToFeet() - needed
 }
 ```
 
-Coste cero en runtime (son el tipo subyacente) y la conversión explícita marca dónde cambias
-de unidad: el punto donde se cuelan los errores de factor.
+Zero runtime cost (they are the underlying type), and the explicit conversion marks where
+you change units, which is exactly where factor errors sneak in. Every `float64` is a valid
+length, so a defined type is enough here: there is no invariant for a constructor to protect.
 
-## 5. Functional options sobre bool flags y config contradictorio
+## 5. Functional options instead of bool flags and contradictory config
 
-**Regla.** Para constructores con muchos parámetros opcionales, usa **functional options** en
-vez de flags posicionales o un config struct que admite combinaciones inválidas. **Por qué.**
-`NewServer(addr, true, false, 30)` es ilegible (¿qué es `false`?) y crece mal; un
-`Config{TLS: false, Cert: "x.pem"}` deja representable "sin TLS pero con certificado". El
-patrón: una `Option` es una función que muta una `config` no-exportada.
+**Rule.** For constructors with many optional parameters, use **functional options** rather
+than positional flags or a config struct that admits invalid combinations. **Why.**
+`NewServer(addr, true, false, 30)` is unreadable (what is `false`?) and grows badly; a
+`Config{TLS: false, Cert: "x.pem"}` makes "no TLS but with a certificate" representable. An
+`Option` is a function that mutates an unexported `config`.
 
 ```go
 type config struct {
@@ -170,8 +170,10 @@ type config struct {
 	timeout time.Duration
 }
 
+// Option configures a Server.
 type Option func(*config)
 
+// WithTLS enables TLS with the given certificate; it is the only way to set a certificate.
 func WithTLS(cert string) Option {
 	return func(c *config) {
 		c.tls = true
@@ -179,12 +181,14 @@ func WithTLS(cert string) Option {
 	}
 }
 
+// WithTimeout overrides the 30s default.
 func WithTimeout(d time.Duration) Option {
 	return func(c *config) { c.timeout = d }
 }
 
+// NewServer applies opts over safe defaults; addr is required, so it is positional.
 func NewServer(addr string, opts ...Option) *Server {
-	cfg := config{timeout: 30 * time.Second} // defaults sanos
+	cfg := config{timeout: 30 * time.Second}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -193,40 +197,41 @@ func NewServer(addr string, opts ...Option) *Server {
 ```
 
 ```go
-// GOOD: cada option se autodescribe en el call site (vs NewServer(addr, true, false, 30)).
 s := NewServer("localhost:8443",
 	WithTLS("server.pem"),
 	WithTimeout(5*time.Second),
 )
 ```
 
-`WithTLS` liga `tls` y `cert` en una operación: no hay forma de pedir certificado sin activar
-TLS — ahí el patrón elimina el estado contradictorio, no solo el ruido. Los parámetros
-obligatorios van posicionales (`addr`), no como `WithAddr`.
+`WithTLS` binds `tls` and `cert` in one operation: there is no way to ask for a certificate
+without enabling TLS. Here the pattern removes a contradictory state, not just noise.
 
-## 6. Estados mutuamente excluyentes: sum types en Go
+## 6. Mutually exclusive states: sum types in Go
 
-**Regla.** Cuando un valor es exactamente una de N variantes cerradas, exprésalo con una
-**sealed interface**. **Por qué.** Go no tiene unions ni `enum` con payload. El idiom es una
-interfaz con un método **no-exportado**: solo los tipos del propio paquete pueden
-implementarla, así el conjunto queda cerrado y ningún paquete externo añade una variante.
+**Rule.** When a value is exactly one of N closed variants, express it with a **sealed
+interface**. **Why.** Go has no unions or enums with payload. The idiom is an interface with
+an **unexported** method: only types in the same package can implement it, so the set is
+closed and no outside package adds a variant.
 
 ```go
-// El método no exportado sella el conjunto: otros paquetes no pueden implementarla.
+// PaymentMethod is sealed by its unexported method: only this package adds variants.
 type PaymentMethod interface {
 	isPaymentMethod()
 }
 
+// Card pays with a card; only cards carry digits.
 type Card struct {
 	Last4 string
 }
 
 func (Card) isPaymentMethod() {}
 
+// Cash has no payload.
 type Cash struct{}
 
 func (Cash) isPaymentMethod() {}
 
+// Describe renders a method for receipts.
 func Describe(m PaymentMethod) string {
 	switch v := m.(type) {
 	case Card:
@@ -234,78 +239,69 @@ func Describe(m PaymentMethod) string {
 	case Cash:
 		return "cash"
 	default:
-		// Inalcanzable: el set es cerrado. Panic revela un error de programa.
+		// Unreachable while the set is closed; a panic reveals a programming error.
 		panic(fmt.Sprintf("payment: unhandled method %T", m))
 	}
 }
 ```
 
-Cada variante lleva solo sus campos (`Card` tiene `Last4`, `Cash` ninguno): eso hace
-irrepresentable "efectivo con número de tarjeta". El type switch es la forma idiomática de
-consumirlas; el `default` con `panic` documenta que el caso es inalcanzable.
+Each variant carries only its own fields (`Card` has `Last4`, `Cash` nothing), which makes
+"cash with a card number" unrepresentable. The variants are plain values, so exported fields
+are fine; the closed set is what the interface protects.
 
-### Alternativa: un `kind` + validación
+### Alternative: a `kind` field plus validation
 
-La sealed interface cuesta interface dispatch, allocación por variante y verbosidad. Cuando
-las variantes comparten casi todos los campos, un discriminador `kind` con validación es más simple.
+A sealed interface costs interface dispatch, an allocation per variant and verbosity. When
+variants share almost all fields, a `kind` discriminator is simpler:
 
 ```go
+// EventKind discriminates Event; zero is invalid.
 type EventKind int
 
+// Event kinds.
 const (
 	EventUnknown EventKind = iota
 	EventClick
 	EventScroll
 )
 
+// Event is a UI event; X and Y only mean something for EventClick.
 type Event struct {
 	Kind EventKind
-	X, Y int // solo válidos para EventClick
-}
-
-func NewClick(x, y int) Event {
-	return Event{Kind: EventClick, X: x, Y: y}
-}
-
-func (e Event) Validate() error {
-	if e.Kind == EventUnknown {
-		return fmt.Errorf("kindvariant: unknown event kind")
-	}
-	return nil
+	X, Y int
 }
 ```
 
-El `kind` no impide un `Event{Kind: EventScroll, X: 5}` incoherente —el struct expone campos
-que no aplican a toda variante—, así que la coherencia recae en `NewClick` y `Validate`. La
-sealed interface hace ese estado irrepresentable; el `kind` solo lo hace detectable. Agrupar
-comportamiento por variante es tema de `references/coupling-behavior.md`.
+A `kind` does not prevent an incoherent `Event{Kind: EventScroll, X: 5}`: the struct exposes
+fields that do not apply to every variant, so coherence rests on constructors such as
+`NewClick(x, y)` and a `Validate()` check. A sealed interface makes that state
+unrepresentable; a `kind` only makes it detectable.
 
-## 7. Objetivo: si un estado no debe existir, que no compile
+## 7. Goal: if a state must not exist, it should not compile
 
-Las siete técnicas persiguen lo mismo: reducir el conjunto de valores construibles al de
-valores válidos, lo más arriba posible en la escala compile-time → runtime.
+All of these techniques shrink the set of buildable values towards the set of valid ones,
+as early as possible on the compile-time → runtime scale.
 
-| Nivel                    | Herramienta                        | Falla el estado inválido    |
-| ------------------------ | ---------------------------------- | --------------------------- |
-| Compile time (mejor)     | tipos distintos, sealed interface  | al escribir el código       |
-| Construcción             | constructor `(T, error)`, options  | al construir el valor       |
-| Frontera                 | parse-don't-validate, `Parse*`     | al entrar el input crudo    |
-| Runtime (último recurso) | `kind` + `Validate()`              | al chequear explícitamente  |
+| Level | Tool | When the invalid state fails |
+| --- | --- | --- |
+| Compile time (best) | distinct types, sealed interface | while writing the code |
+| Construction | `(T, error)` constructor with unexported fields, options | when building the value |
+| Boundary | parse-don't-validate, `Parse*` | when raw input enters |
+| Runtime (last resort) | `kind` + `Validate()` | when checked explicitly |
 
-Sube cada invariante tan alto como el lenguaje te deje sin pelear con él (Regla #0): un
-`Meters`/`Feet` cuesta cero y atrapa el bug al compilar; un `Validate()` es el último recurso.
-Nombrar estos tipos se trata en `references/domain-naming.md`; evitar validación duplicada, en
-`references/dry-solid-go.md`.
+Push every invariant as high as the language allows without fighting it: `Meters`/`Feet`
+cost nothing and catch the bug at compile time; a `Validate()` is the last resort. Naming
+these types is covered in [domain-naming.md](domain-naming.md); avoiding duplicated
+validation in [dry-solid-go.md](dry-solid-go.md).
 
 ## Checklist
 
-- [ ] El input crudo se **parsea** a un tipo de dominio en la frontera, no se valida y se deja circular.
-- [ ] Cada invariante vive UNA vez, en el constructor `NewX(...) (X, error)`; campos con invariante van no-exportados.
-- [ ] Enum con `iota`: primera constante = `Unknown`/`Invalid` explícito, o `Parse*` en la frontera; `String()` vía `stringer`.
-- [ ] Cero strings mágicos como estado interno.
-- [ ] Unidades y magnitudes distintas → tipos distintos; conversión explícita como único puente.
-- [ ] Muchos opcionales → functional options; `WithX` liga campos co-dependientes para que no exista la combinación inválida.
-- [ ] Variantes mutuamente excluyentes → sealed interface (método no-exportado) + type switch; cada variante solo sus campos.
-- [ ] `kind` + `Validate()` solo cuando la sealed interface es demasiado; la coherencia recae en el constructor.
-- [ ] Cada invariante empujado tan alto como se pueda: compile time > construcción > frontera > runtime.
-- [ ] `gofmt -l` vacío, `go build ./...` y `go vet ./...` limpios.
+- [ ] Raw input is **parsed** into a domain type at the boundary, not validated and left circulating.
+- [ ] Parsed types keep their fields unexported, so holding one proves it passed the parser.
+- [ ] Each invariant lives ONCE, in `NewX(...) (X, error)`; a defined type (`type X float64`) only where every value is valid.
+- [ ] `iota` enum: first constant is an explicit `Unknown`/`Invalid`, or a `Parse*` guards the boundary; `String()` via `stringer`.
+- [ ] No magic strings as internal state.
+- [ ] Distinct units and magnitudes → distinct types; explicit conversion as the only bridge.
+- [ ] Many optional settings → functional options; a `WithX` binds co-dependent fields so the invalid combination cannot exist.
+- [ ] Mutually exclusive variants → sealed interface (unexported method) + type switch; each variant has only its fields.
+- [ ] `kind` + `Validate()` only when a sealed interface is overkill.

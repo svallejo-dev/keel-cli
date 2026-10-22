@@ -1,91 +1,80 @@
 ---
 name: go-design-rules
 description: >
-  Design and coupling rules applied the idiomatic Go way — Law of Demeter,
-  Tell-Don't-Ask, Command–Query Separation, domain naming (named types over
-  primitives), make-illegal-states-unrepresentable / parse-don't-validate,
-  explicit dependencies (no globals/singletons), and DRY/SOLID read through a Go
-  lens. Use when designing or reviewing Go code for coupling, naming, type-safety,
-  or dependency smells. Trigger on "law of demeter", "tell don't ask", "command
-  query separation", "CQS", "stringly-typed", "boolean blindness", "named types",
-  "make illegal states unrepresentable", "parse don't validate", "dependency
-  injection in Go", "no globals", "DRY", "SOLID in Go", "is this good design",
-  "design smell", "how should this be structured", "service.go", "usecase.go",
-  "file naming", "one use case per file", or "too many comments". Rule #0: when a design
-  principle conflicts with Go idioms, Go idioms win.
+  Cross-cutting design principles applied the idiomatic Go way: Law of Demeter,
+  Tell-Don't-Ask, Command–Query Separation, named types over primitives, making illegal
+  states unrepresentable (parse, don't validate), explicit dependencies instead of
+  globals, and DRY/SOLID read through a Go lens. Use when designing or reviewing Go code
+  for coupling, type-safety or dependency smells. Triggers: "law of demeter", "train
+  wreck", "tell don't ask", "CQS", "stringly-typed", "boolean blindness", "named types",
+  "illegal states unrepresentable", "parse don't validate", "dependency injection in Go",
+  "global variables", "singleton", "DRY", "SOLID in Go", "design smell", "acoplamiento",
+  "ley de Demeter", "estados ilegales", "inyección de dependencias".
 ---
 
 # Go Design Rules
 
-Reglas de diseño y acoplamiento **alineadas a Go**. No son sobre sintaxis ni sobre DDD: son sobre las decisiones de acoplamiento, nombres, tipos y dependencias que hacen que el código escale. Cada regla trae su marco Go y su **trampa** (dónde el canon OOP se desalinea si lo aplicas literal).
+Design and coupling rules aligned with Go. They are not about syntax or about DDD: they are
+about the coupling, naming, typing and dependency decisions that let code keep scaling. Each
+rule comes with its Go framing and its **trap**: where the OOP canon misleads you if applied
+literally.
 
-## Regla #0 — go-idiomatic manda
+**Rule #0: when a design principle conflicts with a Go idiom, the Go idiom wins.** Quote the
+canon with an asterisk: importing it whole (inheritance hierarchies, abstract factories,
+interface per class, getters/setters) pushes towards Java-isms that break in Go (import
+cycles, interface pollution, indirection, allocations). Take what fits, reinterpret the rest,
+drop what needs inheritance.
 
-Ante cualquier conflicto entre un principio de diseño (OOP/SOLID/DRY) y una convención idiomática de Go, **gana go-idiomatic**. El canon se cita **con asterisco**: importarlo entero —jerarquías de herencia, abstract factories, interfaz-por-clase, getters/setters— te empuja a Java-ismos que rompen en Go (ciclos de import, interface pollution, indirección y allocaciones). Toma lo que encaja, reinterpreta lo demás, descarta lo que exige herencia.
+Scope: these principles only. Where a use case, port or file goes inside a bounded context
+(one use case per file, `service.go`, file naming) is owned by `ddd-go-idiomatic`; comment
+policy and general idioms by `senior-go-idiomatic`.
 
-> Compañeras opcionales: `senior-go-idiomatic` (el idioma) y `ddd-go-idiomatic` (modelado de dominio). Esta skill es **autocontenida** y no depende de ellas.
+## Principles (Go rule → smell it kills)
 
-## Principios (regla en Go → smell que mata)
-
-| Principio | Regla en Go | Smell que mata |
+| Principle | Rule in Go | Smell it kills |
 |---|---|---|
-| Ley de Demeter | No atravieses objetos ajenos; Tell-Don't-Ask | *train-wreck* `a.B().C().D()` sobre grafos que no posees |
-| Command–Query Separation | Command muta y devuelve `error`; query es pura | getter que muta al vuelo y devuelve |
-| Nombres de dominio | Named types sobre primitivos | *stringly-typed*, *boolean blindness* |
-| Métodos con intención | Verbo de negocio, no CRUD | `SetStatus` / `SetBalance` que rompe invariantes |
-| Archivos con intención | Un caso de uso por archivo, nombrado por lo que hace | `service.go`/`usecase.go` con `Login()` + `Signup()` |
-| Illegal states unrepresentable | Parse-don't-validate; constructores `(T, error)` | validar el mismo dato en 10 sitios |
-| Dependencias explícitas | Inyección por constructor | `var` global mutable, singleton, service locator |
-| DRY con matiz | No dupliques **conocimiento** (no código que se parece) | `common/`/`shared/` que acopla dominios distintos |
-| SOLID selectivo | ISP y DIP son nativos; OCP por composición | herencia simulada, interfaz-por-clase |
+| Law of Demeter | Do not reach through objects you do not own | *train wreck* `a.B().C().D()` over someone else's graph |
+| Tell, Don't Ask | Ask the owner to act; it guards its invariant | read state → decide outside → write state |
+| Command–Query Separation | A command mutates and returns `error`; a query is pure | a "getter" that mutates on the fly |
+| Named types | Domain types over primitives; enums with `iota` | *stringly-typed* code, *boolean blindness*, swapped arguments |
+| Intent-revealing methods | Business verbs, not CRUD | `SetStatus` / `SetBalance` that break invariants |
+| Illegal states unrepresentable | Parse, don't validate; constructors `(T, error)`; unexported fields | the same value validated in ten places |
+| Explicit dependencies | Constructor injection; wiring in `main` | mutable package `var`, singleton, service locator |
+| DRY with nuance | Do not duplicate **knowledge** (not code that looks alike) | `common/`/`shared/` coupling unrelated domains |
+| Selective SOLID | ISP and DIP are native; OCP by composition | simulated inheritance, interface per class |
 
-La **trampa** más importante, para no traicionar la Regla #0: la Ley de Demeter **no** es "la regla del punto único" — encadenar sobre valores que *posees* o sobre la stdlib componible (`strings.ToLower(strings.TrimSpace(s))`, `io.Copy`, `errors.Is`, functional options) es idiomático y no la viola. La regla real es: no dependas de la **estructura** de lo que te devuelven tus colaboradores.
+The most important trap, so as not to betray Rule #0: the Law of Demeter is **not** "one dot
+per line". Chaining over values you own or over composable stdlib
+(`strings.ToLower(strings.TrimSpace(s))`, `io.Copy`, `errors.Is`, functional options) is
+idiomatic and does not violate it. The real rule: do not depend on the **structure** of what
+your collaborators return.
 
-## Guardián: archivos y tipos con intención
+A second one: a defined type such as `type Email string` names a concept and stops argument
+swaps, but it does **not** guarantee validity (an untyped constant like `"garbage"` converts
+implicitly, and any package can write `Email(s)`). When the value has an invariant, use a
+struct with an unexported field and a validating constructor.
 
-En un bounded context, **el nombre del archivo dice qué hace**. Cada caso de uso vive en
-su archivo (`login.go`, `signup.go`, `search_users.go`) con **un** struct de nombre de
-acción (`Login`), constructor `NewLogin(deps...)` y un único método exportado
-`Execute(ctx, in LoginInput) (LoginOutput, error)`; sus DTOs y puertos estrechos van en
-el mismo archivo (un puerto compartido, en su propio archivo: `user_repository.go`).
+## Smell checklist
 
-- **Prohibidos** dentro de un contexto: `service.go`, `services.go`, `usecase.go`,
-  `usecases.go`, `use_cases.go`, `application.go`, `app.go`, `manager.go`, `helpers.go`,
-  `utils.go`, `common.go`, y `handler.go`/`handlers.go` con varios endpoints (transporte:
-  un archivo por endpoint + `routes.go`).
-- **Prohibidos** los tipos cajón `Service`, `UseCase`, `Manager`.
-- **Permitidos**: conceptos (`user.go`, `email.go`), `errors.go`, puertos con nombre
-  (`user_repository.go`), `routes.go`, y composition roots fuera de los contextos
-  (`internal/handlers/handlers.go` solo monta rutas).
+Review a change against this:
 
-Detalle, tabla BAD → GOOD y el caso Login/Signup: `references/domain-naming.md` §7.
+- [ ] A train wreck `x.A().B().C()` over objects you do not own? → Tell-Don't-Ask, or pass only the data.
+- [ ] A method that mutates **and** silently returns data? → split command from query.
+- [ ] Raw `int64`/`string`/`bool` parameters where there is a concept? → named type, enum or functional option.
+- [ ] A `SetX` that can leave the object invalid? → an intent-revealing method that keeps the invariant.
+- [ ] A value with an invariant modeled as `type X string`? → struct with unexported field + `NewX(...) (X, error)`.
+- [ ] The same value validated in several places? → parse it into a valid type **once**, at the boundary.
+- [ ] A mutable package `var`, a singleton or a service locator? → inject the dependency through the constructor.
+- [ ] `time.Now()` or global `rand` inside logic? → inject a clock / `*rand.Rand`.
+- [ ] A `common/`/`shared/`/`util/` package deduplicating unrelated domains? → split them; they couple by convenience.
+- [ ] Simulated inheritance (`BaseX`), an abstract factory or one interface per struct? → composition + small consumer-defined interfaces.
 
-Comentarios: el nombre ya documenta. Doc comment de una línea en exportados solo si dice
-algo que el nombre no dice; nada de narrar el código ni banners `// ----` (política
-completa en `senior-go-idiomatic`, `references/idioms-and-style.md` §5).
+## Reference files
 
-## Checklist de smells
+Read the one that matches the question; do not load them all.
 
-Revisa un cambio contra esto:
-
-- [ ] ¿Hay un *train-wreck* `x.A().B().C()` sobre objetos que no posees? → Tell-Don't-Ask, o pasa solo el dato.
-- [ ] ¿Un método muta **y** devuelve dato calladamente? → separa command de query.
-- [ ] ¿Parámetros `int64`/`string`/`bool` crudos donde hay un concepto? → named type / enum / functional option.
-- [ ] ¿Un `SetX` que puede dejar el objeto en un estado inválido? → método con verbo de intención que preserva la invariante.
-- [ ] ¿Se valida el mismo valor en varios sitios? → parsea a un tipo válido **una** vez en la frontera.
-- [ ] ¿Un `var` global mutable, un singleton o un service locator? → inyecta la dependencia por constructor.
-- [ ] ¿Un paquete `common/`/`shared/`/`util/` deduplicando dominios distintos? → sepáralos (acoplan por conveniencia).
-- [ ] ¿Herencia simulada (`BaseX`), abstract factory o una interfaz por cada struct? → composición + interfaces pequeñas consumer-defined.
-- [ ] ¿Un `service.go`/`usecase.go`/`manager.go`/`utils.go`, o un archivo con dos casos de uso (`Login()` + `Signup()`)? → un archivo y un struct por caso de uso, nombrado por su intención.
-- [ ] ¿Un tipo `Service`/`UseCase`/`Manager` que agrupa operaciones? → un struct por acción con `Execute`.
-- [ ] ¿Comentarios que narran el código o pesan más que él? → bórralos; deja solo el "por qué" no obvio.
-
-## Reference Files
-
-Lee el archivo relevante cuando la pregunta sea de ese tema. No cargues todos a la vez.
-
-- `references/coupling-behavior.md` — Ley de Demeter (y su trampa), Tell-Don't-Ask, Command–Query Separation
-- `references/domain-naming.md` — named types sobre primitivos, muerte al stringly-typed y al boolean blindness, métodos con verbo de intención, archivos nombrados por intención (un caso de uso por archivo)
-- `references/illegal-states.md` — make illegal states unrepresentable / parse-don't-validate, constructores, enums con iota, functional options, sealed interfaces
-- `references/dependencies.md` — inyección por constructor, cero globals/singletons/service locator, clock/rand como dependencias, wiring en `main`
-- `references/dry-solid-go.md` — DRY subordinado al desacople, SOLID selectivo (ISP/DIP nativos, OCP por composición, LSP como contrato de interfaz)
+- [coupling-behavior.md](references/coupling-behavior.md): train wrecks and what does *not* count as one, Tell-Don't-Ask, Command–Query Separation and its idiomatic exceptions (comma-ok, `Pop`).
+- [domain-naming.md](references/domain-naming.md): named types over primitives, stringly-typed state, boolean blindness, intent-revealing method names, package names as vocabulary.
+- [illegal-states.md](references/illegal-states.md): parse-don't-validate, `(T, error)` constructors, `iota` enums and the invalid zero value, unit types, functional options, sealed interfaces.
+- [dependencies.md](references/dependencies.md): constructor injection, no globals/singletons/service locator, acceptable package-level state, clock and `math/rand/v2` as dependencies, wiring in `main`.
+- [dry-solid-go.md](references/dry-solid-go.md): when deduplication couples, and which SOLID letters apply natively, get reinterpreted or drop out in Go.

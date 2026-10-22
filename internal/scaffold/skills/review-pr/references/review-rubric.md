@@ -1,120 +1,111 @@
-# Rúbrica universal de review
+# Universal review rubric
 
-Dimensiones que se aplican a **cualquier** PR, en cualquier lenguaje. Para cada archivo del
-diff, recórrelas y anota lo que encuentres como hallazgo (ver taxonomía de severidad abajo).
+Dimensions that apply to any PR in any language. Walk each changed file through them and
+record what you find with one severity.
 
-## Dimensiones — qué buscar
+## Dimensions
 
-### 1. Corrección y edge cases
-- ¿El código hace lo que la intención del PR dice que hace?
-- Casos límite: entrada vacía, `nil`/`null`, cero, negativos, listas de un elemento, overflow,
-  off-by-one, orden de operaciones, zonas horarias, unicode.
-- Rutas de fallo: ¿qué pasa si la llamada de red/DB falla a mitad? ¿Estado consistente?
-- Idempotencia y reintentos donde el flujo lo exija.
+### 1. Correctness and edge cases
+- Does the code do what the PR's intent says?
+- Edges: empty input, nil/null, zero, negatives, single-element lists, overflow,
+  off-by-one, ordering, time zones, unicode.
+- Failure paths: if a network or DB call fails halfway, is state still consistent?
+- Idempotency and retries where the flow needs them.
 
-### 2. Seguridad
-- **Injection**: SQL/NoSQL/command/LDAP — ¿input concatenado en vez de parametrizado?
-- **Authz/authn**: ¿se verifica permiso en el punto correcto? ¿IDOR (acceso a recursos de otro
-  usuario por ID)? ¿se confía en datos del cliente para decidir acceso?
-- **Secrets**: claves, tokens, contraseñas hardcodeados o logueados. Márcalo **blocker** y
-  **nunca reproduzcas el valor** en el comentario.
-- **Validación de input**: todo dato externo (HTTP, colas, archivos) validado y acotado antes
-  de usarse; límites de tamaño en lecturas; deserialización segura.
-- Crypto: aleatoriedad segura para tokens, comparación en tiempo constante, no algoritmos rotos.
+### 2. Security
+- Injection (SQL, NoSQL, shell, LDAP): concatenated input instead of parameters.
+- Authn/authz: permission checked at the right place? IDOR? Access decided from
+  client-supplied data?
+- Secrets hardcoded or logged: **blocker**, and never quote the value.
+- External input (HTTP, queues, files) validated and bounded; size limits on reads; safe
+  deserialization.
+- Crypto: secure randomness for tokens, constant-time comparison, no broken algorithms.
 
 ### 3. Tests
-- ¿El PR **añade o actualiza** tests para el cambio?
-- ¿Cubren los **bordes**, no solo el happy path? ¿El caso de fallo tiene su test?
-- ¿Los tests son deterministas (sin sleeps ni dependencias de reloj/red no controladas)?
-- ¿Un test que "pasa" realmente ejercita el código nuevo, o es un placeholder?
+- New or changed behavior has tests, including the failure path and the edges.
+- Tests are deterministic (no sleeps, uncontrolled clock or network).
+- A passing test actually exercises the new code.
 
-### 4. Manejo de errores
-- Errores **propagados con contexto**, no tragados ni convertidos en `log + continue` silencioso.
-- No se pierde el error original; se distingue "esperado" (not found) de "inesperado".
-- Sin `panic`/exceptions no capturadas en flujos normales; recursos liberados en el camino de error.
+### 4. Error handling
+- Errors propagate with context instead of being swallowed or logged-and-ignored.
+- Expected errors (not found) are distinguished from unexpected ones.
+- No panics/uncaught exceptions in normal flows; resources released on error paths.
 
-### 5. API y compatibilidad hacia atrás
-- ¿Cambia una firma pública, un endpoint, un schema, un formato serializado, un env var?
-- **Breaking changes**: campos renombrados/eliminados, tipos cambiados, defaults alterados,
-  errores/estatus HTTP distintos. ¿Hay versionado, deprecación o migración?
-- Contratos con consumidores: ¿este cambio rompe a quien ya depende del comportamiento actual?
+### 5. API and backward compatibility
+- Changes to public signatures, endpoints, schemas, serialized formats, env vars.
+- Breaking changes (renamed/removed fields, changed types, defaults, status codes):
+  versioned, deprecated or migrated? Who already depends on the current behavior?
 
-### 6. Performance y concurrencia
-- Consultas N+1, trabajo O(n²) evitable, allocaciones en el hot path, ausencia de paginación.
-- **Concurrencia**: data races, acceso compartido sin sincronizar, deadlocks, goroutines/hilos
-  sin fin claro (leaks), locks retenidos durante I/O.
-- ¿Se ejecutó (o debería) el detector de races del lenguaje?
+### 6. Performance and concurrency
+- N+1 queries, avoidable O(n²), allocations in hot paths, missing pagination.
+- Data races, unsynchronized shared state, deadlocks, goroutine/thread leaks, locks held
+  during I/O. Would the race detector pass?
 
-### 7. Tamaño y revisabilidad
-- ¿El PR es lo bastante pequeño y enfocado para revisarse con rigor?
-- ¿Mezcla concerns (refactor + feature + fix + formato masivo)?
-- Nombres claros, funciones cohesivas, sin código muerto ni comentado.
-- **Archivos con intención**: cada archivo dice qué hace. Un archivo cajón (`service.go`,
-  `usecase.go`, `manager.go`, `helpers.go`, `utils.go`, `common.go`) o un archivo con dos casos
-  de uso (`Login()` + `Signup()`) es **major**: obliga a abrirlo para saber qué contiene y
-  crece sin cohesión. Fix: un archivo por caso de uso nombrado por su acción (`login.go`).
-- **Comentarios mínimos**: si un archivo tiene casi tantas líneas de comentario como de código,
-  o comentarios que narran lo obvio, repiten el nombre o son banners (`// ----`), es **minor**
-  (ruido que encarece la revisión). Se conservan los que explican un "por qué" no obvio.
+### 7. Size and readability
+- Small and focused enough to review rigorously? Mixed concerns (refactor + feature + fix
+  + mass formatting)?
+- Clear names, cohesive functions, no dead or commented-out code.
+- Files named by what they do. Grab-bag files (`utils`, `helpers`, `common`, `manager`)
+  hurt navigation in any language; their severity depends on the repo's own rules, see
+  the Go layer.
+- Comments that narrate the obvious or banners add review noise (minor or nit).
 
-### 8. Docs y migraciones
-- Cambios de comportamiento reflejados en README/docs/CHANGELOG/comentarios de API pública.
-- Migraciones de DB: ¿reversibles? ¿bloquean tablas grandes? ¿compatibles con la versión aún
-  desplegada durante el rollout (expand/contract)?
-- Feature flags y config nueva documentadas.
+### 8. Docs and migrations
+- Behavior changes reflected in README, docs, CHANGELOG, public API docs.
+- DB migrations reversible? Do they lock large tables? Compatible with the version still
+  deployed during rollout (expand/contract)?
+- New flags and config documented.
 
-### 9. Observabilidad
-- Logs con nivel y contexto adecuados (sin secretos, sin spam en hot paths).
-- Métricas/trazas para el camino nuevo cuando importa operacionalmente.
-- Mensajes de error accionables para quien opera el sistema.
+### 9. Observability
+- Logs at the right level with context, no secrets, no spam in hot paths.
+- Metrics or traces for operationally important new paths.
+- Error messages actionable for whoever operates the system.
 
-## Taxonomía de severidad
+## Severity
 
-Etiqueta **cada** hallazgo con una y solo una:
+Exactly one per finding:
 
-- **blocker** — No puede mergear así. Rompe correctness, seguridad, o un contrato público;
-  pierde datos; introduce una race. Requiere fix antes de aprobar.
-- **major** — Debe arreglarse. Bug real en un caso plausible, test faltante para lógica nueva,
-  manejo de errores deficiente, deuda que costará caro pronto (p. ej. archivo/tipo cajón o dos
-  casos de uso en un archivo). Justifica `request-changes`.
-- **minor** — Debería arreglarse. Mejora de claridad/robustez sin riesgo inmediato; edge case
-  poco probable; naming confuso; exceso de comentarios narrativos.
-- **nit** — Opcional/estilo. Preferencia, micro-optimización, formato. Nunca bloquea; márcalo
-  como tal para que el autor sepa que puede ignorarlo.
+- **blocker** — cannot merge as is: breaks correctness, security or a public contract,
+  loses data, introduces a race.
+- **major** — should be fixed before merge: a real bug in a plausible case, missing tests
+  for new logic, poor error handling, or a violation of a rule the repo itself adopted.
+- **minor** — worth fixing, no immediate risk: clarity, an unlikely edge, confusing names,
+  house-style suggestions the repo has not adopted.
+- **nit** — optional preference. Label it so the author knows it can be ignored.
 
-Regla del veredicto: ≥1 blocker o major ⇒ `request-changes`. Solo minors/nits ⇒ `comment`.
-Todo limpio ⇒ recomiéndalo, pero la aprobación la da un humano.
+Verdict: any blocker or major → request changes; only minor/nit → comment; nothing found →
+"looks ready", with approval left to a human.
 
-## Regla de tamaño
+## Size rule
 
-Si el PR es **demasiado grande** para revisarse con rigor, o **mezcla concerns**, el hallazgo
-de mayor valor es **pedir un split**. Ponlo primero, explica qué cortes propones (p. ej.
-"separa el refactor de renombrado del cambio de lógica") y ofrece revisar cada parte por
-separado. Un review superficial de un PR gigante es peor que pedir dividirlo.
+If the PR is too big to review rigorously or mixes concerns, put the split request first,
+propose the cuts ("separate the rename refactor from the logic change") and offer to review
+each part. A shallow review of a huge PR is worse than asking to split it.
 
-## Formato recomendado del comentario de review
+## Output format
+
+Write it in the language the PR uses.
 
 ```markdown
-## Review — <título del PR>
+## Review — <PR title>
 
-**Veredicto:** request-changes | comment  ·  **Intención:** <1 línea>
-**Resumen:** <2-3 líneas: qué hace bien, qué falta, blast radius>
+**Verdict:** request changes | comment | looks ready  ·  **Intent:** <one line>
+**Summary:** <2-3 lines: what it does well, what is missing, blast radius>
 
 ### Blockers
-- `path/file.ext:LÍNEA` — <qué está mal y por qué>. **Fix:** <cambio concreto>
+- `path/file.ext:LINE` — <what is wrong and why>. **Fix:** <concrete change>
 
 ### Major
-- `path/file.ext:LÍNEA` — … **Fix:** …
+- `path/file.ext:LINE` — … **Fix:** …
 
 ### Minor
-- `path/file.ext:LÍNEA` — …
+- `path/file.ext:LINE` — …
 
 ### Nits
-- `path/file.ext:LÍNEA` — …
+- `path/file.ext:LINE` — …
 
-### Bien
-- <1-2 cosas que el PR hace bien — el review también reconoce lo bueno>
+### Good
+- <one or two things the PR does well>
 ```
 
-Si no hay hallazgos en una categoría, omite el encabezado. Mantén el tono constructivo:
-critica el código, propone el arreglo, reconoce lo que está bien hecho.
+Omit empty sections.

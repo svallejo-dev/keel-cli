@@ -1,52 +1,63 @@
 # Memory & Pointers — Go Idiomatic Reference
 
-## El Modelo Mental Correcto
+## Contents
 
-La memoria de un programa Go vive en dos sitios: el **stack** (una pila por goroutine, barata) y el **heap** (compartido, gestionado por el garbage collector, caro). La pregunta que importa no es "¿uso un puntero?" sino "¿dónde termina viviendo este dato y cuánto le cuesta al GC?". Decisión clave: **el programador no elige stack o heap.** Lo decide el compilador mediante *escape analysis*; tú solo controlas las condiciones — retornar direcciones, guardar valores en interfaces, capturar en closures — y el compilador deduce las consecuencias.
+1. Stack vs Heap
+2. Escape Analysis
+3. Pointers
+4. Value vs pointer receiver
+5. Garbage Collector
+6. Cache locality and struct layout
+7. When not to use pointers
+8. Profiling
 
-Este archivo cubre **dónde vive la memoria y por qué en términos de performance**. Para *qué se copia* al pasar o asignar (semántica de copia, aliasing de slice/map), ver `references/value-vs-reference.md`. El layout y padding de structs ya está en `SKILL.md`; aquí no se desarrolla.
+---
 
-> Toolchain de las salidas transcritas: Go 1.24.7. Estándar hoy: Go 1.26.
+## The Mental Model
+
+A Go program's memory lives in two places: the **stack** (one per goroutine, cheap) and the **heap** (shared, managed by the garbage collector, expensive). The question that matters is not "should I use a pointer?" but "where does this value end up living, and what does it cost the GC?". The programmer does not choose stack or heap: the compiler decides through *escape analysis*. You only control the conditions — returning addresses, storing values in interfaces, capturing in closures — and the compiler derives the consequences.
+
+This file covers **where memory lives and why it matters for performance**. For *what gets copied* when passing or assigning (copy semantics, slice/map aliasing), see `references/value-vs-reference.md`.
 
 ---
 
 ## 1. Stack vs Heap
 
-El **stack** crece y decrece con el *frame* de la función: entrar empuja un frame, retornar lo libera. Asignar es incrementar un puntero; liberar, decrementarlo. Sin coste de gestión y con los datos calientes en cache. El **heap** almacena valores cuya vida excede el frame que los creó: nadie los libera al retornar; los reclama el garbage collector, que debe rastrear qué sigue vivo. Cada valor en el heap es trabajo futuro para el GC.
+The **stack** grows and shrinks with the function *frame*: entering pushes a frame, returning releases it. Allocating is bumping a pointer; freeing is bumping it back. No bookkeeping, and the data is hot in cache. The **heap** holds values whose lifetime outlives the frame that created them: nobody frees them on return; the garbage collector reclaims them and must track what is still alive. Every heap value is future work for the GC.
 
 | | Stack | Heap |
 |---|---|---|
-| Gestión | Automática con el frame (push/pop) | Garbage collector (mark-sweep) |
-| Coste de alloc | ~0 (mover un puntero) | Allocador + presión de GC |
-| Cache locality | Alta (contiguo, caliente) | Depende — a menudo disperso |
-| Vida | Termina con la función | Hasta que el GC lo reclama |
-| Quién decide | El compilador (escape analysis) | El compilador (escape analysis) |
+| Management | Automatic with the frame (push/pop) | Garbage collector (mark-sweep) |
+| Allocation cost | ~0 (move a pointer) | Allocator + GC pressure |
+| Cache locality | High (contiguous, hot) | Varies — often scattered |
+| Lifetime | Ends with the function | Until the GC reclaims it |
+| Who decides | The compiler (escape analysis) | The compiler (escape analysis) |
 
-Regla operativa: **lo que no escapa es gratis.** El objetivo en el hot path no es evitar punteros por dogma, sino evitar que los valores escapen al heap sin necesidad.
+Working rule: **what does not escape is free.** The goal in a hot path is not to avoid pointers on principle, but to keep values from escaping to the heap without need.
 
 ---
 
 ## 2. Escape Analysis
 
-El compilador determina en tiempo de compilación si un valor puede vivir en el stack o debe "escapar" al heap. Se inspecciona con `-gcflags="-m"`:
+The compiler decides at compile time whether a value can live on the stack or must "escape" to the heap. Inspect it with `-gcflags="-m"`:
 
 ```bash
 go build -gcflags="-m" ./...
 ```
 
-Un valor escapa cuando su vida no se puede acotar al frame. Los disparadores canónicos:
+A value escapes when its lifetime cannot be bounded by the frame. The canonical triggers:
 
 ```go
-// stays: x vive en el stack; muere con el frame.
+// stays: x lives on the stack and dies with the frame.
 func stays() int {
 	x := 42
-	return x // se copia el valor al caller; x no escapa
+	return x // the value is copied to the caller; x does not escape
 }
 
-// escapesPtr: retornar &local mueve x al heap.
+// escapesPtr: returning &local moves x to the heap.
 func escapesPtr() *int {
 	x := 42
-	return &x // el puntero sobrevive a la función → x al heap
+	return &x // the pointer outlives the function → x on the heap
 }
 
 type Stringer interface{ String() string }
@@ -54,109 +65,109 @@ type box struct{ n int }
 
 func (b box) String() string { return "box" }
 
-// escapesIface: meter un valor en una interfaz lo mueve al heap.
+// escapesIface: storing a value in an interface moves it to the heap.
 func escapesIface() Stringer {
 	b := box{n: 1}
-	return b // la interfaz oculta el tipo concreto → box al heap
+	return b // the interface hides the concrete type → box on the heap
 }
 
-// escapesClosure: el closure sobrevive a la función; captura x.
+// escapesClosure: the closure outlives the function and captures x.
 func escapesClosure() func() int {
 	x := 42
-	return func() int { return x } // x vive mientras viva el closure
+	return func() int { return x } // x lives as long as the closure
 }
 
-// unknownSize: make con longitud variable → backing array al heap.
+// unknownSize: make with a variable length → backing array on the heap.
 func unknownSize(n int) []byte {
-	return make([]byte, n) // tamaño no conocido en compilación
+	return make([]byte, n) // size unknown at compile time
 }
 
-// knownSize: tamaño constante y pequeño → puede quedarse en el stack.
+// knownSize: small constant size → can stay on the stack.
 func knownSize() byte {
 	buf := make([]byte, 64)
 	return buf[0]
 }
 ```
 
-Salida **real** de `go build -gcflags="-m" ./demo/` (Go 1.24.7), recortada a las líneas de escape:
+Output of `go build -gcflags="-m"` on that file (trimmed to the escape lines; exact wording and positions vary between releases):
 
 ```
 demo.go:11:2:  moved to heap: x                       // escapesPtr
 demo.go:23:9:  b escapes to heap                      // escapesIface
 demo.go:29:9:  func literal escapes to heap           // escapesClosure
-demo.go:34:13: make([]byte, n) escapes to heap        // unknownSize (n dinámico)
-demo.go:39:13: make([]byte, 64) does not escape       // knownSize (constante)
+demo.go:34:13: make([]byte, n) escapes to heap        // unknownSize (dynamic n)
+demo.go:39:13: make([]byte, 64) does not escape       // knownSize (constant)
 ```
 
-Vocabulario del compilador: `moved to heap: x` (variable local reubicada al heap), `escapes to heap` (el valor de una expresión se aloja en el heap), `does not escape` (se queda en el stack — lo que quieres ver en el hot path).
+Compiler vocabulary: `moved to heap: x` (a local variable relocated to the heap), `escapes to heap` (the value of an expression is allocated on the heap), `does not escape` (stays on the stack — what you want to see in a hot path).
 
-Disparadores adicionales: **enviar un puntero por un channel** (`ch <- &x` mueve `x` al heap, porque otra goroutine puede leerlo después) y guardar un puntero en un campo de un struct que escapa. Regla general: si algo con vida más larga que el frame puede alcanzar el valor, escapa.
+More triggers: **sending a pointer on a channel** (`ch <- &x` moves `x` to the heap, because another goroutine may read it later) and storing a pointer in a field of a struct that escapes. General rule: if anything that lives longer than the frame can reach the value, it escapes.
 
 ---
 
-## 3. Punteros
+## 3. Pointers
 
-`&v` toma la dirección de `v`; `*p` deref­erencia el puntero `p`. El zero value de cualquier puntero es `nil`.
+`&v` takes the address of `v`; `*p` dereferences the pointer `p`. The zero value of any pointer is `nil`.
 
 ```go
 x := 42
-p := &x  // p es *int
-*p = 100 // muta x a través del puntero
+p := &x  // p is *int
+*p = 100 // mutates x through the pointer
 _ = x    // x == 100
 ```
 
 ### `new(T)` vs `&T{}`
 
 ```go
-a := new(int)       // *int → int con zero value (0); útil para tipos básicos
-c := &Counter{n: 1} // *Counter → construir y tomar dirección en un paso
+a := new(int)       // *int → an int with its zero value (0)
+c := &Counter{n: 1} // *Counter → build and take the address in one step
 ```
 
-Ambos alojan e igual retornan `*T`. Idiomático: usa `&T{...}` para structs (permite inicializar campos); `new(T)` queda para tipos básicos o cuando solo quieres el zero value. `&int{}` **no compila** — los literales compuestos son solo para structs, arrays, slices y maps.
+Both allocate and return `*T`. Idiomatic use: `&T{...}` for structs (it lets you initialize fields); `new(T)` for basic types or when you only want the zero value. `&int{}` does **not** compile — composite literals exist only for structs, arrays, slices and maps.
 
-### nil deref → panic
+### nil dereference → panic
 
 ```go
 var p *Counter // nil
 p.Inc()        // panic: runtime error: invalid memory address or nil pointer dereference
 ```
 
-Un método con pointer receiver sobre un puntero `nil` panica al tocar un campo; valida antes de deref­erenciar datos externos.
+A pointer-receiver method called on a `nil` pointer panics as soon as it touches a field; validate external data before dereferencing it.
 
-### Punteros a interfaces y a slices/maps
+### Pointers to interfaces and to slices/maps
 
-- **`*interface{}` — casi nunca.** Una interfaz ya es una referencia (par tipo+puntero). `*io.Reader` es casi siempre un error de diseño; pasa la interfaz por valor.
-- **`*[]T` / `*map[K]V` — rara vez.** Slices y maps ya son *reference types* baratos de copiar (ver `references/value-vs-reference.md`). Solo necesitas `*[]T` cuando el método debe **reasignar** el slice del caller (p. ej. `append` que cambia el header). Para maps, nunca — el header ya comparte el mismo backing.
+- **`*interface{}` — almost never.** An interface is already a (type, pointer) pair. `*io.Reader` is nearly always a design mistake; pass the interface by value.
+- **`*[]T` / `*map[K]V` — rarely.** Slices and maps are already cheap-to-copy headers (see `references/value-vs-reference.md`). You need `*[]T` only when the function must **reassign** the caller's slice (e.g. an `append` that changes the header). For maps, never — the copied header already shares the same table.
 
 ---
 
-## 4. Framework: value vs pointer receiver
+## 4. Value vs pointer receiver
 
-Esta es la decisión de memoria que más veces tomarás. La respuesta no es estética: determina si los métodos pueden mutar, si el tipo es seguro de copiar y si el valor escapa.
+This is the memory decision you will make most often. It is not cosmetic: it decides whether methods can mutate, whether the type is safe to copy, and whether the value escapes.
 
-### Usa POINTER receiver `(t *T)` si:
+### Use a pointer receiver `(t *T)` when:
 
-- **El método muta el receiver.** Un value receiver opera sobre una copia; la mutación se pierde al retornar.
-- **El struct es grande.** Copiar el receiver en cada llamada cuesta; un puntero copia 8 bytes.
-- **Contiene un campo no-copiable** — `sync.Mutex`, `sync.WaitGroup`, `atomic.*`, o cualquier struct que a su vez los tenga. Copiar un `Mutex` rompe la exclusión mutua.
-- **Consistencia.** Si *algún* método del tipo necesita pointer receiver, usa pointer receiver en **todos** para presentar un *method set* uniforme.
+- **The method mutates the receiver.** A value receiver works on a copy; the mutation is lost on return.
+- **The struct is large.** Copying the receiver on every call costs; a pointer copies 8 bytes.
+- **It contains a non-copyable field** — `sync.Mutex`, `sync.WaitGroup`, `atomic.*`, or a struct that holds one. Copying a `Mutex` breaks mutual exclusion.
+- **Consistency.** If *any* method of the type needs a pointer receiver, use pointer receivers on all of them so the method set is uniform.
 
-### Usa VALUE receiver `(t T)` si:
+### Use a value receiver `(t T)` when:
 
-- **El tipo es pequeño e inmutable** — `time.Time`, `Point{X, Y float64}`, IDs.
-- **Es un tipo básico o numérico** — `type Celsius float64`.
-- **Quieres la seguridad de operar sobre una copia** — el método no puede alterar el original por accidente.
+- **The type is small and immutable** — `time.Time`, `Point{X, Y float64}`, IDs.
+- **It is a basic or numeric type** — `type Celsius float64`.
+- **You want the safety of working on a copy** — the method cannot alter the original by accident.
 
-### Ejemplos
+### Examples
 
 ```go
-// POINTER: muta el receiver.
+// Pointer: mutates the receiver.
 type Counter struct{ n int }
 
-func (c *Counter) Inc()     { c.n++ } // sobre un value receiver, el ++ se perdería
+func (c *Counter) Inc()     { c.n++ } // with a value receiver the ++ would be lost
 func (c *Counter) Get() int { return c.n }
 
-// POINTER: contiene sync.Mutex (no-copiable) → obligatorio.
+// Pointer: contains a sync.Mutex, which must not be copied.
 type Registry struct {
 	mu    sync.Mutex
 	items map[string]int
@@ -168,56 +179,56 @@ func (r *Registry) Add(k string) {
 	r.items[k]++
 }
 
-// VALUE: pequeño e inmutable; cada método retorna un nuevo Point.
+// Value: small and immutable; each method returns a new Point.
 type Point struct{ X, Y float64 }
 
 func (p Point) Add(q Point) Point { return Point{p.X + q.X, p.Y + q.Y} }
 ```
 
-`go vet` detecta la copia accidental de un `Mutex` — salida real:
+`go vet` (copylocks) catches an accidental `Mutex` copy:
 
 ```
 badCopy passes lock by value: x.Registry contains sync.Mutex
 ```
 
-### Regla de oro: NO mezcles receivers en el mismo tipo
+### Don't mix receiver kinds on one type
 
-Un tipo con métodos value **y** pointer tiene un *method set* inconsistente: solo `*T` satisface interfaces que incluyan los métodos con pointer receiver, y copiar un valor cuyos métodos mutan produce bugs silenciosos. Elige uno por tipo.
+A type with both value and pointer methods has a confusing method set: only `*T` satisfies interfaces that include the pointer methods, and copying a value whose other methods mutate leads to silent bugs. Pick one kind per type.
 
-### Tabla de decisión
+### Decision table
 
-| Condición | Receiver |
+| Condition | Receiver |
 |---|---|
-| El método muta el receiver | `*T` |
-| Contiene `sync.Mutex` / `WaitGroup` / `atomic` | `*T` |
-| Struct grande (varias palabras) | `*T` |
-| Algún otro método del tipo ya usa `*T` | `*T` (consistencia) |
-| Tipo pequeño, inmutable, básico | `T` |
-| No estás seguro | `*T` (default seguro para structs con estado) |
+| The method mutates the receiver | `*T` |
+| Contains `sync.Mutex` / `WaitGroup` / `atomic` | `*T` |
+| Large struct (several words) | `*T` |
+| Another method of the type already uses `*T` | `*T` (consistency) |
+| Small, immutable or basic type | `T` |
+| Unsure | `*T` (safe default for stateful structs) |
 
 ---
 
 ## 5. Garbage Collector
 
-Go usa un **mark-sweep concurrente tricolor**: marca en concurrencia con el programa los objetos alcanzables (blanco→gris→negro) y barre los blancos. El *stop-the-world* se reduce a pausas de sub-milisegundo, pero el trabajo de marcado compite por CPU con tu código. Dos perillas:
+Go uses a **concurrent tri-color mark-sweep** collector: it marks reachable objects (white → grey → black) concurrently with your program and sweeps the white ones. Stop-the-world pauses are typically sub-millisecond, but marking competes with your code for CPU. Two knobs:
 
-- **`GOGC`** (default `100`): dispara un ciclo de GC cuando el heap crece un 100% respecto al heap vivo tras el último ciclo. Subirlo (`GOGC=200`) reduce la frecuencia de GC a cambio de más memoria residente.
-- **`GOMEMLIMIT`** (Go 1.19+): límite *soft* de memoria total. El GC se vuelve más agresivo al acercarse al límite. Es la herramienta correcta en contenedores con límite de memoria — evita el OOM kill sin fijar `GOGC` a ciegas.
+- **`GOGC`** (default `100`): triggers a GC cycle when the heap has grown 100% over the live heap left by the previous cycle. Raising it (`GOGC=200`) makes GC less frequent at the cost of more resident memory.
+- **`GOMEMLIMIT`** (Go 1.19+): a *soft* limit on total memory. The GC becomes more aggressive as usage approaches it. It is the right tool in containers with a memory limit — it avoids the OOM kill without blindly tuning `GOGC`.
 
-La cadena causal que importa en producción:
+The causal chain that matters in production:
 
 ```
-más allocaciones al heap → más objetos que marcar → ciclos de GC
-más frecuentes → más CPU robada al hot path → mayor latencia p99
+more heap allocations → more objects to mark → more frequent GC cycles
+→ more CPU taken from the hot path → higher p99 latency
 ```
 
-**Objetivo:** minimizar allocaciones en el hot path. Menos escapes al heap = menos presión de GC = colas de latencia más planas. Un allocador rápido no arregla un hot path que genera basura; el coste real es el marcado posterior.
+**Goal:** minimize allocations in the hot path. Fewer escapes = less GC pressure = flatter latency tails. A fast allocator does not fix a hot path that produces garbage; the real cost is the marking afterwards.
 
 ---
 
-## 6. Localidad de caché
+## 6. Cache locality and struct layout
 
-Cómo dispones los datos en memoria pesa tanto como el algoritmo cuando iteras sobre muchos elementos.
+How you lay data out in memory matters as much as the algorithm when you iterate over many elements.
 
 ```go
 type Particle struct {
@@ -225,59 +236,81 @@ type Particle struct {
 	vx, vy  float64
 }
 
-// []Particle: structs contiguos en un solo backing array.
+// []Particle: structs stored contiguously in one backing array.
 func sumContiguous(ps []Particle) float64 {
 	var total float64
 	for i := range ps {
-		total += ps[i].x // el prefetcher de la CPU acierta: siguiente struct ya en cache
+		total += ps[i].x // the prefetcher guesses right: the next struct is already in cache
 	}
 	return total
 }
 
-// []*Particle: punteros contiguos, structs DISPERSOS por el heap.
+// []*Particle: contiguous pointers, structs scattered across the heap.
 func sumScattered(ps []*Particle) float64 {
 	var total float64
 	for _, p := range ps {
-		total += p.x // cada deref salta a una dirección impredecible → cache miss
+		total += p.x // each dereference jumps to an unpredictable address → cache miss
 	}
 	return total
 }
 ```
 
-`[]T` guarda los structs uno tras otro: recorrerlos es un barrido lineal que el hardware pre-carga. `[]*T` guarda solo punteros; los structs viven fragmentados donde el allocador los dejó. Cada iteración es un salto que el prefetcher no anticipa, y un cache miss cuesta cientos de ciclos.
+`[]T` stores the structs back to back: walking them is a linear sweep the hardware prefetches. `[]*T` stores only pointers; the structs live wherever the allocator left them. Each iteration is a jump the prefetcher cannot anticipate, and a cache miss costs hundreds of cycles.
 
-**Cuándo importa:** en hot loops sobre colecciones grandes (miles+ de elementos) recorridas densamente. Ahí `[]T` puede ser varias veces más rápido que `[]*T` con el mismo big-O. **Cuándo no:** colecciones pequeñas, acceso esporádico, o cuando los elementos son grandes y necesitas identidad compartida (mutación in-place vista por varios dueños). No reestructures por cache locality sin un benchmark que lo justifique.
+**When it matters:** hot loops over large collections (thousands of elements and up) walked densely. There `[]T` can be several times faster than `[]*T` with the same big-O. **When it doesn't:** small collections, sporadic access, or large elements that need shared identity (in-place mutation seen by several owners). Don't restructure for cache locality without a benchmark that justifies it.
+
+### Struct field order and padding
+
+Each field is aligned to its own size, so the compiler inserts padding between fields of different widths. Field order changes the struct's size:
+
+```go
+// 24 bytes on 64-bit: 1 + 7 padding + 8 + 1 + 7 padding.
+type Loose struct {
+	a bool
+	b int64
+	c bool
+}
+
+// 16 bytes: 8 + 1 + 1 + 6 padding.
+type Tight struct {
+	b int64
+	a bool
+	c bool
+}
+```
+
+Reorder fields only for structs that are hot and numerous — millions of instances in a slice, a cache, a wire buffer — and only when a benchmark or the `fieldalignment` analyzer (`golang.org/x/tools/go/analysis/passes/fieldalignment`) shows the saving. Everywhere else, order fields for readability (group related fields, put the mutex next to what it guards); eight bytes per instance is noise on a struct you create a few hundred times.
 
 ---
 
-## 7. Cuándo NO usar punteros
+## 7. When not to use pointers
 
-Un puntero no es gratis: añade una indirección (posible cache miss) y, si el valor escapa, presión de GC. Para valores pequeños, **copiar suele ser más barato que apuntar**.
+A pointer is not free: it adds an indirection (a possible cache miss) and, if the value escapes, GC pressure. For small values, **copying is usually cheaper than pointing**.
 
 ```go
 type RGBA struct{ R, G, B, A uint8 } // 4 bytes
 
-// Value receiver + copia: cero indirección, cero allocaciones, no escapa.
+// Value receiver + copy: no indirection, no allocation, does not escape.
 func invert(c RGBA) RGBA {
 	return RGBA{255 - c.R, 255 - c.G, 255 - c.B, c.A}
 }
 ```
 
-Pasar `RGBA` por valor copia 4 bytes en un registro. Por `*RGBA` copia 8 bytes (el puntero) **y** arriesga mover el valor al heap si escapa, sumando trabajo de GC. La copia gana.
+Passing `RGBA` by value copies 4 bytes in a register. Passing `*RGBA` copies 8 bytes (the pointer) **and** risks moving the value to the heap if it escapes, adding GC work. The copy wins.
 
-Heurística: para structs de hasta ~2-3 palabras (16-24 bytes) sin campos no-copiables y sin necesidad de mutar al caller, prefiere value semantics. Por encima, o si hay mutación o estado compartido, usa puntero. Verifica con `-gcflags="-m"` y `-benchmem` en lugar de suponer.
+Heuristic: for structs up to ~2–3 words (16–24 bytes) without non-copyable fields and without a need to mutate the caller's value, prefer value semantics. Above that, or when there is mutation or shared state, use a pointer. Check with `-gcflags="-m"` and `-benchmem` instead of guessing.
 
 ---
 
 ## 8. Profiling
 
-No optimices por intuición; mide. Herramientas, de más rápida a más profunda:
+Don't optimize by intuition; measure. Tools, from quickest to deepest:
 
-### `-gcflags="-m"` — diagnóstico estático
+### `-gcflags="-m"` — static diagnosis
 
-Antes de medir, comprueba qué escapa (Sección 2): barato y sin ejecutar nada.
+Before measuring, check what escapes (section 2): cheap and nothing runs.
 
-### `go test -bench` con `-benchmem`
+### `go test -bench` with `-benchmem`
 
 ```bash
 go test -bench=. -benchmem ./...
@@ -285,45 +318,47 @@ go test -bench=. -benchmem ./...
 
 ```go
 func BenchmarkInvert(b *testing.B) {
-	b.ReportAllocs() // fuerza el reporte de allocs aunque falte -benchmem
+	b.ReportAllocs() // report allocations even without -benchmem
 	c := RGBA{10, 20, 30, 255}
-	for range b.N { // Go 1.22+: range sobre un entero
+	for b.Loop() {
 		c = invert(c)
 	}
-	_ = c
 }
 ```
 
-Salida **real** (Go 1.24.7):
+Since Go 1.24, `for b.Loop()` is the benchmark loop to use: the timer starts on the first call, so setup before the loop is not measured and `b.ResetTimer()` is unnecessary; arguments and results of calls in the loop body are kept alive, so the compiler cannot optimize the work away (no `_ = c` sink needed).
+
+Illustrative output:
 
 ```
-BenchmarkInvert-2   1000000000   0.4303 ns/op   0 B/op   0 allocs/op
+BenchmarkInvert-8   1000000000   0.43 ns/op   0 B/op   0 allocs/op
 ```
 
-Cómo leerla: `ns/op` es latencia por operación; `B/op` son bytes alojados al heap por operación (`0` confirma que `invert` no escapa); `allocs/op` es el número de allocaciones al heap — **la métrica que persigues en el hot path: bajarla a 0.** Una allocación aquí sería regresión aunque `ns/op` no se mueva: cada alloc es deuda que pagará el GC bajo carga real.
+How to read it: `ns/op` is latency per operation; `B/op` is bytes allocated on the heap per operation (`0` confirms `invert` does not escape); `allocs/op` is the number of heap allocations — **the metric to chase in a hot path, ideally down to 0.** One allocation here is a regression even if `ns/op` doesn't move: every allocation is debt the GC collects under real load.
 
 ### `-memprofile` + `go tool pprof`
 
 ```bash
 go test -bench=BenchmarkInvert -benchmem -memprofile mem.out ./...
 go tool pprof mem.out
-#   top      → funciones que más memoria alojan
-#   list Fn  → líneas exactas con allocaciones dentro de Fn
+#   top      → functions that allocate the most
+#   list Fn  → exact lines that allocate inside Fn
 ```
 
-`pprof` te dice **dónde** se aloja; `-benchmem` te dice **cuánto**. Flujo idiomático: `-m` (qué escapa) → `-benchmem` (allocs/op) → `pprof list` (línea culpable) → refactor (reusar buffers, evitar interfaces en el hot path, `sync.Pool` si aplica) → re-benchmark.
+`pprof` tells you **where** memory is allocated; `-benchmem` tells you **how much**. The usual loop: `-m` (what escapes) → `-benchmem` (allocs/op) → `pprof list` (the culprit line) → refactor (reuse buffers, avoid interfaces in the hot path, `sync.Pool` if it applies) → benchmark again.
 
 ---
 
 ## Checklist
 
-- [ ] El valor no escapa al heap en el hot path — verificado con `go build -gcflags="-m"`; `moved to heap` / `escapes to heap` inesperados investigados
-- [ ] Pointer receiver cuando el método muta, el struct es grande, o contiene `sync.Mutex`; value receiver para tipos pequeños, inmutables o básicos
-- [ ] Un solo estilo de receiver por tipo — nunca value y pointer mezclados
-- [ ] `go vet` limpio de `passes lock by value` (ningún `Mutex` copiado)
-- [ ] Sin `*interface{}`; `*[]T` solo si el método reasigna el slice del caller
-- [ ] Datos externos validados antes de deref­erenciar (evitar nil deref → panic)
-- [ ] `[]T` en vez de `[]*T` para hot loops sobre colecciones grandes y densas
-- [ ] `GOMEMLIMIT` fijado en contenedores con límite de memoria (Go 1.19+)
-- [ ] Benchmarks con `b.ReportAllocs()` / `-benchmem`; objetivo `0 allocs/op` en el hot path
-- [ ] Regresiones de memoria localizadas con `-memprofile` + `go tool pprof list`
+- [ ] Hot-path values don't escape to the heap — checked with `go build -gcflags="-m"`; unexpected `moved to heap` / `escapes to heap` investigated
+- [ ] Pointer receiver when the method mutates, the struct is large, or it contains a `sync.Mutex`; value receiver for small, immutable or basic types
+- [ ] One receiver kind per type — value and pointer not mixed
+- [ ] `go vet` clean of `passes lock by value` (no `Mutex` copied)
+- [ ] No `*interface{}`; `*[]T` only when the function reassigns the caller's slice
+- [ ] External data validated before dereferencing (avoid nil-deref panics)
+- [ ] `[]T` instead of `[]*T` for hot loops over large, dense collections
+- [ ] Field reordering for padding only on hot, numerous structs, backed by a benchmark or `fieldalignment`
+- [ ] `GOMEMLIMIT` set in containers with a memory limit
+- [ ] Benchmarks use `for b.Loop()` and `b.ReportAllocs()` / `-benchmem`; target `0 allocs/op` in the hot path
+- [ ] Memory regressions located with `-memprofile` + `go tool pprof list`

@@ -1,43 +1,62 @@
 # Package Oriented Design — Go Project Layout
 
+## Contents
+
+- The core principle
+- What a package is (and is not)
+- Canonical project structure: `cmd/`, `internal/`, bounded contexts, `platform/`, `app/`
+- Package Oriented Design in practice (worked example)
+- Anti-patterns
+- Avoid nested packages; `internal/` as the only real boundary
+- File names
+- Dependency direction (DAG)
+- Rules summary
+
+Bounded-context internals (one use case per file, the `NewX` + `Execute(ctx, XInput) (XOutput, error)`
+shape, ports, value objects) are owned by the **ddd-go-idiomatic** skill. This file covers the
+project layout around them.
+
+---
+
 ## The Core Principle
 
 > **A package is not a namespace. A package is a unit of design.**
 
-This is the defining difference between Package Oriented Design and how Java/C# engineers approach Go. In Java, packages are folders that group related things. In Go, **a package defines what it IS** — its purpose, its data, and its behavior are inseparable.
+In Java or C#, packages are folders that group related things. In Go, a package defines what it
+*is*: its purpose, its data and its behavior belong together.
 
-The question is never *"where should I put this file?"*  
-The question is *"what single concept does this package represent?"*
+The question is never *"where should I put this file?"* but *"what single concept does this
+package represent?"*
 
 ---
 
-## What a Package IS (and is NOT)
+## What a Package Is (and Is Not)
 
-### A Package IS:
-- A single, self-contained concept with a clear boundary
-- The owner of its own data — it does not share raw types with other packages
-- Named after what it represents, not what it does
-- Small enough that its entire API can be understood in one reading
+A package is:
+- a single, self-contained concept with a clear boundary;
+- the owner of its own data — it does not share raw types through a common `models` package;
+- named after what it represents, not what it does;
+- small enough that its API can be understood in one reading.
 
-### A Package is NOT:
-- A folder to dump related files
-- A Java-style namespace (`com.company.utils`)
-- A collection of helpers for other packages
-- An excuse to avoid thinking about design
+A package is not a folder to dump related files, a Java-style namespace (`com.company.utils`), or
+a collection of helpers for other packages.
 
 ### The Naming Test
-If you cannot name your package with a **single, specific noun**, the package has no identity yet.
 
-| Bad Name | Why It Fails | What You're Really Designing |
+If you cannot name the package with a single, specific noun, it has no identity yet. A useful check:
+describe it in one sentence that starts with its name — "Package user models accounts and their
+lifecycle." If the sentence needs "and also", the package is two packages.
+
+| Bad name | Why it fails | What you are really designing |
 |---|---|---|
-| `util` | It's a drawer, not a concept | Break into specific packages |
-| `helper` | Helps what? | A package that helps nothing |
+| `util` | A drawer, not a concept | Split by the concept each function serves |
+| `helper` | Helps what? | Nothing with an identity |
 | `common` | Common to whom? | Shared coupling disguised as reuse |
 | `types` | Types of what? | An anemic data layer |
 | `models` | ORM thinking | Domain types belong inside their domain package |
-| `base` | Base of what? | Missing abstraction |
-| `shared` | Red flag: forced coupling | Rethink the boundaries |
-| `manager` | Manages what? | A God object disguised as a package |
+| `base` | Base of what? | A missing abstraction |
+| `shared` | Forced coupling | Rethink the boundaries |
+| `manager` | Manages what? | A god object disguised as a package |
 
 ---
 
@@ -47,401 +66,426 @@ If you cannot name your package with a **single, specific noun**, the package ha
 myservice/
 ├── cmd/
 │   └── myservice/
-│       └── main.go          ← Thin: wires dependencies, calls Run(), exits
+│       └── main.go            ← thin: load config, call app.Run, exit
 ├── internal/
-│   ├── user/                ← The "user" concept owns its data AND behavior
-│   │   ├── user.go          ← Type definition + constructors
-│   │   ├── get_user.go      ← Use case GetUser + its DTOs and narrow ports
-│   │   ├── register_user.go ← Use case RegisterUser (one use case per file)
-│   │   ├── store.go         ← PostgresStore: implements the ports
-│   │   ├── user_test.go
-│   │   └── userhttp/        ← Transport: one file per endpoint + routes.go
+│   ├── user/                  ← bounded context: domain + use cases, no infra imports
+│   │   ├── user.go            ← the User entity and its errors
+│   │   ├── get_user.go        ← use case GetUser + its DTOs and port
+│   │   ├── register_user.go   ← use case RegisterUser
+│   │   ├── user_repository.go ← port shared by several use cases
+│   │   ├── pgstore/           ← infra: implements the ports with pgx
+│   │   │   └── pgstore.go
+│   │   └── userhttp/          ← transport: one file per endpoint + routes.go
 │   │       ├── get_user.go
 │   │       ├── register_user.go
 │   │       └── routes.go
-│   ├── auth/                ← The "auth" concept: tokens, sessions, claims
-│   │   ├── auth.go
-│   │   ├── token.go
-│   │   └── middleware.go
-│   ├── platform/            ← Cross-cutting infrastructure (not "util")
-│   │   ├── postgres/        ← DB connection + pool setup
-│   │   ├── logger/          ← Logger initialization
-│   │   └── config/          ← Config loading and validation
-│   └── app/                 ← Wires everything together; the application graph
+│   ├── platform/              ← cross-cutting infrastructure (not "util")
+│   │   ├── postgres/          ← pool setup
+│   │   └── config/            ← config loading and validation
+│   └── app/                   ← composition root: wires the graph
 │       └── run.go
 ├── go.mod
 └── go.sum
 ```
 
 ### `cmd/` — Entry Points Only
-Each subdirectory of `cmd/` is a `main` package. Its job is **exclusively** to:
-1. Parse flags / environment
-2. Build the dependency graph
-3. Call the top-level `Run(ctx)` function
-4. Handle the exit code
 
-If `main.go` is longer than ~50 lines, business logic has leaked into it.
+Each subdirectory of `cmd/` is a `main` package whose job is to parse flags/environment, build the
+dependency graph (or call something that does), run, and turn the result into an exit code. When
+`main.go` grows past roughly 50 lines, business logic has usually leaked into it.
 
+**cmd/myservice/main.go**
 ```go
+package main
+
 func main() {
-    cfg, err := config.Load()
-    if err != nil {
-        log.Fatalf("config: %v", err)
-    }
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 
-    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    defer stop()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-    if err := app.Run(ctx, cfg); err != nil {
-        log.Fatalf("run: %v", err)
-    }
+	if err := app.Run(ctx, cfg); err != nil {
+		log.Printf("run: %v", err)
+		stop()
+		os.Exit(1)
+	}
 }
 ```
 
+`log.Fatal` calls `os.Exit`, which skips deferred calls; that is fine before anything needs
+cleanup, but after `defer stop()` the example releases resources explicitly before exiting.
+
 ### `internal/` — The Compiler-Enforced Boundary
-`internal/` is **not a convention** — it is enforced by the Go compiler. Code inside `internal/` can only be imported by code rooted at the parent of `internal/`. External packages and other modules cannot import it.
 
-Use `internal/` for:
-- All business logic that should not be a public API
-- Domain packages (`user`, `order`, `payment`)
-- Infrastructure wrappers (`platform/postgres`, `platform/redis`)
-
-Use a public `pkg/` only for code you explicitly want other modules to import. When in doubt, `internal/` first.
+`internal/` is enforced by the Go toolchain: code under `a/b/internal/` can only be imported by
+code rooted at `a/b/`. Use it for all business logic that should not be a public API, for domain
+packages, and for infrastructure wrappers. Create a public package (with or without `pkg/`) only
+when another module genuinely needs to import it. When in doubt, `internal/` first.
 
 ---
 
 ## Package Oriented Design in Practice
 
-### Each Domain Package Owns Its World
+### The bounded context owns its world
 
-The `user` package owns the `User` type. Not `models.User`. Not `types.User`. The type, its use cases, the ports they need and the persistence all live together because they are all about the same concept. Each file is named after its intent: opening the directory lists what the concept can do.
+The `user` package owns the `User` type — not `models.User`, not `types.User`. The type, its use
+cases and the ports they need live together; persistence and transport live in subpackages that
+depend on `user`, never the other way round. The domain package imports no `database/sql`, `pgx`,
+`net/http` or `encoding/json`.
 
-```
-internal/user/
-├── user.go          ← type User struct { ... }  +  constructors
-├── get_user.go      ← GetUser use case + GetUserOutput + userFinder port
-├── store.go         ← PostgresStore: satisfies the ports
-├── user_test.go
-└── userhttp/
-    ├── get_user.go  ← GET /users/{id}
-    └── routes.go    ← mounts the endpoints
-```
-
+**internal/user/user.go**
 ```go
-// internal/user/user.go
+// Package user models accounts and the use cases that operate on them.
 package user
 
+// ID identifies a User.
+type ID int64
+
+// ErrNotFound is returned when no user matches the requested ID.
+var ErrNotFound = errors.New("user: not found")
+
+// User is an account; build it with NewUser so the email is always validated.
 type User struct {
-    ID        int64
-    Email     string
-    CreatedAt time.Time
+	id        ID
+	email     string
+	createdAt time.Time
 }
 
-// New is the only way to obtain a valid User.
-func New(email string) (*User, error) {
-    if !isValidEmail(email) {
-        return nil, fmt.Errorf("user: invalid email %q", email)
-    }
-    return &User{Email: email, CreatedAt: time.Now()}, nil
+// NewUser returns an error when email has no "@".
+func NewUser(id ID, email string, now time.Time) (*User, error) {
+	if !strings.Contains(email, "@") {
+		return nil, fmt.Errorf("user: invalid email %q", email)
+	}
+	return &User{id: id, email: email, createdAt: now}, nil
 }
+
+// ID returns the user's identifier.
+func (u *User) ID() ID { return u.id }
+
+// Email returns the validated email address.
+func (u *User) Email() string { return u.email }
 ```
 
+**internal/user/get_user.go**
 ```go
-// internal/user/get_user.go
 package user
 
-type userFinder interface {
-    ByID(ctx context.Context, id int64) (*User, error)
-}
+type GetUserInput struct{ ID ID }
 
 type GetUserOutput struct {
-    ID    int64
-    Email string
+	ID    ID
+	Email string
 }
 
+type userFinder interface {
+	FindByID(ctx context.Context, id ID) (*User, error)
+}
+
+// GetUser loads one user by ID.
 type GetUser struct{ users userFinder }
 
+// NewGetUser wires GetUser to any store that can find users by ID.
 func NewGetUser(users userFinder) *GetUser { return &GetUser{users: users} }
 
-func (uc *GetUser) Execute(ctx context.Context, id int64) (GetUserOutput, error) {
-    u, err := uc.users.ByID(ctx, id)
-    if err != nil {
-        return GetUserOutput{}, fmt.Errorf("get user: %w", err)
-    }
-    return GetUserOutput{ID: u.ID, Email: u.Email}, nil
+// Execute returns ErrNotFound when the user does not exist.
+func (uc *GetUser) Execute(ctx context.Context, in GetUserInput) (GetUserOutput, error) {
+	u, err := uc.users.FindByID(ctx, in.ID)
+	if err != nil {
+		return GetUserOutput{}, fmt.Errorf("get user %d: %w", in.ID, err)
+	}
+	return GetUserOutput{ID: u.ID(), Email: u.Email()}, nil
 }
 ```
 
-The port is declared in the file that consumes it, with only the method this use case needs — not a 10-method `Store` interface in a separate "interfaces" package.
+The port is declared where it is consumed and holds only the method this use case needs. A port
+shared by several use cases gets its own file (`user_repository.go` → `UserRepository`), still in
+the consumer package and still small.
 
+**internal/user/pgstore/pgstore.go**
 ```go
-// internal/user/store.go
-package user
+// Package pgstore persists users in PostgreSQL.
+package pgstore
 
-type PostgresStore struct{ db *pgxpool.Pool }
+// Store implements the user ports with a pgx pool.
+type Store struct{ pool *pgxpool.Pool }
 
-func (s *PostgresStore) ByID(ctx context.Context, id int64) (*User, error) { ... }
+// New returns a Store backed by pool; the caller owns the pool's lifecycle.
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// FindByID translates pgx.ErrNoRows into user.ErrNotFound.
+func (s *Store) FindByID(ctx context.Context, id user.ID) (*user.User, error) {
+	var (
+		email     string
+		createdAt time.Time
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT email, created_at FROM users WHERE id = $1`, id,
+	).Scan(&email, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, user.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: find user %d: %w", id, err)
+	}
+	return user.NewUser(id, email, createdAt)
+}
 ```
 
+Rebuilding the entity through its constructor means a corrupt row is detected on load instead of
+leaking an invalid `User` into the domain. Driver errors never cross the boundary: callers see
+`user.ErrNotFound`, not `pgx.ErrNoRows` or `*pgconn.PgError`.
+
+**internal/user/userhttp/get_user.go**
 ```go
-// internal/user/userhttp/get_user.go
 package userhttp
 
 func getUser(uc *user.GetUser) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-        out, err := uc.Execute(r.Context(), id)
-        if errors.Is(err, user.ErrNotFound) {
-            http.Error(w, "not found", http.StatusNotFound)
-            return
-        }
-        // ...
-    }
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		out, err := uc.Execute(r.Context(), user.GetUserInput{ID: user.ID(id)})
+		if errors.Is(err, user.ErrNotFound) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}
 }
 ```
 
-### Platform Packages — Not "util"
+**internal/user/userhttp/routes.go**
+```go
+// Package userhttp exposes the user use cases over HTTP.
+package userhttp
 
-Infrastructure code that multiple domain packages need is NOT `util/`. It is a **specific named concept**:
+// Deps lists the use cases the routes need.
+type Deps struct {
+	GetUser *user.GetUser
+}
+
+// Routes registers the user endpoints on mux.
+func Routes(mux *http.ServeMux, d Deps) {
+	mux.Handle("GET /users/{id}", getUser(d.GetUser))
+}
+```
+
+`ServeMux` patterns with a method and wildcards (`"GET /users/{id}"`, read with `r.PathValue`)
+exist since Go 1.22; a third-party router is no longer needed for this.
+
+### Platform packages — not "util"
+
+Infrastructure that several contexts need is a specific named concept, not `util/`:
 
 ```
 internal/platform/
-├── postgres/    ← package postgres: opens pool, runs health check, returns *pgxpool.Pool
-├── logger/      ← package logger: builds *slog.Logger from config
-├── config/      ← package config: loads and validates Config struct
-└── httpserver/  ← package httpserver: builds *http.Server with timeouts, graceful shutdown
+├── postgres/    ← opens a tuned pool and pings it
+├── config/      ← loads and validates Config
+└── ...          ← logger, httpserver, telemetry: one concept each
 ```
 
+**internal/platform/postgres/postgres.go**
 ```go
-// internal/platform/postgres/postgres.go
+// Package postgres opens PostgreSQL connection pools.
 package postgres
 
 // Open returns a tuned pool that already answered a ping.
 func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-    cfg, err := pgxpool.ParseConfig(dsn)
-    if err != nil {
-        return nil, fmt.Errorf("postgres: parse config: %w", err)
-    }
-    cfg.MaxConns = 25
-    cfg.MinConns = 5
-    cfg.MaxConnLifetime = 5 * time.Minute
-    cfg.MaxConnIdleTime = 1 * time.Minute
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse config: %w", err)
+	}
+	cfg.MaxConns = 25
+	cfg.MinConns = 5
+	cfg.MaxConnLifetime = 5 * time.Minute
+	cfg.MaxConnIdleTime = time.Minute
 
-    pool, err := pgxpool.NewWithConfig(ctx, cfg)
-    if err != nil {
-        return nil, fmt.Errorf("postgres: open: %w", err)
-    }
-    if err := pool.Ping(ctx); err != nil {
-        return nil, fmt.Errorf("postgres: ping: %w", err)
-    }
-    return pool, nil
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: open: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("postgres: ping: %w", err)
+	}
+	return pool, nil
 }
 ```
 
-### `app/` — The Dependency Graph
+### `app/` — the composition root
 
-`app.Run` is the only place in the codebase that knows about all packages simultaneously. Its job is to wire the graph and nothing else.
+`app.Run` is the one place that knows every package at once. Its job is to wire the graph and run
+it; it holds no business rules.
 
+**internal/app/run.go**
 ```go
-// internal/app/run.go
+// Package app wires the service's dependency graph.
 package app
 
-func Run(ctx context.Context, cfg *config.Config) error {
-    pool, err := postgres.Open(ctx, cfg.DatabaseURL)
-    if err != nil {
-        return fmt.Errorf("app: %w", err)
-    }
-    defer pool.Close()
+// Run serves HTTP until ctx is canceled, then shuts down gracefully.
+func Run(ctx context.Context, cfg config.Config) error {
+	pool, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("app: %w", err)
+	}
+	defer pool.Close()
 
-    log := logger.New(cfg.LogLevel)
+	users := pgstore.New(pool)
 
-    userStore := &user.PostgresStore{Pool: pool}
-    authMW := auth.NewMiddleware(&auth.PostgresStore{Pool: pool})
+	mux := http.NewServeMux()
+	userhttp.Routes(mux, userhttp.Deps{GetUser: user.NewGetUser(users)})
 
-    mux := http.NewServeMux()
-    userhttp.Routes(mux, authMW, userhttp.Deps{
-        GetUser: user.NewGetUser(userStore),
-    })
+	srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
 
-    return httpserver.New(cfg.Addr, mux).Run(ctx)
+	select {
+	case err := <-errc:
+		return fmt.Errorf("app: serve: %w", err)
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
 }
 ```
 
 ---
 
-## Anti-Patterns — Spotted in the Wild
+## Anti-Patterns
 
-### The God Package
+### The god package
+
 ```
-// BAD: one package that knows everything
-internal/service/
+internal/service/          ← BAD: one package that knows everything
 ├── user_service.go
 ├── auth_service.go
 ├── payment_service.go
-└── email_service.go  // ← not a "service", it's everything
+└── email_service.go
 ```
 
-### The Grab-Bag File
+### The anemic type layer
+
 ```
-// BAD: one file, several use cases — the name says nothing about any of them
-internal/identity/
-├── service.go   // type Service; func (s *Service) Login(...); func (s *Service) Signup(...)
-└── handler.go   // every endpoint of the context
-
-// GOOD: one file per use case, named by what it does
-internal/identity/
-├── login.go
-├── signup.go
-└── identityhttp/
-    ├── login.go
-    ├── signup.go
-    └── routes.go
+internal/models/models.go             ← BAD: type User struct{...}; type Order struct{...}
+internal/repositories/user_repo.go    ← func GetUser(id int64) (*models.User, error)
+internal/services/user_service.go     ← func CreateUser(u *models.User) error
 ```
-See "Nombres de Archivo por Intención" below.
 
-### The Anemic Type Layer
-```
-// BAD: types separated from their behavior — Java DTO thinking
-internal/models/
-└── models.go  // type User struct { ... }  type Order struct { ... }
+The `User` type is owned by nobody, and three packages must coordinate to do anything with a user.
 
-internal/repositories/
-└── user_repo.go  // func GetUser(id int64) (*models.User, error)
+### The circular import smell
 
-internal/services/
-└── user_service.go // func CreateUser(u *models.User) error
-```
-The `User` type is owned by nobody. Three packages must coordinate to do anything with a user.
-
-### The Circular Import Smell
 If packages A and B need to import each other, one of three things is true:
-1. They are actually one concept and should be merged
-2. A third package C needs to be extracted that both A and B depend on
-3. An interface should replace the direct dependency
+1. they are one concept and should be merged;
+2. a third package C should be extracted that both depend on;
+3. an interface (defined by the consumer) should replace the direct dependency.
 
 ---
 
-## Evitar Nested Packages
+## Avoid Nested Packages
 
-Go no tiene jerarquía de paquetes. Anidar un paquete dentro de otro **no** crea relación padre-hijo, **no** da acceso privilegiado a los identificadores no-exportados del "padre", y **no** comunica encapsulación. `internal/user/profile` no es "hijo" de `internal/user`: son dos paquetes independientes que resultan estar en carpetas anidadas. La visibilidad en Go es **por paquete**, nunca por carpeta.
+Go has no package hierarchy. Nesting `internal/user/profile` inside `internal/user` creates no
+parent–child relationship, grants no access to the parent's unexported identifiers and
+communicates no encapsulation: they are two independent packages that happen to sit in nested
+folders. Visibility is per package, never per folder.
 
-Consecuencias de anidar sin motivo:
-- Ruido en los import paths sin ganar nada de diseño.
-- La suposición (falsa) de que el sub-paquete ve los no-exportados del de arriba. No los ve.
-- Estructuras profundas (`internal/domain/user/service/impl/...`) son diseño Java/C# trasplantado.
+Nesting without a reason costs you:
+- noisier import paths with no design gain;
+- the false belief that the subpackage sees the parent's unexported names (it does not);
+- deep trees like `internal/domain/user/service/impl/...`, which are Java/C# layering transplanted.
 
-Regla: **estructura plana por defecto**. Un nivel de paquetes de dominio bajo `internal/`. Anida SOLO cuando el sub-paquete es un concepto genuinamente distinto y subordinado que nadie más va a importar.
+Default to a flat layout: one level of domain packages under `internal/`. Nest only when the
+subpackage is a distinct, subordinate concept. The infra and transport adapters of a context
+(`user/pgstore`, `user/userhttp`) are the standard case: they depend on `user`, and `user` never
+imports them.
 
 ```
-// BAD — capas técnicas disfrazadas de paquetes (models/repo/service = Java)
-internal/
+internal/                  ← BAD: technical layers disguised as packages
 └── user/
-    ├── service/      ← "service" no es un concepto
-    ├── repository/   ← capa técnica, no dominio
-    └── model/        ← el tipo User separado de su comportamiento
+    ├── service/           ← "service" is not a concept
+    ├── repository/        ← a technical layer, not a domain
+    └── model/             ← the User type separated from its behavior
 
-// GOOD — plano; cada carpeta es un concepto con nombre propio
-internal/
-├── user/            ← un paquete: tipo + casos de uso + store juntos
+internal/                  ← GOOD: each folder is a named concept
+├── user/
 │   ├── user.go
 │   ├── get_user.go
-│   └── store.go
-└── billing/         ← otro concepto, al mismo nivel
+│   └── pgstore/           ← adapter that depends on user
+└── billing/
     ├── billing.go
-    └── store.go
+    └── pgstore/
 ```
 
-### `internal/` es la única frontera real
-La encapsulación entre carpetas la impone el compilador SOLO con `internal/`: el código bajo `internal/X` solo puede importarlo el árbol enraizado en el padre de ese `internal/`. Anidar `internal/` a distintos niveles crea fronteras finas cuando de verdad las necesitas:
+### `internal/` is the only real boundary
+
+The toolchain enforces encapsulation between folders only through `internal/`. Nesting `internal/`
+at different levels gives you fine-grained boundaries when you actually need them:
 
 ```
 myservice/
-└── internal/            ← privado a myservice
+└── internal/              ← private to myservice
     └── billing/
-        └── internal/    ← privado a billing: ni user ni auth pueden importar esto
+        └── internal/      ← private to billing: user and auth cannot import it
             └── ledger/
 ```
 
-Usa esto para ocultar detalles de un sub-dominio del resto de sub-dominios — nunca para simular capas.
+Use this to hide a subdomain's details from the other subdomains, not to simulate layers.
 
 ---
 
-## Nombres de Archivo por Intención
+## File Names
 
-El paquete nombra el concepto; el **archivo** nombra la intención. Dentro de un bounded
-context, cada caso de uso vive en su propio archivo, en `snake_case`, nombrado por lo
-que hace (`login.go`, `signup.go`, `search_users.go`). Un archivo **nunca** contiene dos
-casos de uso: un `service.go` con `Login()` y `Signup()` es un cajón que obliga a abrirlo
-para saber qué hay.
-
-| Prohibido dentro de un contexto | Correcto |
-|---|---|
-| `service.go`, `services.go` | un archivo por caso de uso: `login.go`, `signup.go` |
-| `usecase.go`, `usecases.go`, `use_cases.go` | `register_user.go`, `search_users.go` |
-| `application.go`, `app.go` | idem: la capa no es una intención |
-| `manager.go`, `helpers.go`, `utils.go`, `common.go` | el archivo del concepto al que pertenece el código |
-| `handler.go` / `handlers.go` con varios endpoints | `<ctx>http/login.go` por endpoint + `routes.go` |
-
-Permitidos: conceptos (`user.go`, `email.go`), `errors.go`, un puerto compartido con su
-nombre (`user_repository.go`), `store.go` para la implementación de persistencia,
-`routes.go`. Fuera de los contextos, un composition root (`internal/handlers/handlers.go`
-que solo monta rutas, `internal/app/run.go`) es aceptable: tiene una sola intención.
-
-El tipo sigue al archivo: un struct por caso de uso con nombre de acción, constructor
-`NewX(deps...)` y un único método exportado `Execute(ctx, in XInput) (XOutput, error)`;
-DTOs y puertos estrechos en el mismo archivo. Nada de tipos cajón `Service`, `UseCase` o
-`Manager`.
-
-```go
-// internal/identity/signup.go
-package identity
-
-type SignupInput struct {
-    Email    string
-    Password string
-}
-
-type SignupOutput struct{ UserID string }
-
-type accountCreator interface {
-    Create(ctx context.Context, a Account) error
-}
-
-type Signup struct{ accounts accountCreator }
-
-func NewSignup(accounts accountCreator) *Signup { return &Signup{accounts: accounts} }
-
-func (uc *Signup) Execute(ctx context.Context, in SignupInput) (SignupOutput, error) {
-    // ...
-}
-```
+The package names the concept; the file names what it contains. File names are `snake_case`
+(`get_user.go`, `routes.go`) and no file is a grab-bag: no `utils.go`, `helpers.go`, `common.go`
+or `misc.go` — put each function in the file of the concept it serves. Inside a bounded context,
+one use case per file named after the action; the full rule set lives in the
+**ddd-go-idiomatic** skill.
 
 ---
 
-## Dirección de Dependencias (Grafo Acíclico)
+## Dependency Direction (DAG)
 
-Las dependencias entre paquetes deben formar un **DAG** (grafo dirigido acíclico) que apunta hacia adentro: `wiring → aplicación → dominio`. El dominio (`user`, `billing`) **no** importa infraestructura (`platform/postgres`); la infraestructura implementa las interfaces que el dominio define.
+Package dependencies form a directed acyclic graph that points inward: composition root → adapters
+→ context. The context (`user`) never imports infrastructure; infrastructure implements the ports
+the context declares.
 
 ```
-cmd/ ──▶ internal/app ──▶ internal/user ──▶ (define la interfaz Store)
-                    │                              ▲
-                    └──▶ internal/platform/postgres ┘  (implementa Store)
+cmd/myservice ──▶ internal/app ──▶ internal/user/userhttp ──▶ internal/user
+                        │                                        ▲
+                        ├──▶ internal/user/pgstore ──────────────┘  (implements user's ports)
+                        └──▶ internal/platform/postgres
 ```
 
-- Las flechas nunca vuelven: `postgres` puede depender de `user` (para implementar su `Store`), pero `user` **jamás** importa `postgres`.
-- Un ciclo lo rechaza el compilador. Es una feature: te obliga a arreglar el diseño (ver "The Circular Import Smell").
-- `go mod graph` (a nivel de módulo) y herramientas como `go-cleanarch` (a nivel de paquete) verifican la dirección.
+- Arrows never point back: `pgstore` depends on `user` to implement its ports; `user` never
+  imports `pgstore`.
+- The compiler rejects import cycles. Treat that as a feature: it forces you to fix the design
+  (see "The circular import smell").
+- `go list -deps` and `go mod graph` show the graph; a linter such as `depguard` can forbid
+  `pgx`/`net/http` imports in domain packages.
 
 ---
 
 ## Rules Summary
 
-1. **Name packages after what they represent, not what they do**
-2. **Each package owns its types** — no shared `models/` or `types/` package
-3. **Define interfaces at the point of use** — inside the package that depends on them, not inside the package that implements them
-4. **`internal/` first** — expose a public API only when another module needs it
-5. **`cmd/` packages are wiring only** — 50 lines max, no business logic
-6. **Platform packages are named concepts** — `postgres`, `redis`, `logger`, never `util`
-7. **If you can't name it, you haven't designed it yet** — applies to files too: one use case per file, named by intent; no `service.go`/`usecase.go`/`utils.go`
-8. **Estructura plana** — anidar paquetes no crea jerarquía ni encapsulación; solo `internal/` es una frontera real
-9. **Dependencias en DAG** — el dominio define interfaces, la infraestructura las implementa; las flechas nunca vuelven
+1. Name packages after what they represent, not what they do.
+2. Each package owns its types — no shared `models/` or `types/`.
+3. Define interfaces where they are consumed, small, not next to the implementation.
+4. `internal/` first; expose a public API only when another module needs it.
+5. `cmd/` is wiring only; business rules live in packages.
+6. Platform packages are named concepts — `postgres`, `config`, never `util`.
+7. Infra and transport live in subpackages of the context (`pgstore`, `userhttp`); the domain
+   package imports no driver, HTTP or JSON packages.
+8. Flat by default: nesting creates no hierarchy or encapsulation; only `internal/` is a boundary.
+9. Dependencies form a DAG pointing inward.
+10. Files are named by what they contain; bounded-context file rules live in ddd-go-idiomatic.

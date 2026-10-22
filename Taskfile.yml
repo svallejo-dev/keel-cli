@@ -28,6 +28,13 @@ tasks:
     cmds:
       - go test ./...
 
+  skills:sync:
+    desc: Copy the bundled Claude skills from the claude-skills repo (SKILLS_REPO, default ../claude-skills)
+    vars:
+      SRC: '{{.SKILLS_REPO | default "../claude-skills"}}'
+    cmds:
+      - rsync -a --delete --exclude .DS_Store {{.SRC}}/skills/ internal/scaffold/skills/
+
   check:
     desc: Format, vet and test
     cmds:

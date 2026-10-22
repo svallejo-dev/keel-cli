@@ -1,81 +1,91 @@
-# Value Objects — DDD Táctico al Estilo Idiomático de Go
+# Value Objects
 
-> **Regla #0.** Ante cualquier conflicto entre la ortodoxia DDD y el Go idiomático, gana Go. Los value objects son el punto del táctico DDD donde ambos mundos coinciden casi por completo: Go ya tiene semántica de valor de primera clase. No importamos Java-ismos (getters/setters, `equals()`/`hashCode()`, `final` por todas partes); usamos lo que el lenguaje ya te da. La skill compañera `senior-go-idiomatic` cubre el detalle del lenguaje; aquí solo asumimos su vocabulario.
+Value objects are where DDD and Go agree almost completely: Go already has first-class value
+semantics. There is nothing to import from Java (getters/setters, `equals`/`hashCode`,
+`final` everywhere); use what the language gives you. When a DDD habit and a Go idiom
+disagree, the Go idiom wins.
 
-Snippets verificados con toolchain `go1.24.7`; el código es válido en Go 1.26 estándar.
+## 1. Definition
 
-## 1. Definición
+A **value object** (VO) is a small, **immutable** type **without identity**, defined entirely
+by its attributes. Two VOs with the same attributes are interchangeable: there is no "this
+email" versus "that email", only the value.
 
-Un **value object** (VO) es un tipo pequeño, **inmutable**, **sin identidad**, definido enteramente por sus atributos. Dos VOs con los mismos atributos son intercambiables: no existe "este email" frente a "aquel email", solo existe el valor.
+The VO is **the smallest unit where that unit's rules live**. "An email has the shape
+`local@domain`" does not belong to the handler, the use case or the entity that holds it; it
+belongs to `Email`. Concentrating validation in the VO is what lets the rest of the system
+assume correct data without re-validating.
 
-El VO es la **unidad mínima donde viven las validaciones de esa unidad**. La regla de negocio "un email tiene forma `local@domain`" no pertenece al handler, ni al use case, ni a la entity que lo contiene: pertenece al tipo `Email`. Concentrar la validación en el VO es lo que hace que el resto del sistema pueda asumir datos correctos sin re-validar.
+Contrast with an entity (see [entities.md](entities.md)): an entity has an ID and a life
+cycle, and two entities with equal attributes are still different. A VO is pure value.
 
-Contraste con **entity** (ver `references/entities.md`): la entity tiene identidad (`ID`) y ciclo de vida; dos entities con los mismos atributos siguen siendo distintas. El VO no: es puro valor.
+## 2. Two shapes in Go, and why the struct wins
 
-## 2. Realización en Go — dos formas y su trade-off
-
-Hay exactamente dos maneras idiomáticas de materializar un VO en Go, y la elección no es estética.
-
-| | `type Email struct{ v string }` (campo no-exportado) | `type Email string` (alias) |
+| | `type Email struct{ v string }` | `type Email string` (defined type) |
 |---|---|---|
-| Allocación | Igual que el string subyacente (un campo) | Cero-alloc, es el string |
-| Ergonomía | Requiere `String()`/accessor para leer | Se usa casi como un `string` |
-| Barrera de invariantes | **Infranqueable** desde fuera del paquete | **Evadible**: `Email("basura")` compila dentro del paquete |
-| Comparable con `==` | Sí (si los campos lo son) | Sí |
-| Uso recomendado | VOs con invariantes fuertes | Envoltorios triviales sin invariante real |
+| Cost | One field, same as the string | The string itself |
+| Reading the value | Needs `String()` or an accessor | Used almost like a `string` |
+| Can code skip the constructor? | **No**, outside the package only the zero value `Email{}` can be built | **Yes**, from any package |
+| Comparable with `==` | Yes, if every field is | Yes |
+| Use for | VOs with an invariant | Named types with no rule to protect |
 
-El alias es tentador: es cero-alloc y se lee como un string. Pero su invariante es **evadible**: cualquier código en el mismo paquete puede escribir `Email("no-es-un-email")` con una conversión y saltarse el constructor. El struct con campo no-exportado no tiene esa fuga: fuera del paquete es imposible construir un `Email` con un valor arbitrario porque `v` no es accesible.
+`type Email string` is a **defined type**, not an alias (an alias is `type Email = string`
+and creates no new type at all). A defined type is still not a safe value object, because
+two things bypass any `NewEmail` constructor:
 
 ```go
-type Email struct {
-	v string
-}
+type Email string
 
-type Username string
+func Send(to Email) error { /* ... */ }
+
+Send("garbage")                 // compiles: an untyped string constant is assignable to Email
+e := identity.Email(userInput)  // compiles in any package: explicit conversion
 ```
 
-La fuga del alias es concreta: dentro del paquete que lo declara, la conversión de tipo evita el constructor por completo.
+With the struct, `v` is unexported, so no other package can put an arbitrary string inside
+an `Email`; `NewEmail` is the only way in, and the zero value `Email{}` is the only other
+value anyone can produce.
+
+**Rule:** a VO with an invariant (email, money, coordinates) is a struct with unexported
+fields plus a validating constructor. Keep defined types (`type Meters float64`,
+`type UserID string`) for named types where every underlying value is acceptable; their job
+is to stop parameter swaps, not to guarantee validity.
+
+## 3. Validating constructor
+
+Validation lives in a constructor returning `(T, error)`. This is not the GoF Factory Method
+(no hierarchy, no polymorphism); it is an ordinary Go constructor.
 
 ```go
-// BAD: dentro del paquete, esto compila y salta toda validación.
-u := Username("basura") // sin pasar por NewUsername
-
-// GOOD con el struct: NewEmail es la única puerta desde fuera del paquete.
-e, err := NewEmail("basura") // err != nil
-```
-
-**Recomendación:** struct con campo privado para VOs con invariantes fuertes (email, dinero, coordenadas); alias solo para envoltorios triviales donde el tipo aporta significado semántico pero no hay regla que proteger.
-
-## 3. Constructor con validación
-
-La validación vive en un **constructor**. Esto no es el patrón GoF "Factory Method" (no hay jerarquía, ni polimorfismo, ni subclases): es un constructor idiomático de Go, una función que devuelve `(T, error)`.
-
-```go
-func NewEmail(s string) (Email, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
+// NewEmail trims and lower-cases raw and fails with ErrInvalidEmail if it is not an address.
+func NewEmail(raw string) (Email, error) {
+	addr := strings.ToLower(strings.TrimSpace(raw))
+	if addr == "" {
 		return Email{}, fmt.Errorf("%w: empty", ErrInvalidEmail)
 	}
-	at := strings.LastIndexByte(s, '@')
-	if at <= 0 || at == len(s)-1 {
-		return Email{}, &ValidationError{Field: "email", Reason: "missing local or domain part"}
+	if _, err := mail.ParseAddress(addr); err != nil {
+		return Email{}, fmt.Errorf("%w: %q", ErrInvalidEmail, raw)
 	}
-	return Email{v: s}, nil
+	return Email{v: addr}, nil
 }
 ```
 
-El principio rector es **make invalid states unrepresentable**: si tienes en la mano un `Email`, es válido *por construcción*. No hay un `Email` medio-formado esperando validación posterior. El `zero value` (`Email{}`) es el único estado inválido posible, y no puede confundirse con uno construido porque el constructor nunca lo devuelve junto a un `err == nil`.
+The governing idea is **make invalid states unrepresentable**: if you hold an `Email`, it is
+valid by construction. The zero value `Email{}` is the only invalid value, and the
+constructor never returns it together with a `nil` error. Code that receives an `Email`
+stops defending itself; the type is the guarantee.
 
-Consecuencia práctica: el resto del código deja de defenderse. Una función que recibe `Email` no re-valida — el tipo *es* la garantía. Esto elimina la validación defensiva dispersa que plaga los sistemas donde se pasan `string` crudos (ver `references/antipatterns.md`).
-
-El mismo patrón escala a VOs multi-campo. `Money` valida en construcción y expone operaciones que devuelven un valor nuevo, no que mutan:
+The pattern scales to multi-field VOs. Operations that can fail return an error; operations
+never mutate the receiver.
 
 ```go
+// Money is an amount in the smallest unit of a currency.
 type Money struct {
 	cents    int64
 	currency string
 }
 
+// NewMoney rejects an empty currency; negative amounts are allowed (refunds).
 func NewMoney(cents int64, currency string) (Money, error) {
 	if currency == "" {
 		return Money{}, &ValidationError{Field: "currency", Reason: "empty"}
@@ -83,7 +93,7 @@ func NewMoney(cents int64, currency string) (Money, error) {
 	return Money{cents: cents, currency: currency}, nil
 }
 
-// Add falla con ErrCurrencyMismatch si las monedas difieren.
+// Add fails with ErrCurrencyMismatch when the currencies differ.
 func (m Money) Add(other Money) (Money, error) {
 	if m.currency != other.currency {
 		return Money{}, fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, m.currency, other.currency)
@@ -92,70 +102,57 @@ func (m Money) Add(other Money) (Money, error) {
 }
 ```
 
-La operación de negocio (`Add`) puede fallar, así que devuelve `error`: sumar dos monedas distintas es un estado inválido y el tipo lo impide en el punto exacto donde ocurre.
+Adding two currencies is an invalid state, so the type rejects it exactly where it would
+happen.
 
-## 4. Inmutabilidad por convención
+## 4. Immutability by convention
 
-Go no tiene `readonly` ni `const` para structs. La inmutabilidad es una **convención sostenida por tres decisiones**, no una garantía del compilador:
+Go has no `readonly` for structs. Immutability rests on three decisions, not on the compiler:
 
-1. **Campos no-exportados** — nadie fuera del paquete puede reasignarlos.
-2. **Value receivers** — el método opera sobre una copia; mutarla no afecta al original.
-3. **Métodos que devuelven un VO NUEVO** — cualquier "transformación" produce otro valor, nunca muta el receptor.
-
-```go
-// Normalized baja a minúsculas solo el dominio.
-func (e Email) Normalized() Email {
-	at := strings.LastIndexByte(e.v, '@')
-	local, domain := e.v[:at], strings.ToLower(e.v[at+1:])
-	return Email{v: local + "@" + domain}
-}
-```
+1. **Unexported fields**: nobody outside the package can reassign them.
+2. **Value receivers**: the method works on a copy.
+3. **Methods return a new VO**: every "transformation" produces another value.
 
 ```go
-// BAD: pointer receiver que muta in-place rompe la semántica de valor.
-func (e *Email) normalize() { e.v = strings.ToLower(e.v) }
+// BAD: a pointer receiver that mutates in place breaks value semantics.
+func (m *Money) Scale(n int64) { m.cents *= n }
 
-// GOOD: value receiver que devuelve un valor nuevo.
-func (e Email) Normalized() Email { /* ... */ }
+// GOOD: value receiver, new value.
+func (m Money) Times(n int64) Money { return Money{cents: m.cents * n, currency: m.currency} }
 ```
 
-Un VO con pointer receiver mutante es un smell: significa que estás tratando un valor como si tuviera identidad. Si necesitas mutación, probablemente es una entity, no un VO.
+A VO with a mutating pointer receiver is a smell: you are treating a value as if it had
+identity. If it really needs to change over time, it is probably an entity.
 
-## 5. Igualdad
+## 5. Equality
 
-Un VO se define por su valor, así que la igualdad es **igualdad por valor**. Cuando el tipo es `comparable` (sin slices, maps ni funciones dentro), Go te la da gratis con `==`. Nada de escribir `Equal`/`hashCode` a mano como en Java.
+A VO is equal to another when their values are equal. When the type is `comparable` (no
+slices, maps or funcs inside), `==` does it for free; no hand-written `Equal`/`hashCode`.
 
 ```go
 a, _ := NewEmail("dev@example.com")
-b, _ := NewEmail("dev@example.com")
-_ = a == b // true, y compila: Email{ v string } es comparable
+b, _ := NewEmail("DEV@example.com")
+_ = a == b // true: both normalize to the same value
 ```
 
-**FOOTGUN.** Si el VO lleva un slice (o map) interno deja de ser `comparable` y `==` **no compila**. El compilador es tajante:
+A slice or map field makes the struct non-comparable and `==` stops compiling
+(`invalid operation: a == b (struct containing []Email cannot be compared)`). Provide an
+explicit `Equal` instead:
 
 ```go
+// Recipients is an ordered list of addresses.
 type Recipients struct {
 	to []Email
 }
 
-// BAD: no compila.
-//   invalid operation: a == b
-//   (struct containing []Email cannot be compared)
-func recipientsEqualBAD(a, b Recipients) bool {
-	return a == b
-}
-```
-
-La corrección es proveer un método `Equal` explícito. Con Go 1.21+, `slices.Equal` lo resuelve cuando el elemento es comparable (aquí `Email` lo es):
-
-```go
-// GOOD: método Equal explícito.
+// Equal compares element by element, since == does not compile for slices.
 func (r Recipients) Equal(other Recipients) bool {
 	return slices.Equal(r.to, other.to)
 }
 ```
 
-Regla operativa: **diseña los VOs para que sean `comparable` siempre que puedas** (usa arrays de tamaño fijo o campos escalares en vez de slices). Un VO comparable, además, sirve como key de map sin ceremonia — algo imposible con un tipo no-comparable:
+Design VOs to be `comparable` when you can (scalar fields, fixed-size arrays such as
+`[3]Email` instead of slices). A comparable VO also works as a map key without ceremony:
 
 ```go
 balances := map[Money]int{}
@@ -163,99 +160,98 @@ usd, _ := NewMoney(100, "USD")
 balances[usd]++
 ```
 
-Cuando la colección tiene una cota conocida, un **array** (`[N]T`) preserva la comparabilidad donde un slice la rompería:
+Accept a manual `Equal` only when the data really is a collection of arbitrary size.
 
-```go
-type Line3 struct {
-	fields [3]Email // con []Email el struct dejaría de ser comparable
-}
-```
+## 6. Typed and sentinel validation errors
 
-Solo cuando la naturaleza del dato exige una colección de tamaño arbitrario aceptas el coste de un `Equal` manual.
+Constructors fail with errors the edge can map to `400` without inspecting strings.
 
-## 6. Errores de validación tipados / sentinela
-
-El constructor falla con errores que las capas superiores puedan **mapear a un 400** sin inspeccionar strings. Dos herramientas complementarias:
-
-**Sentinela** — para un modo de fallo único y estable, comparable con `errors.Is`:
+**Sentinel**, for a single stable failure mode, checked with `errors.Is`:
 
 ```go
 var ErrInvalidEmail = errors.New("identity: invalid email")
 ```
 
-**`ValidationError` tipado** — cuando quieres transportar el campo y la razón hasta el handler, inspeccionable con `errors.As`:
+**Typed `ValidationError`**, when the field and reason should reach the client, checked with
+`errors.As`:
 
 ```go
+// ValidationError names the field that failed and why.
 type ValidationError struct {
 	Field  string
 	Reason string
 }
 
+// Error reads "identity: <field>: <reason>".
 func (e *ValidationError) Error() string {
 	return fmt.Sprintf("identity: %s: %s", e.Field, e.Reason)
 }
 ```
 
-El transporte traduce sin acoplarse al texto del mensaje (ver `references/application-layer.md`):
+The domain only emits errors; the **transport** (the edge) maps them to status codes, as
+described in [application-layer.md](application-layer.md) §5:
 
 ```go
+var ve *identity.ValidationError
 switch {
-case errors.Is(err, ErrInvalidEmail):
+case errors.Is(err, identity.ErrInvalidEmail):
 	http.Error(w, "invalid email", http.StatusBadRequest)
+case errors.As(err, &ve):
+	http.Error(w, ve.Field+": "+ve.Reason, http.StatusBadRequest)
 default:
-	var ve *identity.ValidationError
-	if errors.As(err, &ve) {
-		http.Error(w, ve.Reason, http.StatusBadRequest)
-		return
-	}
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 ```
 
-El dominio no conoce HTTP; solo emite errores tipados. El mapeo a status code vive en el borde. Envuelve siempre con `%w` para no romper la cadena de `errors.Is`/`errors.As`.
+Always wrap with `%w` so `errors.Is`/`errors.As` keep working up the chain.
 
-## 7. Stateless / siempre-crea-nuevo
+## 7. Replace, never update
 
-El VO es **stateless en el sentido temporal**: no se actualiza in-place, siempre se reemplaza. Esto encaja de forma natural con la semántica de valor de Go, donde asignar y pasar copia es el comportamiento por defecto.
-
-La entity **compone** VOs y, cuando cambia, reemplaza el VO completo — nunca alcanza dentro de él para mutar un campo:
+A VO is never updated in place; it is replaced. The entity composes VOs and, when it
+changes, swaps the whole VO instead of reaching inside it:
 
 ```go
 type User struct {
-	id    int64
+	id    UserID
 	email Email
 }
 
-func (u *User) ChangeEmail(e Email) {
-	u.email = e
-}
+// ChangeEmail swaps the whole value object.
+func (u *User) ChangeEmail(e Email) { u.email = e }
 ```
 
-Nótese el reparto de receivers: la entity usa **pointer receiver** (tiene identidad y muta su estado interno); el VO usa **value receiver** (es valor puro). Esa asimetría es la firma en el código de la distinción entity/VO. La entity es dueña de su ciclo de vida; el VO solo existe como el valor de un campo. Cómo se agrupan entities y VOs bajo una raíz transaccional es competencia del aggregate (ver `references/aggregates.md`).
+Note the receiver asymmetry: the entity uses a **pointer receiver** (it has identity and
+mutates), the VO a **value receiver**. That asymmetry is the entity/VO distinction written in
+code. How entities and VOs group under a transactional root is the aggregate's job
+([aggregates.md](aggregates.md)).
 
-### El borde de persistencia
+### The persistence edge
 
-El campo no-exportado que protege el invariante tiene un coste: el repository no puede reconstruir un VO leído de la DB con un struct literal, porque no puede tocar `v` desde otro paquete. La reconstitución **debe pasar por el constructor**, igual que la entrada de usuario:
+The unexported field has a cost: a repository in another package cannot rebuild a VO with a
+struct literal. Reconstitution goes through the constructor, exactly like user input:
 
 ```go
-// pgstore, al leer una fila
-e, err := identity.NewEmail(row.Email)
+// in pgstore, when reading a row
+email, err := identity.NewEmail(r.Email)
 if err != nil {
-	return nil, fmt.Errorf("corrupt email in row %d: %w", row.ID, err)
+	return nil, fmt.Errorf("pgstore: corrupt email for user %s: %w", r.ID, err)
 }
 ```
 
-Esto es una feature, no una fricción: si un dato persistido viola el invariante (migración defectuosa, escritura fuera de banda), lo detectas al cargar en vez de propagar un VO inválido por el dominio. Cuando la validación en la lectura sea un cuello de botella medido, ofrece un constructor `mustReconstruct` **no-exportado** dentro del bounded context, nunca uno público que reabra la evasión.
+That is a feature: a stored value that violates the invariant (bad migration, out-of-band
+write) is caught on load instead of spreading through the domain. If validation on read is a
+measured bottleneck, add an unexported reconstruction helper inside the context, never an
+exported one that reopens the bypass.
 
 ## Checklist
 
-- [ ] VO con invariante fuerte → `struct` con campo **no-exportado**, no alias.
-- [ ] Alias (`type T string`) solo para envoltorios triviales sin regla que proteger.
-- [ ] Toda validación vive en el constructor `NewX(...) (X, error)` — *make invalid states unrepresentable*.
-- [ ] Sin `readonly`: inmutabilidad por campos privados + value receivers + métodos que devuelven un VO nuevo.
-- [ ] Ningún método de VO usa pointer receiver para mutar in-place.
-- [ ] VO diseñado como `comparable` cuando es posible → `==` gratis, sirve como key de map.
-- [ ] VO con slice/map interno → método `Equal` explícito (`slices.Equal`); nunca esperar que `==` compile.
-- [ ] Errores de construcción tipados/sentinela (`errors.Is`/`errors.As`), envueltos con `%w`, mapeados a 400 en el borde.
-- [ ] El dominio no conoce HTTP; el mapeo a status code vive en la capa de aplicación.
-- [ ] La entity reemplaza el VO completo al cambiar; nunca muta sus campos internos.
+- [ ] A VO with an invariant is a struct with **unexported** fields, not a defined type like `type Email string`.
+- [ ] Defined types (`type T string`) only where every underlying value is valid; they stop swaps, not bad values.
+- [ ] All validation lives in `NewX(...) (X, error)`; holding an `X` means it is valid.
+- [ ] Immutability: unexported fields + value receivers + methods that return a new VO.
+- [ ] No VO method uses a pointer receiver to mutate in place.
+- [ ] VOs are `comparable` when possible (`==` for free, usable as map keys).
+- [ ] A VO with a slice/map field has an explicit `Equal` (`slices.Equal`).
+- [ ] Construction errors are sentinels or typed, wrapped with `%w`, mapped to 400 at the transport edge.
+- [ ] The domain knows nothing about HTTP; status mapping lives in the transport.
+- [ ] Entities replace whole VOs; stores rebuild VOs through their constructors.

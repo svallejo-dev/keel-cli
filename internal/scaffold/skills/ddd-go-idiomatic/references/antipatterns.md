@@ -1,94 +1,107 @@
-# Anti-patrones: DDD táctico que rompe en Go
+# Anti-patterns: Tactical DDD That Breaks in Go
 
-DDD es un vocabulario de diseño, no un dialecto de Java. La mayoría de los "patrones tácticos" que circulan como canónicos son convenciones de Java/Spring o C#/.NET trasplantadas: en Go compilan, pero pelean contra el lenguaje (ciclos de import, interface pollution, allocaciones, tipos huérfanos). Este archivo cataloga esos Java/C#-ismos y su forma idiomática. Toolchain objetivo: Go 1.26 estándar (pin 1.24.7). Los `// BAD` son Go válido cuyo defecto es de diseño, salvo donde se marque lo contrario.
+## Contents
 
-## Regla #0 — Ante conflicto DDD ↔ Go idiomático, gana Go
+1. Folders per layer → package per context
+2. One interface per class → interface at the consumer
+3. Getters/setters → intent-revealing methods
+4. Anemic model → rich model
+5. `mapper/` + reflection → hand translation
+6. GoF Builder / Abstract Factory → idiomatic constructor
+7. Repository leaking driver errors → domain error at the border
+8. Pointer between aggregates → reference by ID
+9. Generic `Repository[T]` → concrete repositories
+10. Grab-bag packages → concept names
+11. `BaseEntity` inheritance → purposeful composition
+12. Mutable value object → immutable, create-new
+13. Grab-bag file/type (`service.go`) → one file and one type per use case
+- Summary table and checklist
 
-Es el corazón de este documento. Cuando la ortodoxia DDD ("una interfaz por repositorio", "capas domain/application/infrastructure", "value objects con getters") choca con lo que escribiría un principal engineer de Go, se sigue Go. Cada anti-patrón de abajo es un caso concreto de esa regla: el "patrón" viene de un lenguaje con herencia, reflection ubicua y namespaces jerárquicos, y Go no tiene nada de eso. DDD aporta los conceptos (aggregate, bounded context, invariante); Go dicta la implementación. Si necesitas citar a Evans en vez de `go doc` para justificar tu layout, ya te desviaste.
+Most "tactical patterns" that circulate as canonical are Java/Spring or C#/.NET conventions
+transplanted. In Go they compile but fight the language: import cycles, interface pollution,
+needless allocations, orphan types. DDD supplies the concepts (aggregate, bounded context,
+invariant); Go dictates the implementation. When they disagree, Go wins. Each `BAD` below is
+valid Go whose defect is design, unless stated otherwise.
 
----
+## 1. Folders per layer → package per context
 
-## 1. Carpetas por capa → paquete por contexto, archivo por rol
-
-Carpetas top-level `domain/`+`application/`+`infrastructure/` con `models/`+`repositories/`+`services/` dentro. En Go un paquete es unidad de diseño, no namespace: partir un concepto en capas crea el modelo anémico (`models.Order` no lo posee nadie) y, en cuanto el dominio necesita una firma de la infra, un **ciclo de import** que el compilador rechaza. Fix: un paquete por bounded context (ver `references/bounded-contexts.md`); dentro, un archivo por rol, con el tipo, sus invariantes y su persistencia en el mismo paquete.
+Top-level `domain/` + `application/` + `infrastructure/`, with `models/`, `repositories/`,
+`services/` inside. In Go a package is a unit of design, not a namespace: splitting one
+concept across layers produces the anemic model (`models.Order` belongs to nobody) and, as
+soon as the domain needs a type from infrastructure, an **import cycle** the compiler
+rejects. Fix: one package per bounded context ([bounded-contexts.md](bounded-contexts.md));
+inside, one file per concept or use case.
 
 ```
-// BAD — capas técnicas; Order huérfano y domain↔infra tiende al ciclo
-internal/domain/models/order.go        internal/domain/repositories/order_repo.go
-internal/application/services/order_service.go   internal/infrastructure/order_pg.go
+# BAD: technical layers; Order is an orphan and domain ↔ infra drifts into a cycle
+internal/domain/models/order.go
+internal/domain/repositories/order_repo.go
+internal/application/services/order_service.go
+internal/infrastructure/order_pg.go
+
+# GOOD: the concept, its port, its use cases and its infrastructure together
+internal/order/order.go              Order + invariants
+internal/order/order_repository.go   OrderRepository (port, declared by the consumer)
+internal/order/place_order.go        PlaceOrder use case
+internal/order/pgstore/              OrderRepository on PostgreSQL
 ```
+
+## 2. One interface per class → interface at the consumer
+
+A `port` plus `adapter` for every collaborator, even with a single implementation. Go
+interfaces are satisfied implicitly and declared where they are used; an interface with one
+implementation declared next to it is **interface pollution**: indirection (blocks
+inlining), an allocation and a file jump for nothing. Fix: the implementation is an exported
+concrete struct; the consumer declares the minimal interface it needs
+([application-layer.md](application-layer.md) §3).
 
 ```go
-// GOOD — internal/order/order.go: tipo + invariante + store en un paquete
-package order
-
-type Order struct {
-	id    ID
-	lines []Line
-}
-
-func New(id ID, lines []Line) (*Order, error) {
-	if len(lines) == 0 {
-		return nil, ErrEmpty // sentinela del paquete
-	}
-	return &Order{id: id, lines: lines}, nil
-}
-
-type Store interface{ Save(o *Order) error } // la persistencia, en el mismo paquete
-```
-
-## 2. Una interfaz por clase → interfaz en el consumidor
-
-Un `port` + su `adapter` por cada colaborador, aunque haya una sola impl. Las interfaces en Go se satisfacen implícitamente y se declaran en el punto de uso; una interfaz con una única impl es **interface pollution**: mete indirección (bloquea inlining), una allocación y un salto de archivo para nada. Fix: la impl es un struct concreto exportado; el consumidor declara la interfaz mínima que necesita (ver `references/application-layer.md`).
-
-```go
-// BAD — package smtp: port declarado junto a su ÚNICA impl
+// BAD: package smtp declares a port next to its ONLY implementation.
 type EmailSender interface {
 	Send(to, subject, body string) error
 }
 
-func (c *Client) Send(to, subject, body string) error { return nil }
-
-// GOOD — welcome/send_welcome.go: el caso de uso define la interfaz mínima que usa
-type sender interface {
+// GOOD: welcome/send_welcome.go — the use case declares what it calls.
+// Mailer is the one method SendWelcome needs; *smtp.Client satisfies it implicitly.
+type Mailer interface {
 	Send(to, subject, body string) error
 }
 
-type SendWelcome struct{ mail sender }
+// SendWelcome mails the welcome message to a newly registered user.
+type SendWelcome struct{ mail Mailer }
 
-func NewSendWelcome(m sender) *SendWelcome { return &SendWelcome{mail: m} }
+// NewSendWelcome takes any Mailer; tests pass a fake.
+func NewSendWelcome(m Mailer) *SendWelcome { return &SendWelcome{mail: m} }
 ```
 
-## 3. Getters/Setters → métodos con intención
+## 3. Getters/setters → intent-revealing methods
 
-`GetX()`/`SetX(v)` estilo JavaBean. El estilo Go no usa `Get` (el accessor de `email` es `Email()`), y un setter genérico deja a la entidad sin proteger invariantes (`SetActive(true)` admite estados imposibles). Fix: accessor sin `Get`; cada setter se reemplaza por un método que nombra la transición y valida (ver `references/entities.md`).
+JavaBean `GetX()`/`SetX(v)`. Go style drops `Get` (the accessor for `email` is `Email()`),
+and a generic setter leaves invariants unprotected (`SetActive(true)` admits impossible
+states). Fix: accessors without `Get`; each setter becomes a method that names the transition
+([entities.md](entities.md) §5).
 
 ```go
-// BAD — JavaBean; el setter admite estados inválidos
+// BAD: JavaBean; the setter admits invalid states.
 func (u *User) GetEmail() string  { return u.email }
 func (u *User) SetEmail(e string) { u.email = e }
 func (u *User) SetActive(b bool)  { u.active = b }
 
-// GOOD — sin Get; la mutación tiene nombre y preserva la invariante
-func (u *User) Email() string { return u.email }
-
-func (u *User) ChangeEmail(e string) error {
-	if !strings.Contains(e, "@") {
-		return ErrBadEmail
-	}
-	u.email = e
-	return nil
-}
-
-func (u *User) Deactivate() { u.active = false } // no SetActive(false)
+// GOOD: no Get; the parameter is a valid Email; transitions have names.
+func (u *User) Email() Email           { return u.email }
+func (u *User) ChangeEmail(e Email)    { u.email = e }
+func (u *User) Deactivate(t time.Time) { u.active = false; u.deactivatedAt = t }
 ```
 
-## 4. Modelo anémico → rich model
+## 4. Anemic model → rich model
 
-Structs de datos con campos públicos y la lógica en un `XxxService` gordo que los edita desde fuera. Con campos exportados nadie garantiza las invariantes (`o.Total = -1`) y el service acumula reglas que pertenecen al tipo. En Go el encapsulamiento es por paquete: los campos privados solo se mantienen coherentes si el comportamiento vive con ellos. Fix: la lógica vive con los datos.
+Data structs with exported fields and the logic in a fat `XxxService` that edits them from
+outside. With exported fields nobody guarantees invariants (`o.Total = -1`) and the service
+accumulates rules that belong to the type. Encapsulation in Go is per package, so unexported
+fields stay coherent only if the behaviour lives with them.
 
 ```go
-// BAD — datos públicos + service que edita las tripas ajenas
+// BAD: public data + a service that edits someone else's insides.
 type Order struct {
 	Lines []string
 	Total int
@@ -100,24 +113,18 @@ func (OrderService) AddLine(o *Order, sku string, price int) {
 }
 ```
 
-```go
-// GOOD — el comportamiento (y los campos privados) viven con el tipo
-func (o *Order) AddLine(sku string, price int) error {
-	if price < 0 {
-		return ErrNegative
-	}
-	o.lines = append(o.lines, sku)
-	o.total += price
-	return nil
-}
-```
+GOOD: `Order` with unexported `lines` and an `AddLine(sku, qty, unit) error` method that
+enforces the invariants; the total is derived, not stored ([aggregates.md](aggregates.md) §2).
 
-## 5. `mapper/` + auto-mapping por reflection → traducción a mano
+## 5. `mapper/` + reflection → hand translation
 
-Un paquete `mapper/` o una librería tipo AutoMapper que copia structs por reflection. El compilador no ve reflection: renombrar un campo rompe el mapeo en runtime, no en el build, y pagas coste de reflection por request. Fix: structs `XInput`/`response` junto al caso de uso y traducción explícita que revisa el compilador (ver `references/application-layer.md`).
+A `mapper/` package or an AutoMapper-style library that copies structs by reflection. The
+compiler cannot see reflection: renaming a field breaks the mapping at runtime, not in the
+build, and every request pays for reflection. Fix: `XInput`/response structs next to the use
+case or endpoint and explicit translation the compiler checks.
 
 ```go
-// BAD — automapper por reflection; el build no detecta un rename
+// BAD: reflection-based automapper; the build does not catch a rename.
 func Map(src, dst any) {
 	sv, dv := reflect.ValueOf(src).Elem(), reflect.ValueOf(dst).Elem()
 	for i := 0; i < sv.NumField(); i++ {
@@ -127,120 +134,127 @@ func Map(src, dst any) {
 	}
 }
 
-// GOOD — struct de salida junto al endpoint + traducción explícita
-type response struct {
-	ID    string `json:"id"`
-	Total int    `json:"total"`
-}
-
-func toResponse(o *Order) response {
-	return response{ID: o.ID(), Total: o.Total()}
-}
+// GOOD: the endpoint's response struct + explicit translation.
+resp := registerUserResponse{ID: out.ID, Email: out.Email}
 ```
 
-## 6. Abstract Factory / Builder GoF → constructor idiomático
+## 6. GoF Builder / Abstract Factory → idiomatic constructor
 
-`OrderBuilder{}.WithID(..).WithTotal(..).Build()` o factorías abstractas. El Builder fluido de GoF existe porque Java no tiene retorno múltiple; Go sí, así que `New() (X, error)` valida y devuelve el error en el sitio, mientras el Builder difiere la validación hasta `Build()` y admite objetos a medio construir. Fix: `NewX(...) (X, error)`, o functional options si hay muchos opcionales; nunca un Builder mutable.
+`OrderBuilder{}.WithID(..).WithCustomer(..).Build()` or abstract factories. The fluent
+Builder exists where a language lacks multiple returns; Go has them, so `NewX(...) (X, error)`
+validates and returns the error on the spot, while the Builder defers validation to `Build()`
+and admits half-built objects. Fix: a constructor, or functional options for many optional
+settings; never a mutable Builder.
 
 ```go
-// BAD — Builder GoF; la validación se difiere o se pierde
-func (b *OrderBuilder) WithID(id string) *OrderBuilder { b.o.id = id; return b }
-func (b *OrderBuilder) Build() Order                   { return b.o }
+// BAD: GoF Builder; validation is deferred or lost.
+func (b *OrderBuilder) WithID(id OrderID) *OrderBuilder { b.o.id = id; return b }
+func (b *OrderBuilder) Build() *Order                   { return b.o }
 
-// GOOD — constructor que valida y devuelve (valor, error)
-func New(id string, total int) (Order, error) {
-	if id == "" {
-		return Order{}, ErrNoID
+// GOOD: a constructor that validates and returns (value, error).
+func NewOrder(id OrderID, customer CustomerID, currency string) (*Order, error) {
+	if id == "" || customer == "" || currency == "" {
+		return nil, ErrIncompleteOrder
 	}
-	return Order{id: id, total: total}, nil
+	return &Order{id: id, customerID: customer, currency: currency}, nil
 }
 ```
 
-## 7. Repository que filtra errores del driver → error de dominio en la frontera
+## 7. Repository leaking driver errors → domain error at the border
 
-El repositorio devuelve `sql.ErrNoRows` o `*pgconn.PgError` tal cual. Filtrarlo acopla a cada caller al driver: la capa de aplicación acaba importando `database/sql`/`pgx` para hacer `errors.Is`. La frontera del repo es justo donde se traduce el error de infraestructura a uno de dominio. Fix: traducir en el método y exponer sentinelas de dominio (ver `references/aggregates.md`).
+The repository returns `sql.ErrNoRows` or `*pgconn.PgError` as-is. That couples every caller
+to the driver: the application layer ends up importing `database/sql`/`pgx` just to call
+`errors.Is`. The repository border is exactly where an infrastructure error becomes a domain
+error ([application-layer.md](application-layer.md) §3).
 
 ```go
-// BAD — el error del driver escapa el paquete y acopla a los callers
-func (r *Repo) FindByID(id string) (*Customer, error) {
-	var c Customer
-	err := r.db.QueryRow(query, id).Scan(&c.ID)
-	return &c, err // sql.ErrNoRows sale tal cual
+// BAD: the driver error escapes and couples callers to database/sql.
+func (s *Store) FindByID(ctx context.Context, id order.OrderID) (*order.Order, error) {
+	var r orderRow
+	err := s.db.QueryRowContext(ctx, query, id).Scan(&r.customerID, &r.currency)
+	return r.toOrder(id), err // sql.ErrNoRows leaks out
 }
-```
 
-```go
-// GOOD — traducción en la frontera a un error de dominio
-var ErrNotFound = errors.New("customer: no encontrado")
-
-func (r *Repo) FindByID(id string) (*Customer, error) {
-	var c Customer
-	switch err := r.db.QueryRow(query, id).Scan(&c.ID); {
+// GOOD: translate at the border into the context's sentinel.
+func (s *Store) FindByID(ctx context.Context, id order.OrderID) (*order.Order, error) {
+	var r orderRow
+	switch err := s.db.QueryRowContext(ctx, query, id).Scan(&r.customerID, &r.currency); {
 	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrNotFound
+		return nil, order.ErrOrderNotFound
 	case err != nil:
-		return nil, fmt.Errorf("customer: find id=%s: %w", id, err)
+		return nil, fmt.Errorf("pgstore: find order %s: %w", id, err)
 	}
-	return &c, nil
+	return order.NewOrder(id, order.CustomerID(r.customerID), r.currency)
 }
 ```
 
-## 8. Referencia entre aggregates por puntero → por ID
+## 8. Pointer between aggregates → reference by ID
 
-`Order` contiene `Customer *Customer`. El puntero cruza la frontera transaccional: cargar un `Order` arrastra el grafo entero de `Customer`, invita a mutar otro aggregate en la misma transacción y crea aliasing compartido. Cada aggregate es su propia frontera de consistencia. Fix: guarda `CustomerID`; si necesitas los datos, cárgalos por su propio repositorio (ver `references/aggregates.md`).
+`Order` holds `customer *Customer`. The pointer crosses the transactional boundary: loading an
+`Order` drags in the whole `Customer` graph, invites mutating another aggregate in the same
+transaction and creates shared aliasing. Fix: store `CustomerID`; when you need the
+customer's data, load it through its own repository ([aggregates.md](aggregates.md) §3).
 
 ```go
-// BAD — puntero a otro aggregate: difumina la frontera y arrastra el grafo
+// BAD: a pointer to another aggregate blurs the boundary and drags the graph.
 type Order struct {
-	ID       string
-	Customer *Customer
+	id       OrderID
+	customer *Customer
 }
-```
 
-```go
-// GOOD — referencia por identidad; cada aggregate es su propia frontera
-type CustomerID string
-
+// GOOD: reference by identity; each aggregate is its own boundary.
 type Order struct {
-	ID         string
-	CustomerID CustomerID
+	id         OrderID
+	customerID CustomerID
 }
 ```
 
-## 9. `Repository[T any]` genérico → repos concretos
+## 9. Generic `Repository[T]` → concrete repositories
 
-Una interfaz genérica `Repository[T]` con `Get/Save` "para no repetir" _(generics: Go 1.18+)_. Los aggregates no comparten operaciones: uno se busca por `FindOpen(customerID)`, otro por `FindByEmail`. `Repository[T].Get(id)` fuerza a todos al mínimo común denominador y esconde las consultas reales. Generics solo cuando la lógica es type-agnostic de verdad (contenedores, algoritmos); un repo no lo es. Fix: interfaz concreta por aggregate.
+A generic `Repository[T]` with `Get`/`Save` "to avoid repetition". Aggregates do not share
+operations: one is found by `FindOpenByCustomer`, another by `ExistsByEmail`.
+`Repository[T].Get(id)` forces all of them down to the lowest common denominator and hides the
+real queries. Generics pay off when logic is truly type-agnostic (containers, algorithms); a
+repository is not. Fix: one concrete interface per aggregate.
 
 ```go
-// BAD — abstracción que no aporta y oculta las consultas reales
+// BAD: an abstraction that hides the real queries.
 type Repository[T any] interface {
 	Get(ctx context.Context, id string) (T, error)
 	Save(ctx context.Context, entity T) error
 }
 
-// GOOD — repo concreto que nombra las operaciones del aggregate
+// GOOD: a concrete port that names the aggregate's operations.
 type OrderRepository interface {
-	FindOpen(ctx context.Context, customerID string) ([]*Order, error)
+	FindByID(ctx context.Context, id OrderID) (*Order, error)
+	FindOpenByCustomer(ctx context.Context, customer CustomerID) ([]*Order, error)
 	Save(ctx context.Context, o *Order) error
 }
 ```
 
-## 10. Paquetes-cajón (`domain`, `vo`, `dto`, `util`, `common`) → nombres de concepto
+## 10. Grab-bag packages (`domain`, `vo`, `dto`, `util`, `common`) → concept names
 
-Paquetes genéricos `domain/`, `entity/`, `vo/`, `dto/`, `util/`, `common/`. No se pueden describir en una frase que empiece por su nombre: son cajones, no conceptos. Fuerzan acoplamiento (`common` que todos importan) y arruinan los import paths: `vo.Money` no dice nada, `billing.Money` sí. En Go el nombre del paquete es parte del identificador. Fix: nombra por el bounded context o el concepto (ver `references/bounded-contexts.md`).
+Generic packages cannot be described in a sentence that starts with their name: they are
+drawers, not concepts. They force coupling (a `common` everybody imports) and ruin import
+paths: `vo.Money` says nothing, `billing.Money` does. In Go the package name is part of
+every identifier. Fix: name by bounded context or concept ([bounded-contexts.md](bounded-contexts.md) §2).
 
 ```
-// BAD — cajones sin identidad          // GOOD — conceptos con nombre
-internal/vo/money.go                     internal/billing/money.go
-internal/common/util.go                  internal/pricing/discount.go
+# BAD: drawers without identity      # GOOD: named concepts
+internal/vo/money.go                  internal/billing/money.go
+internal/common/util.go               internal/pricing/discount.go
 ```
 
-## 11. Herencia simulada con `BaseEntity` → composición con propósito
+## 11. `BaseEntity` inheritance → purposeful composition
 
-Un `BaseEntity` con `ID`/`CreatedAt`/`UpdatedAt`/`Touch()` embebido en cada tipo. Go no tiene herencia: el embedding es composición, no jerarquía, y no hay override ni dispatch dinámico. Un `BaseEntity` universal inyecta estado y métodos (`Touch`) en tipos que no los necesitan (un `Tag` inmutable no tiene `UpdatedAt`) e infla su API pública. Fix: embebe una pieza acotada (`Timestamps`) solo en los tipos que la usan (ver `references/entities.md`).
+A `BaseEntity` with `ID`/`CreatedAt`/`UpdatedAt`/`Touch()` embedded in every type. Go has no
+inheritance: embedding is composition, with no override or dynamic dispatch. A universal
+`BaseEntity` injects state and methods into types that do not need them (an immutable `Tag`
+has no `UpdatedAt`), inflates their public API and, with exported fields, lets anyone rewrite
+them. Fix: embed a small, unexported piece only in the types that use it, and pass time in.
 
 ```go
-// BAD — BaseEntity universal: mete Touch/UpdatedAt donde no toca
+// BAD (the anti-pattern): a universal BaseEntity with exported, writable fields.
 type BaseEntity struct {
 	ID                   string
 	CreatedAt, UpdatedAt time.Time
@@ -249,59 +263,76 @@ type BaseEntity struct {
 func (b *BaseEntity) Touch() { b.UpdatedAt = time.Now() }
 
 type Tag struct {
-	BaseEntity // un Tag no necesita UpdatedAt ni Touch
+	BaseEntity // a Tag needs neither UpdatedAt nor Touch
 	Name       string
 }
 
-// GOOD — composición con propósito: solo los tipos auditables embeben Timestamps
-type Timestamps struct {
-	CreatedAt, UpdatedAt time.Time
+// GOOD: only audited types embed audit; the domain receives time instead of reading the clock.
+type audit struct {
+	createdAt, updatedAt time.Time
 }
 
-func (t *Timestamps) Touch() { t.UpdatedAt = time.Now() }
+func (a *audit) touch(now time.Time) { a.updatedAt = now }
 
-type Order struct { // Order audita y la embebe; un Tag simplemente no lo haría
-	ID string
-	Timestamps
+// Order is audited; a Tag simply would not embed audit.
+type Order struct {
+	id     OrderID
+	status Status
+	audit
+}
+
+// Cancel records when the order was cancelled.
+func (o *Order) Cancel(now time.Time) {
+	o.status = StatusCancelled
+	o.touch(now)
 }
 ```
 
-## 12. Value Object mutable / con setters → inmutable, crea-nuevo
+## 12. Mutable value object → immutable, create-new
 
-Un `Money` con campos públicos y `SetAmount`/`Add` que mutan el receptor por puntero. Un value object se define por su valor: dos `Money(10,"EUR")` son intercambiables. Si es mutable y se comparte por puntero, `Add` cambia el importe bajo los pies de todos (aliasing). Fix: campos privados, sin setters, receptor por valor, cada operación devuelve un `Money` nuevo (ver `references/value-objects.md`).
+A `Money` with exported fields and `SetAmount`/`Add` that mutate the receiver through a
+pointer. A value object is defined by its value: two `Money{10, "EUR"}` are interchangeable.
+If it is mutable and shared by pointer, `Add` changes the amount under everyone's feet
+(aliasing). Fix: unexported fields, no setters, value receivers, every operation returns a
+new `Money` ([value-objects.md](value-objects.md) §3–4).
 
 ```go
-// BAD — VO mutable con setter; el Money compartido cambia para todos
+// BAD: mutable VO with a setter; the shared Money changes for everyone.
 func (m *Money) SetAmount(a int64) { m.Amount = a }
 func (m *Money) Add(other Money)   { m.Amount += other.Amount }
-```
 
-```go
-// GOOD — inmutable: receptor por valor, cada operación crea un valor nuevo
+// GOOD: immutable; value receiver; each operation creates a new value.
 func (m Money) Add(other Money) (Money, error) {
 	if m.currency != other.currency {
-		return Money{}, ErrCurrency
+		return Money{}, fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, m.currency, other.currency)
 	}
-	return Money{amount: m.amount + other.amount, currency: m.currency}, nil
+	return Money{cents: m.cents + other.cents, currency: m.currency}, nil
 }
-
-func (m Money) Amount() int64 { return m.amount }
 ```
 
-## 13. Archivo/tipo cajón (`service.go`, `usecase.go`) → un archivo y un tipo por caso de uso
+## 13. Grab-bag file/type (`service.go`, `usecase.go`) → one file and one type per use case
 
-Un `service.go` (o `usecase.go`, `usecases.go`, `app.go`, `manager.go`) con un `type Service struct` que acumula `Login()`, `Signup()`, `ResetPassword()`… Es la versión Go del `UserService` de Spring: el nombre del archivo no dice qué hace, el struct suma las dependencias de todas las operaciones (cada test construye cinco colaboradores para probar una) y cada caso de uso nuevo edita el mismo archivo, así que todo cambio choca con todo. Que el código esté en un paquete por contexto no lo arregla: el cajón solo se movió un nivel abajo. Fix: un caso de uso = un tipo con el nombre de la acción + un archivo con ese nombre, con su constructor, un único método `Execute` y sus DTO (ver `references/application-layer.md`). Lo mismo aplica al transporte: un archivo por endpoint + `routes.go`, no un `handler.go` con todo.
+A `service.go` (or `usecase.go`, `usecases.go`, `app.go`, `manager.go`) with a
+`type Service struct` that accumulates `LogIn()`, `SignUp()`, `ResetPassword()`... It is the
+Go version of Spring's `UserService`: the file name does not say what it does, the struct
+sums the dependencies of every operation (each test builds five collaborators to exercise
+one), and every new use case edits the same file, so every change collides with every other.
+Having one package per context does not fix it; the drawer just moved one level down. Fix:
+one use case = one type named after the action + one file with that name, with its
+constructor, a single `Execute` and its DTOs ([application-layer.md](application-layer.md) §2).
+The same applies to transport: one file per endpoint + `routes.go`, not a `handler.go` with
+everything.
 
 ```
-// BAD — internal/identity/                // GOOD — internal/identity/
-service.go     Login, Signup, Reset…         login.go            Login
-handler.go     todos los endpoints           sign_up.go          SignUp
-                                             reset_password.go   ResetPassword
-                                             identityhttp/routes.go, login.go, sign_up.go…
+# BAD: internal/identity/              # GOOD: internal/identity/
+service.go   LogIn, SignUp, Reset...    log_in.go           LogIn
+handler.go   every endpoint             sign_up.go          SignUp
+                                        reset_password.go   ResetPassword
+                                        identityhttp/routes.go, log_in.go, sign_up.go...
 ```
 
 ```go
-// BAD — service.go: dos intenciones, la unión de sus dependencias
+// BAD: service.go — two intents, the union of their dependencies.
 type Service struct {
 	users  UserRepository
 	hasher Hasher
@@ -309,56 +340,52 @@ type Service struct {
 	mail   Mailer
 }
 
-func (s *Service) Login(ctx context.Context, in LoginInput) (LoginOutput, error)   { /* ... */ }
+func (s *Service) LogIn(ctx context.Context, in LogInInput) (LogInOutput, error)    { /* ... */ }
 func (s *Service) SignUp(ctx context.Context, in SignUpInput) (SignUpOutput, error) { /* ... */ }
-```
 
-```go
-// GOOD — login.go: el archivo, el tipo y sus dependencias dicen lo mismo
-type Login struct {
+// GOOD: log_in.go — the file, the type and its dependencies say the same thing.
+type LogIn struct {
 	users  UserRepository
 	hasher Hasher
 	tokens TokenIssuer
 }
 
-func NewLogin(users UserRepository, hasher Hasher, tokens TokenIssuer) *Login {
-	return &Login{users: users, hasher: hasher, tokens: tokens}
+func NewLogIn(users UserRepository, hasher Hasher, tokens TokenIssuer) *LogIn {
+	return &LogIn{users: users, hasher: hasher, tokens: tokens}
 }
 
-func (uc *Login) Execute(ctx context.Context, in LoginInput) (LoginOutput, error) { /* ... */ }
+func (uc *LogIn) Execute(ctx context.Context, in LogInInput) (LogInOutput, error) { /* ... */ }
 ```
 
-`SignUp` vive en `sign_up.go` con sus propias dependencias (`Mailer` incluido); `Login` ya no carga con ella.
+`SignUp` lives in `sign_up.go` with its own dependencies (`Mailer` included); `LogIn` no
+longer carries it.
 
----
+## Summary: Java-ism → idiomatic Go
 
-## Tabla resumen: Java-ismo → Go idiomático
-
-| Java/C#-ismo | Por qué rompe en Go | Go idiomático |
+| Java/C#-ism | Why it breaks in Go | Idiomatic Go |
 |---|---|---|
-| `domain/`+`application/`+`infrastructure/` | Ciclos de import, tipos huérfanos | Paquete por contexto, archivo por rol |
-| Un port+adapter por colaborador | Interface pollution, indirección, allocación | Interfaz en el consumidor, con 2ª impl o test |
-| `GetX()` / `SetX()` | No es el estilo Go; el setter rompe invariantes | `X()` sin `Get`; método con intención |
-| Modelo anémico + service gordo | Invariantes sin dueño | Rich model: lógica con los datos |
-| `mapper/` + reflection | Sin verificación en compilación; coste runtime | Structs I/O + traducción a mano |
-| Abstract Factory / Builder GoF | Difiere/omite validación; estados a medias | `New() (X, error)` / functional options |
-| Repo filtra `sql.ErrNoRows`/`PgError` | Acopla callers al driver | Traducir a `ErrNotFound` en la frontera |
-| `Order.Customer *Customer` | Cruza frontera transaccional; aliasing | Referencia por `CustomerID` |
-| `Repository[T any]` | Oculta consultas reales; falso DRY | Repo concreto por aggregate |
-| `util`/`common`/`vo`/`dto` | Cajón sin identidad; acoplamiento | Nombre de concepto / contexto |
-| `BaseEntity` embebida en todo | Herencia simulada; API inflada | Composición acotada, con propósito |
-| VO mutable con setter | Aliasing; deja de ser "un valor" | Inmutable; receptor valor, crea-nuevo |
-| `service.go` / `usecase.go` + `type Service` | Archivo sin intención; dependencias sumadas; todo cambio choca | Un archivo y un tipo por caso de uso (`login.go` → `Login`) |
+| `domain/` + `application/` + `infrastructure/` | Import cycles, orphan types | Package per context, file per concept/use case |
+| A port + adapter per collaborator | Interface pollution, indirection | Interface at the consumer, with a 2nd implementation or a test seam |
+| `GetX()` / `SetX()` | Not Go style; setters break invariants | `X()` without `Get`; intent-revealing methods |
+| Anemic model + fat service | Invariants without an owner | Rich model: logic with the data |
+| `mapper/` + reflection | No compile-time check; runtime cost | I/O structs + hand translation |
+| Abstract Factory / GoF Builder | Defers validation; half-built objects | `NewX(...) (X, error)` / functional options |
+| Repository leaks `sql.ErrNoRows`/`PgError` | Couples callers to the driver | Translate to a domain sentinel at the border |
+| `Order.customer *Customer` | Crosses the transactional boundary | Reference by `CustomerID` |
+| `Repository[T any]` | Hides the real queries; false DRY | Concrete repository per aggregate |
+| `util`/`common`/`vo`/`dto` | Drawer without identity | Concept or context name |
+| `BaseEntity` embedded everywhere | Simulated inheritance; inflated API | Small, unexported, purposeful composition |
+| Mutable VO with setters | Aliasing; no longer "a value" | Immutable; value receiver; create-new |
+| `service.go` / `usecase.go` + `type Service` | File without intent; summed deps; every change collides | One file and one type per use case (`log_in.go` → `LogIn`) |
 
 ## Checklist
 
-- [ ] Cero carpetas top-level de capa ni paquetes-cajón (`util`, `common`, `vo`, `dto`, `models`, `types`): paquete por contexto/concepto.
-- [ ] Toda interfaz tiene ≥2 impls o es un seam de test, y la declara el consumidor, no el implementador.
-- [ ] Comportamiento y accessors en métodos del tipo que posee los datos (sin `Get`, sin setters ciegos, sin `Service` externo); value objects inmutables (crea-nuevo).
-- [ ] Nada de auto-mapping por reflection: structs I/O y traducción a mano junto al use case.
-- [ ] Los agregados se construyen con `New() (X, error)`, no con Builders ni factorías abstractas.
-- [ ] Ningún error de driver (`sql.ErrNoRows`, `pgconn.PgError`) sale del repositorio; los aggregates se referencian por ID, nunca por puntero.
-- [ ] Sin `Repository[T any]`: interfaz concreta por aggregate (generics solo si es type-agnostic real).
-- [ ] Sin `BaseEntity`: la composición solo la embeben los tipos que la usan.
-- [ ] Sin `service.go`, `usecase.go`, `app.go`, `manager.go` ni `handler.go` con varios endpoints: cada caso de uso es un tipo en un archivo con su nombre.
-- [ ] Ante cualquier duda DDD ↔ Go: gana Go (Regla #0).
+- [ ] No top-level layer folders or grab-bag packages (`util`, `common`, `vo`, `dto`, `models`, `types`).
+- [ ] Every interface has a second implementation or is a test seam, and the consumer declares it.
+- [ ] Behaviour and accessors live on the type that owns the data (no `Get`, no blind setters, no external `Service`); VOs are immutable.
+- [ ] No reflection-based mapping: I/O structs and hand translation next to the use case or endpoint.
+- [ ] Aggregates are built with `NewX(...) (*X, error)`, not Builders or abstract factories.
+- [ ] No driver error (`sql.ErrNoRows`, `pgconn.PgError`) leaves the repository; aggregates reference each other by ID.
+- [ ] No `Repository[T any]`: one concrete interface per aggregate.
+- [ ] No `BaseEntity`: only the types that need a piece of composition embed it.
+- [ ] No `service.go`, `usecase.go`, `app.go`, `manager.go` or multi-endpoint `handler.go`: each use case is a type in a file with its name.

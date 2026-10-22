@@ -1,209 +1,136 @@
 ---
 name: create-pr
 description: >
-  Open a GitHub pull request end-to-end, fully automatically. Use this skill whenever the
-  user wants to ship a branch for review — triggers include "create a PR", "open a pull
-  request", "abre un PR", "haz un PR", "PR for this branch", "raise a pull request", or
-  "sube esto a review". Runs git and the gh CLI for real (commit if needed, push, detect
-  base branch, craft a Conventional-Commits title, fill the body from commits + diff, and
-  run gh pr create). Executes without pausing to ask — subject to non-negotiable safety
-  guardrails (no force-push, no auto-merge, no secrets, protected-branch protection).
+  Draft or open a GitHub pull request for the current branch, following the repo's PR
+  template, title style and language (falls back to a Conventional Commits title and a
+  built-in template). Drafting only, nothing pushed: "write a PR description", "draft
+  the PR", "redacta la descripción del PR". Pushes the branch and runs gh pr create
+  only when asked to open one: "open a PR", "create a pull request", "abre un PR", "haz
+  un PR", "sube esto a review". Commits only the task's files, handles forks, never
+  merges. Without a shell or gh it drafts the text plus the commands.
 ---
 
-# Create PR Skill
+# Create PR
 
-Eres un ingeniero que abre Pull Requests como en un repo serio: rama limpia empujada,
-**título en Conventional Commits**, cuerpo autocompletado desde los commits y el diff,
-issues vinculados, y todo ejecutado de forma **totalmente automática**. La skill corre
-`git` y `gh` de verdad (no describe: hace). No pausa para pedir confirmación paso a paso;
-sí respeta guardrails de seguridad innegociables (ver `## Guardrails`). Plataforma: GitHub
-vía `gh` CLI. Para la plantilla del cuerpo y cómo rellenar cada sección, lee
-`references/pr-template.md`.
+A pull request should explain itself: a reviewer understands what changed, why, how to
+verify it and what could break before reading any code. The title says *what* in one line;
+the body says *why* and *how*, in the shape and language this repo already uses.
 
-## Principio rector
+## 1. Pick the mode
 
-**El PR se explica solo.** Un revisor debería entender qué cambió, por qué, cómo probarlo
-y qué riesgo tiene sin leer el código todavía. El título dice *qué* en una línea; el cuerpo
-dice *por qué* y *cómo*.
+- **Draft** — "write/draft the PR description", "redacta el PR", a pasted diff, or no
+  shell/`gh`. Gather context read-only (`git log`, `git diff`) and return the title and
+  body, plus the commands that would open it. Nothing is committed, pushed or created,
+  because the user asked for text.
+- **Open** — "open/create a PR", "abre un PR", "sube esto a review". Follow the steps
+  below. Pause and ask only when something is genuinely unclear: which uncommitted changes
+  belong to the PR, which base to target, or which remote to push to.
 
----
-
-## Flujo paso a paso
-
-### 1. Preparar: rama y commits
-
-Nunca abras un PR sobre trabajo a medias. Primero mira el estado:
+## 2. Preflight
 
 ```bash
-git status --porcelain      # ¿hay cambios sin commitear? (vacío = limpio)
-git branch --show-current   # ¿en qué rama estás? (importa para el guardrail)
+sh <this skill's directory>/scripts/preflight.sh
 ```
 
-**Guardrail de rama (innegociable).** Si estás en `main`/`master` (o una rama protegida),
-mueve el trabajo a una feature branch **antes** de seguir. Dos casos:
+It is read-only and prints `key=value` lines. The ones that matter here:
 
-- Cambios aún **sin commitear** → crea la rama primero; el trabajo nace en ella:
-  ```bash
-  git switch -c feat/descripcion-corta
-  ```
-- Commits que ya cayeron sobre `main` local (adelantados respecto al remoto) → móvelos a
-  una rama nueva y devuelve `main` a su sitio:
-  ```bash
-  git switch -c feat/descripcion-corta    # la rama nueva se lleva tus commits
-  git branch --force main origin/main     # main local vuelve al remoto
-  ```
-  (si no hay upstream aún, usa el SHA base en vez de `origin/main`).
+| Key | Use |
+|---|---|
+| `gh_installed=no`, `gh_authenticated=no` | Switch to draft mode and give the `gh auth login` / `gh pr create` commands. |
+| `remote`, `push_remote`, `is_fork`, `fork_parent`, `parent_remote`, `base_repo` | Where to push and where to open the PR (step 5). The remote is not always `origin`. |
+| `gh_default_branch` / `base_default_branch` | Default base. |
+| `on_default_branch`, `ahead`, `staged`, `unstaged`, `untracked` | Branch and commit state (step 3). |
+| `open_pr_for_branch` | A PR already exists: update it instead of opening a duplicate. |
+| `pr_template`, `contributing`, `commit_convention_config`, `history_style` | Title and body conventions (step 6). |
+| `operation_in_progress`, `conflicted` | Stop and tell the user. |
 
-**Commitear lo suelto.** Si quedan cambios sin commitear, compromételos en **Conventional
-Commits** — `type(scope): subject` imperativo, minúscula, sin punto, ≤50 columnas; cuerpo =
-el porqué; footers `BREAKING CHANGE:`, `Closes #N`, `Refs #N`. Para el playbook completo de
-commits atómicos usa la skill `git-commit`. En corto:
+## 3. Get the commits in place
+
+**Base.** The user's explicit target wins; otherwise the default branch of `base_repo`.
+Fetch it before comparing, so the log and diff reflect the real remote state (a fetch only
+updates remote-tracking refs):
 
 ```bash
-git add path/al/archivo ...              # stage selectivo por concern
-git commit -m "feat(scope): subject imperativo"
+git fetch "$BASE_REMOTE" "$BASE"     # BASE_REMOTE: parent_remote for forks, else remote
+BASE_REF="$BASE_REMOTE/$BASE"
 ```
 
-No dejes un working tree sucio: el PR debe reflejar exactamente lo commiteado.
+For a fork with no remote pointing at the parent, fetch by URL and use the fetched commit:
+`git fetch https://github.com/<fork_parent>.git "$BASE"` then `BASE_REF=FETCH_HEAD`.
 
-### 2. Push de la rama
+**Branch.** A PR needs a head branch different from the base. If you are on the default
+branch, create one with `git switch -c <name>`; your local commits move with it. Name it
+like the repo's existing branches (`git branch -r`), else `type/short-topic`. Leave the
+local default branch where it is and mention that it is ahead of the remote; resetting it
+is the user's decision, since a reset there can discard work.
+
+**Uncommitted changes.** Commit only the files that belong to this task, using the
+`git-commit` skill when available (same rules: stage by path, repo message convention,
+secret scan, no `--no-verify`). Leave the user's unrelated changes untouched and list them
+in the report. If you cannot tell which changes belong, ask.
+
+## 4. Push
 
 ```bash
-git push -u origin "$(git branch --show-current)"
+git push -u "$PUSH_REMOTE" "$BRANCH"
 ```
 
-`-u` fija el upstream para futuros `push`/`pull`. Si la rama ya existía y divergió tras un
-rebase **tuyo**, actualízala con `git push --force-with-lease` (nunca `--force`; ver
-Guardrails).
+`PUSH_REMOTE` is `push_remote` from preflight (the user's fork, for fork workflows). If
+the branch already exists remotely and diverged after **your own** rebase, use
+`git push --force-with-lease`; never plain `--force`.
 
-### 3. Determinar la rama base
+## 5. Open (or update) the PR
 
-La base es la rama por defecto del repo, salvo que el trabajo apunte explícitamente a otra
-(p. ej. `develop` o una release):
+If `open_pr_for_branch` shows a URL, the push already updated it; report the URL and edit
+title/body (`gh pr edit`) only if the user asked.
+
+Otherwise:
 
 ```bash
-BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
-echo "base=$BASE"
+body=$(mktemp "${TMPDIR:-/tmp}/pr-body.XXXXXX")
+# write the body (step 6) into "$body"
+gh pr create --repo "$BASE_REPO" --base "$BASE" --head "$HEAD" \
+  --title "$TITLE" --body-file "$body"
+rm -f "$body"
 ```
 
-### 4. Título del PR (Conventional Commits)
+- `HEAD` is `<branch>` for a same-repo PR and `<fork-owner>:<branch>` for a fork.
+- Add `--draft` when the user said WIP/draft or you know the work is incomplete or a check
+  is failing. Otherwise open it ready for review.
+- Add reviewers, labels or assignees only when the user asks; CODEOWNERS assigns reviewers
+  on its own.
 
-El **título sigue la misma convención que los commits**: `type(scope): subject`.
+## 6. Title and body
 
-```bash
-BRANCH=$(git branch --show-current)
-git log "origin/$BASE..$BRANCH" --pretty=format:'%s'   # revisa los subjects de la rama
-```
+Repo conventions win:
 
-- **1 commit** → reusa su subject tal cual como título.
-- **N commits** → sintetiza un `type(scope): resumen` que capture el conjunto (el `type` es
-  el del cambio dominante; el `scope`, el área común). No listes todos los subjects en el
-  título; eso va en el cuerpo.
+1. **Template**: `pr_template` from preflight (if it is a directory, pick the template that
+   fits or ask). Keep its headings and checkboxes and fill every section.
+2. **Recent PRs** show title style, structure and language:
+   `gh pr list --repo "$BASE_REPO" --state merged --limit 10 --json title,body`.
+   If the default branch history ends subjects with `(#123)`, PRs are squash-merged and the
+   title becomes the commit subject, so it must follow the commit convention
+   (commitlint, CONTRIBUTING, `history_style`).
+3. **Fallback**: a Conventional Commits title and the template in
+   [references/pr-template.md](references/pr-template.md), which also explains how to fill
+   each section from `git log "$BASE_REF"..HEAD` and `git diff "$BASE_REF"...HEAD`.
 
-Ejemplos de título válido: `feat(auth): add token refresh endpoint`,
-`fix(parser): handle empty input without panicking`, `refactor(store): extract query builder`.
+Write in the language the repo's PRs and commits use. Title: one commit → reuse its
+subject; several → one line summarizing the dominant change. Link issues with `Closes #N`
+or `Refs #N`. If the environment asks for an attribution line at the end of PR
+descriptions, include it as given. Never paste secrets, tokens or `.env` contents into the
+title or body.
 
-### 5. Cuerpo del PR
+## 7. Report
 
-Elige la plantilla en este orden:
-
-1. **`.github/PULL_REQUEST_TEMPLATE.md` del repo si existe** — esa manda (respétala al pie):
-   ```bash
-   ls .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md 2>/dev/null
-   ```
-2. Si no existe, usa la plantilla de `references/pr-template.md`.
-
-Autocompleta **cada** sección desde los commits y el diff de la rama contra la base:
-
-```bash
-git log  "origin/$BASE..$BRANCH" --pretty=format:'- %s'   # → "Qué cambió" (bullets)
-git diff "origin/$BASE...$BRANCH" --stat                  # → alcance / blast radius
-git diff "origin/$BASE...$BRANCH"                         # → detalle para "Cómo probar" y riesgo
-```
-
-Ojo con los rangos: `..` (dos puntos) para el **log** de commits de la rama; `...` (tres
-puntos) para el **diff** contra el punto de divergencia (merge-base) con la base. Vincula
-issues con `Closes #N` (cierra al mergear) o `Refs #N` (solo referencia) cuando aplique.
-Escribe el cuerpo en un archivo:
-
-```bash
-cat > /tmp/pr-body.md <<'EOF'
-## Resumen
-...
-EOF
-```
-
-### 6. Crear el PR
-
-```bash
-gh pr create \
-  --base "$BASE" \
-  --head "$BRANCH" \
-  --title "feat(scope): subject imperativo" \
-  --body-file /tmp/pr-body.md
-```
-
-- **Ready por defecto.** Añade `--draft` **solo** si los checks de CI están claramente en
-  rojo o el trabajo aún está incompleto (WIP).
-- Si el repo usa `.github/PULL_REQUEST_TEMPLATE.md`, ya lo incorporaste en el body-file; no
-  hace falta `--template`.
-- **Nunca** `gh pr merge` aquí: la skill abre el PR, no lo mergea (ver Guardrails).
-
-### 7. Reportar
-
-`gh pr create` imprime la URL del PR en stdout al terminar. Repórtala al usuario. Si la
-necesitas después:
-
-```bash
-gh pr view --json url -q .url
-```
-
----
+The PR URL, base ← head, draft or ready, and anything left out on purpose (uncommitted
+files, the local default branch now ahead of its remote).
 
 ## Guardrails
 
-Innegociables. No son "preguntar antes": son "no hacer estupideces".
+Hard limits, because their effects reach other people:
 
-1. **Rama protegida → feature branch primero.** Si estás en `main`/`master` (o rama
-   protegida), mueve el trabajo a una rama nueva **antes** de push/PR (paso 1). Nunca abras
-   un PR desde la rama protegida ni empujes commits directos a ella.
-2. **Nunca `git push --force`.** Como mucho `git push --force-with-lease` sobre **tu propia**
-   rama y solo si es imprescindible (p. ej. tras un rebase de tu feature). Jamás force-push
-   a ramas compartidas/protegidas.
-3. **Nunca auto-merge.** No ejecutes `gh pr merge` (ni `--auto`). La skill deja el PR abierto
-   para revisión humana; mergear es decisión de otra persona.
-4. **Nunca secretos en el cuerpo del PR.** No pegues `.env`, claves privadas, tokens,
-   credenciales ni cadenas tipo `AKIA…`/`sk-…` en el título ni en el body. Si un diff los
-   expone, avisa al usuario en vez de publicarlos.
-5. **Respeta la plantilla y los CODEOWNERS del repo.** Si existe
-   `.github/PULL_REQUEST_TEMPLATE.md`, esa plantilla manda. Si existe `CODEOWNERS`, deja que
-   GitHub asigne los revisores automáticamente; no fuerces reviewers que contradigan esa
-   configuración.
-6. **No mientas en el estado.** No marques Ready un PR con CI claramente roja ni Draft uno
-   terminado. `--draft` refleja realidad, no comodidad.
-
-## Checklist
-
-Antes de dar por cerrado el trabajo, verifica:
-
-- [ ] El working tree quedó limpio; todo lo que va al PR está commiteado.
-- [ ] No estás en `main`/`master`; si lo estabas, moviste el trabajo a una feature branch.
-- [ ] La rama está empujada con upstream (`git push -u origin <branch>`); sin `--force`.
-- [ ] La base es la correcta (`defaultBranchRef` u otra deliberada).
-- [ ] El **título** es Conventional Commit válido: `type(scope): subject` imperativo ≤50.
-- [ ] El cuerpo usa la plantilla del repo si existe; si no, la de `references/pr-template.md`.
-- [ ] Cada sección del cuerpo está rellenada desde `git log`/`git diff`; issues vinculados
-      con `Closes #N`/`Refs #N` donde aplique.
-- [ ] Ningún secreto en título ni cuerpo.
-- [ ] Ready por defecto; `--draft` solo si CI en rojo o WIP. No se ejecutó `gh pr merge`.
-- [ ] Reportaste la URL del PR.
-
----
-
-## Reference Files
-
-- `references/pr-template.md` — la plantilla del cuerpo del PR (Resumen, Motivación &
-  contexto, Qué cambió, Cómo probar, Riesgo & rollout, Screenshots/demos, Issues vinculados,
-  Checklist), un ejemplo completo ya rellenado, y cómo autocompletar cada sección desde los
-  commits y el diff. Nota: si el repo trae su propia `.github/PULL_REQUEST_TEMPLATE.md`, esa
-  manda sobre esta.
+- **Never merge** — no `gh pr merge`, no `--auto`. Merging is a human decision.
+- **Never force-push a shared branch**; `--force-with-lease` only on your own branch.
+- **Never commit or publish secrets**, in commits or in the PR text.
+- **Never skip hooks or signing** (`--no-verify`, `--no-gpg-sign`).
